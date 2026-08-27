@@ -15,11 +15,21 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
 
     SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128.
     SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1.
+    SM12x (GB10 / DGX Spark): Hopper K-granularity (1, 128, 128) with
+    FP32 activation scales. Treating major>=10 as SM100 packs UE8M0 into
+    int32; the Python ``fp8_einsum`` fallback then does ``scale.to(float32)``
+    on those packed ints and o_proj becomes noise.
 
     Returns ``(einsum_recipe, tma_aligned_scales)`` for ``deep_gemm_fp8_o_proj``.
     """
     cap = current_platform.get_device_capability()
     assert cap is not None, "DeepseekV4 attention requires a CUDA device"
+    if cap.major == 12:
+        # Hopper K-granularity with FP32 activation scales. The INT32-packed
+        # UE8M0 variant (tma_aligned_scales=True) is numerically wrong on
+        # SM12x: DeepGEMM's einsum misreads the packed lanes (~2^32 error,
+        # measured on GB10 vs an fp32 reference).
+        return (1, 128, 128), False
     einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
     tma_aligned_scales = cap.major >= 10
     return einsum_recipe, tma_aligned_scales
@@ -63,10 +73,19 @@ def deep_gemm_fp8_o_proj(
     weight_scale = (
         wo_a.weight_scale if hasattr(wo_a, "weight_scale") else wo_a.weight_scale_inv
     )
+    weight = wo_a.weight
+    # fp8_einsum's "bhr,hdr->bhd" runs get_shape<3> on B and its scale and
+    # does not reshape: both must be 3D (h, d, r) = (n_groups, o_lora_rank, D)
+    # and (n_groups, o_lora_rank // 128, D // 128). Layers loaded outside the
+    # DeepGEMM scaled-mm path (b12x / FlashMLA / FlashInfer backends) keep
+    # the flat checkpoint layout (n_groups*o_lora_rank, D).
+    if weight.ndim == 2:
+        weight = weight.view(n_groups, o_lora_rank, -1)
+        weight_scale = weight_scale.view(n_groups, o_lora_rank // 128, -1)
     fp8_einsum(
         "bhr,hdr->bhd",
         (o_fp8, o_scale),
-        (wo_a.weight, weight_scale),
+        (weight, weight_scale),
         z,
         recipe=einsum_recipe,
     )
