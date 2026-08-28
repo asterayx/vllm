@@ -139,6 +139,7 @@ def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
     assert sm12x_mixed_warmup_decode_prompt_len() == 2
     assert sm12x_mixed_warmup_prefill_len(15) == 15
     assert sm12x_align_prefill_q_len(2) == 2
+    assert sm12x_align_prefill_kernel_tokens(2) == 2
     assert sm12x_treat_short_extends_as_decodes() is True
     assert sm12x_disable_attn_aux_streams() is False
     sizes = [1, 2, 4, 8, 16, 24, 32, 36]
