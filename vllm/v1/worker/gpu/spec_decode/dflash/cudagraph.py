@@ -72,6 +72,8 @@ def _prepare_dflash_inputs_to_capture(
             kv_cache_config=kv_cache_config,
             for_cudagraph_capture=True,
             causal=causal,
+            # Dummy drafts are decodes; SM12x split requires this flag.
+            is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
         )
     return AttentionState(attn_metadata, slot_mappings_by_layer)
 

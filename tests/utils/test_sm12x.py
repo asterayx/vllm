@@ -197,3 +197,35 @@ def test_sm12x_keeps_q_len_2_seed_on_prefill_split(monkeypatch):
         decode_threshold=6,
         treat_short_extends_as_decodes=sm12x_treat_short_extends_as_decodes(),
     ) == (0, 1, 0, 2)
+
+
+def test_sm12x_dspark_capture_dummy_splits_as_all_decodes(monkeypatch):
+    """DSpark capture dummies are q_len=6 decodes; missing is_prefilling
+    AssertionError'd at 0/5 (16:41). make_dummy zeros the flag."""
+    from vllm.utils import sm12x as sm12x_utils
+    from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    cam = SimpleNamespace(
+        max_query_len=6,
+        num_reqs=6,
+        num_actual_tokens=36,
+        query_start_loc_cpu=torch.arange(0, 37, 6, dtype=torch.int32),
+        is_prefilling=torch.zeros(6, dtype=torch.bool),
+    )
+    assert split_decodes_and_prefills(
+        cam,
+        decode_threshold=6,
+        treat_short_extends_as_decodes=sm12x_treat_short_extends_as_decodes(),
+    ) == (6, 0, 36, 0)
+    cam_missing = SimpleNamespace(**{**cam.__dict__, "is_prefilling": None})
+    with pytest.raises(AssertionError):
+        split_decodes_and_prefills(
+            cam_missing,
+            decode_threshold=6,
+            treat_short_extends_as_decodes=False,
+        )
