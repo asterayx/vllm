@@ -8,6 +8,7 @@ import torch
 
 from vllm.config import set_current_vllm_config
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+    _batch_token_span,
     _required_sm120_sparse_topk,
     sm12x_q_len_spans,
     sm12x_use_per_request_decode,
@@ -218,3 +219,17 @@ def test_non_sm12x_keeps_q_len_2(monkeypatch):
     )
     assert sm12x_q_len_spans(2) == [(0, 2)]
     assert sm12x_align_decode_q_len(2) == 2
+
+
+def test_batch_token_span_pads_indices_with_sentinels():
+    """Padded decode-form rows must not attend; use -1 / zero lens."""
+    indices = torch.tensor([[10, 11], [12, 13]], dtype=torch.int32)
+    lens = torch.tensor([2, 2], dtype=torch.int32)
+    padded = _batch_token_span(indices, 0, 2, 4, fill=-1)
+    padded_lens = _batch_token_span(lens, 0, 2, 4)
+    assert padded.shape == (1, 4, 2)
+    assert torch.equal(padded[0, :2], indices)
+    assert torch.equal(padded[0, 2:], torch.full((2, 2), -1, dtype=torch.int32))
+    assert padded_lens.shape == (1, 4)
+    assert torch.equal(padded_lens[0, :2], lens)
+    assert torch.equal(padded_lens[0, 2:], torch.zeros(2, dtype=torch.int32))
