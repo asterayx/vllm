@@ -8,6 +8,7 @@ import torch
 
 from vllm.config import set_current_vllm_config
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+    DeepseekV4FlashInferSM120Attention,
     _batch_token_span,
     _required_sm120_sparse_topk,
     sm12x_q_len_spans,
@@ -233,3 +234,44 @@ def test_batch_token_span_pads_indices_with_sentinels():
     assert padded_lens.shape == (1, 4)
     assert torch.equal(padded_lens[0, :2], lens)
     assert torch.equal(padded_lens[0, 2:], torch.zeros(2, dtype=torch.int32))
+
+
+def test_launch_per_request_decode_pads_q_len_2_once(monkeypatch):
+    """A 2-token SM12x prefill must be one [1, 4] launch, not two [1, 1]."""
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    shapes: list[torch.Size] = []
+
+    def _fake_launch(**kwargs):
+        shapes.append(kwargs["query"].shape)
+
+    monkeypatch.setattr(
+        fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
+    )
+    dummy = SimpleNamespace(
+        scale=1.0,
+        attn_sink=None,
+        _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
+    )
+    q = torch.zeros(2, 8, 512)
+    output = torch.zeros(2, 8, 512)
+    DeepseekV4FlashInferSM120Attention._launch_per_request_decode(
+        dummy,
+        q,
+        output,
+        torch.zeros(1),
+        None,
+        torch.zeros(2, 16, dtype=torch.int32),
+        torch.ones(2, dtype=torch.int32),
+        None,
+        None,
+        0,
+        2,
+    )
+    assert shapes == [torch.Size([1, 4, 8, 512])]
