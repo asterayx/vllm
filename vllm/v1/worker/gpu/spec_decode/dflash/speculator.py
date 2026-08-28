@@ -12,6 +12,7 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.sm12x import sm12x_align_decode_q_len, sm12x_dspark_capture_sizes
 from vllm.v1.attention.backend import AttentionCGSupport
@@ -148,9 +149,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             vllm_config.compilation_config.cudagraph_capture_sizes,
             capture_query_len,
         )
-        orig_sizes = list(
-            vllm_config.compilation_config.cudagraph_capture_sizes or []
-        )
+        orig_sizes = list(vllm_config.compilation_config.cudagraph_capture_sizes or [])
         if capture_sizes != orig_sizes:
             logger.info(
                 "SM12x %s capture sizes: %s",
@@ -175,6 +174,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_pos.zero_()
         self.sample_idx_mapping.fill_(-1)
         assert self.query_cudagraph_manager is not None
+        if current_platform.is_device_capability_family(120):
+            torch.cuda.synchronize()
+            logger.info(
+                "SM12x %s capture: pre-dummy CUDA synchronize ok",
+                self._speculator_name,
+            )
         self.query_cudagraph_manager.capture(
             self._generate_draft,
             self.input_buffers,

@@ -122,13 +122,18 @@ class DFlashCudaGraphManager(CudaGraphManager):
             )
             attn_metadata, slot_mappings = attn_state
 
-            return lambda cg_mode: forward_fn(
-                num_reqs,
-                num_tokens,
-                attn_metadata,
-                slot_mappings,
-                num_tokens_across_dp,
-                cg_mode,
-            )
+            def _run(cg_mode: CUDAGraphMode) -> None:
+                forward_fn(
+                    num_reqs,
+                    num_tokens,
+                    attn_metadata,
+                    slot_mappings,
+                    num_tokens_across_dp,
+                    cg_mode,
+                )
+                if current_platform.is_device_capability_family(120):
+                    torch.cuda.synchronize()
+
+            return _run
 
         super().capture(create_forward_fn, progress_bar_desc)
