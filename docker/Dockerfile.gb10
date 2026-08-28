@@ -41,7 +41,9 @@ ENV PATH="/root/.local/bin:${PATH}"
 WORKDIR /opt/vllm
 COPY . /opt/vllm
 
-ARG MAX_JOBS=4
+# GB10 has ~20 ARM cores and 128GB unified memory. 8 is the idle-build
+# default; raise with --build-arg MAX_JOBS=12 if `free` stays comfortable.
+ARG MAX_JOBS=8
 RUN grep -v '^flashinfer' requirements/cuda.txt > /tmp/cuda-no-flashinfer.txt \
     && if [ "$(uname -m)" = "aarch64" ]; then \
         printf 'cython<3.3\n' > /tmp/build-constraints.txt \
