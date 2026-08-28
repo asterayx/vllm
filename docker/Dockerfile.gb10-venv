@@ -71,7 +71,11 @@ RUN if [ "${INSTALL_FLASHINFER_NIGHTLY}" = "1" ]; then \
 
 ARG INSTALL_B12X=0
 RUN if [ "${INSTALL_B12X}" = "1" ]; then \
-      chmod +x /tmp/install-b12x.sh \
+      if [ ! -x /root/.local/bin/uv ]; then \
+        curl -LsSf https://astral.sh/uv/install.sh | sh; \
+      fi \
+      && export PATH="/root/.local/bin:${PATH}" \
+      && chmod +x /tmp/install-b12x.sh \
       && /tmp/install-b12x.sh /opt/venv/bin/python; \
     fi \
     && rm -f /tmp/install-b12x.sh

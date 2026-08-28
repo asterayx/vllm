@@ -29,6 +29,11 @@ cat > "${STAGE}/Dockerfile" <<'EOF'
 ARG BASE=vllm-gb10:dspark
 FROM ${BASE}
 USER root
+# Packed host venvs have no pip; install with uv like the FlashInfer overlay.
+RUN if [ ! -x /root/.local/bin/uv ]; then \
+      curl -LsSf https://astral.sh/uv/install.sh | sh; \
+    fi
+ENV PATH="/root/.local/bin:${PATH}"
 COPY install-b12x.sh /tmp/install-b12x.sh
 RUN chmod +x /tmp/install-b12x.sh \
     && /tmp/install-b12x.sh /opt/venv/bin/python \
