@@ -154,11 +154,21 @@ flashinfer_trtllm_batch_decode_with_kv_cache_mla = _lazy_import_wrapper(
     "trtllm_batch_decode_with_kv_cache_mla",
     fallback_fn=_missing_sparse_mla,
 )
-flashinfer_trtllm_batch_decode_sparse_mla_dsv4 = _lazy_import_wrapper(
+_flashinfer_trtllm_batch_decode_sparse_mla_dsv4_impl = _lazy_import_wrapper(
     "flashinfer.decode",
     "trtllm_batch_decode_sparse_mla_dsv4",
     fallback_fn=_missing_sparse_mla,
 )
+
+
+def flashinfer_trtllm_batch_decode_sparse_mla_dsv4(*args: Any, **kwargs: Any):
+    """SM12x last line: refuse per-request ``[1, 2]`` / ``[1, 4]``."""
+    query = kwargs.get("query", args[0] if args else None)
+    if query is not None:
+        from vllm.utils.sm12x import reject_sm12x_unsafe_decode_query
+
+        reject_sm12x_unsafe_decode_query(query)
+    return _flashinfer_trtllm_batch_decode_sparse_mla_dsv4_impl(*args, **kwargs)
 flashinfer_xqa_batch_decode_with_kv_cache = _lazy_import_wrapper(
     "flashinfer.decode",
     "xqa_batch_decode_with_kv_cache",
