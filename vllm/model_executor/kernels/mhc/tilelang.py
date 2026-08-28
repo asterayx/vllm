@@ -2,7 +2,29 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+
+
+def mhc_pdl_enabled() -> bool:
+    """TileLang MHC PDL is unsafe on SM12x (GB10 / SM121 IMA during capture)."""
+    return (
+        current_platform.is_arch_support_pdl()
+        and current_platform.is_cuda()
+        and not current_platform.is_device_capability_family(120)
+    )
+
+
+def use_mhc_small_fma(num_tokens: int) -> bool:
+    """Hopper small-batch fused FMA (n_splits=4/8). Disabled on SM12x.
+
+    That path first compiles ``mhc_pre_big_fuse_with_norm`` at 16 tokens
+    (n_splits=4) and would recompile at 4 tokens (n_splits=8). SM121 IMA'd
+    during PIECEWISE dummy capture of those sizes; stay on n_splits=1.
+    """
+    if current_platform.is_device_capability_family(120):
+        return False
+    return num_tokens <= 16
 
 
 def _torch_hc_prenorm_gemm(
@@ -533,7 +555,7 @@ def mhc_fused_post_pre_tilelang(
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
     use_deep_gemm = is_deep_gemm_supported()
-    use_small_fma = num_tokens <= 16
+    use_small_fma = use_mhc_small_fma(num_tokens)
     if use_small_fma:
         # TODO(gnovack): investigate autotuning these heuristics
         tile_n = 2 if num_tokens < 8 else 3

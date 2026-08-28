@@ -23,6 +23,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
 from vllm.v1.attention.backend import MultipleOf
@@ -80,9 +81,7 @@ def _pad_to_supported_q_heads(num_heads: int) -> int:
     )
 
 
-def spec_decode_uniform_next_n(
-    num_decode_tokens: int, num_decodes: int
-) -> int | None:
+def spec_decode_uniform_next_n(num_decode_tokens: int, num_decodes: int) -> int | None:
     """Return tokens-per-request when the decode batch is uniform and >1.
 
     ``None`` means keep a flat ``[tokens, heads, dim]`` query (pure 1-token
@@ -96,6 +95,22 @@ def spec_decode_uniform_next_n(
     if num_decode_tokens % num_decodes != 0:
         return None
     return num_decode_tokens // num_decodes
+
+
+def sm12x_use_per_request_decode(next_n: int | None, decode_query_len: int) -> bool:
+    """Whether SM12x should skip the batched ``[B, next_n]`` FlashInfer launch.
+
+    PIECEWISE dummy of size 8 is 4 reqs × 2 tokens. FlashInfer's SM120 DSV4
+    batched decode IMA'd on ``next_n=2`` after ``next_n`` in {4, 6, 8}
+    succeeded. Keep the fast batched path for real DSpark decode
+    (``next_n == k+1``) and use the proven per-request ``[1, q_len]`` launch
+    for other uniform dummy widths.
+    """
+    if next_n is None:
+        return False
+    if not current_platform.is_device_capability_family(120):
+        return False
+    return next_n != decode_query_len
 
 
 def _required_sm120_sparse_topk(vllm_config: VllmConfig, window_size: int) -> int:
@@ -612,6 +627,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 required_topk,
                 resolved_topk,
             )
+        speculative_config = vllm_config.speculative_config
+        self._decode_query_len = 1 + (
+            speculative_config.num_speculative_tokens if speculative_config else 0
+        )
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
         # Per-tensor FP8 cache path scales.
         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
@@ -802,7 +821,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         # prefill kernel, whose SM120 build asserts num_tokens > 64
         # ("Decode ... must go through sparse_mla_sm120_decode_dsv4").
         next_n = spec_decode_uniform_next_n(num_decode_tokens, num_decodes)
-        if next_n is not None:
+        if next_n is not None and not sm12x_use_per_request_decode(
+            next_n, self._decode_query_len
+        ):
             q = q.view(num_decodes, next_n, *q.shape[1:])
             output = output.view(num_decodes, next_n, *output.shape[1:])
             swa_indices = swa_indices.reshape(num_decodes, next_n, -1)
@@ -814,10 +835,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             if extra_sparse_lengths is not None:
                 extra_sparse_lengths = extra_sparse_lengths.reshape(num_decodes, next_n)
         elif num_decodes > 0 and num_decode_tokens > num_decodes:
-            # Ragged decode (dummy capture of a non-multiple size, or a real
-            # mixed next_n batch). SM12x has no varlen decode path; launch one
-            # uniform [1, q_len, ...] call per request, matching the <=64
-            # prefill fallback.
+            # Ragged decode, or SM12x dummy next_n != DSpark k+1 (next_n=2
+            # IMA'd the batched SM120 kernel). Launch one [1, q_len, ...]
+            # call per request, matching the <=64 prefill fallback.
             query_start_loc_cpu = swa_metadata.query_start_loc_cpu
             if query_start_loc_cpu is None:
                 raise RuntimeError(

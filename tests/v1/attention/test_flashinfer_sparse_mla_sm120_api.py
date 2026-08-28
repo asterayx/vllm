@@ -9,6 +9,7 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     _required_sm120_sparse_topk,
+    sm12x_use_per_request_decode,
     spec_decode_uniform_next_n,
 )
 from vllm.platforms.interface import DeviceCapability
@@ -127,8 +128,40 @@ def test_spec_decode_uniform_next_n_accepts_dspark_and_skips_ragged_dummy():
     """
     assert spec_decode_uniform_next_n(36, 6) == 6
     assert spec_decode_uniform_next_n(24, 6) == 4
+    assert spec_decode_uniform_next_n(8, 4) == 2
+    assert spec_decode_uniform_next_n(16, 4) == 4
+    assert spec_decode_uniform_next_n(32, 4) == 8
     assert spec_decode_uniform_next_n(6, 6) is None
     assert spec_decode_uniform_next_n(32, 6) is None
     assert spec_decode_uniform_next_n(16, 6) is None
     assert spec_decode_uniform_next_n(8, 6) is None
     assert spec_decode_uniform_next_n(0, 0) is None
+
+
+def test_sm12x_dummy_next_n_uses_per_request_decode(monkeypatch):
+    """Size-8 dummy is 4×2 (next_n=2); batched SM120 decode IMA'd on GB10."""
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert sm12x_use_per_request_decode(2, 6)
+    assert sm12x_use_per_request_decode(4, 6)
+    assert sm12x_use_per_request_decode(8, 6)
+    assert not sm12x_use_per_request_decode(6, 6)
+    assert not sm12x_use_per_request_decode(None, 6)
+
+
+def test_non_sm12x_keeps_batched_spec_decode(monkeypatch):
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
+    assert not sm12x_use_per_request_decode(2, 6)
+    assert not sm12x_use_per_request_decode(4, 6)
+    assert not sm12x_use_per_request_decode(6, 6)

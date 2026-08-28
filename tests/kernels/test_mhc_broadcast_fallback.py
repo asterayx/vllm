@@ -6,7 +6,11 @@ import types
 
 import torch
 
-from vllm.model_executor.kernels.mhc.tilelang import mhc_pre_broadcast_tilelang
+from vllm.model_executor.kernels.mhc.tilelang import (
+    mhc_pdl_enabled,
+    mhc_pre_broadcast_tilelang,
+    use_mhc_small_fma,
+)
 
 
 def test_mhc_pre_broadcast_falls_back_without_deep_gemm(monkeypatch):
@@ -59,3 +63,52 @@ def test_mhc_pre_broadcast_falls_back_without_deep_gemm(monkeypatch):
     )
 
     assert fuse_called["value"]
+
+
+def test_mhc_small_fma_disabled_on_sm12x(monkeypatch):
+    """n_splits=4/8 fused FMA IMA'd on SM121 PIECEWISE dummy sizes 16 and 8."""
+    from vllm.model_executor.kernels.mhc import tilelang as mhc_tilelang
+
+    monkeypatch.setattr(
+        mhc_tilelang.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert use_mhc_small_fma(8) is False
+    assert use_mhc_small_fma(16) is False
+    assert use_mhc_small_fma(32) is False
+
+
+def test_mhc_small_fma_enabled_off_sm12x(monkeypatch):
+    from vllm.model_executor.kernels.mhc import tilelang as mhc_tilelang
+
+    monkeypatch.setattr(
+        mhc_tilelang.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
+    assert use_mhc_small_fma(8) is True
+    assert use_mhc_small_fma(16) is True
+    assert use_mhc_small_fma(32) is False
+
+
+def test_mhc_pdl_disabled_on_sm12x(monkeypatch):
+    from vllm.model_executor.kernels.mhc import tilelang as mhc_tilelang
+
+    monkeypatch.setattr(mhc_tilelang.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        mhc_tilelang.current_platform, "is_arch_support_pdl", lambda: True
+    )
+    monkeypatch.setattr(
+        mhc_tilelang.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert mhc_pdl_enabled() is False
+
+    monkeypatch.setattr(
+        mhc_tilelang.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
+    assert mhc_pdl_enabled() is True
