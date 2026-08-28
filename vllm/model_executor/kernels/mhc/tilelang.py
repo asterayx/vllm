@@ -2,8 +2,44 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
+
+# Size-16 MHC dummies captured on GB10; size 8 then IMA'd in the same
+# compiled TileLang kernel (dynamic num_tokens). Pad small batches up.
+SM12X_MHC_MIN_TOKENS = 16
+
+
+def sm12x_mhc_min_tokens() -> int:
+    """Pad MHC token dim to this on SM12x. 0 means no pad."""
+    if current_platform.is_device_capability_family(120):
+        return SM12X_MHC_MIN_TOKENS
+    return 0
+
+
+def _pad_token_rows(t: torch.Tensor, target: int) -> torch.Tensor:
+    n = t.shape[0]
+    if n >= target:
+        return t
+    return torch.cat((t, t.new_zeros((target - n, *t.shape[1:]))), dim=0)
+
+
+def _sm12x_pad_token_tensors(
+    *tensors: torch.Tensor,
+) -> tuple[list[torch.Tensor], int]:
+    orig = tensors[0].shape[0]
+    target = sm12x_mhc_min_tokens()
+    if not target or orig >= target:
+        return list(tensors), orig
+    logger.info_once(
+        "SM12x MHC: padding token dim %d -> %d to avoid small-batch IMA",
+        orig,
+        target,
+    )
+    return [_pad_token_rows(t, target) for t in tensors], orig
 
 
 def mhc_pdl_enabled() -> bool:
@@ -182,6 +218,8 @@ def mhc_pre_tilelang(
     outer_shape = residual.shape[:-2]
 
     residual_flat = residual.view(-1, hc_mult, hidden_size)
+    padded, orig_tokens = _sm12x_pad_token_tensors(residual_flat)
+    residual_flat = padded[0]
     num_tokens = residual_flat.shape[0]
 
     from vllm.utils.deep_gemm import is_deep_gemm_supported
@@ -273,9 +311,9 @@ def mhc_pre_tilelang(
         )
 
     return (
-        post_mix.view(*outer_shape, hc_mult, 1),
-        comb_mix.view(*outer_shape, hc_mult, hc_mult),
-        layer_input.view(*outer_shape, hidden_size),
+        post_mix[:orig_tokens].view(*outer_shape, hc_mult, 1),
+        comb_mix[:orig_tokens].view(*outer_shape, hc_mult, hc_mult),
+        layer_input[:orig_tokens].view(*outer_shape, hidden_size),
     )
 
 
@@ -361,8 +399,9 @@ def mhc_pre_broadcast_tilelang(
     if not norm_weight.is_contiguous():
         norm_weight = norm_weight.contiguous()
 
-    residual_flat = residual
-    num_tokens = residual.shape[0]
+    padded, orig_tokens = _sm12x_pad_token_tensors(residual)
+    residual_flat = padded[0]
+    num_tokens = residual_flat.shape[0]
 
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
@@ -440,10 +479,10 @@ def mhc_pre_broadcast_tilelang(
         hc_mult,
     )
     return (
-        residual_out,
-        post_mix.unsqueeze(-1),
-        comb_mix.view(num_tokens, hc_mult, hc_mult),
-        layer_input,
+        residual_out[:orig_tokens],
+        post_mix[:orig_tokens].unsqueeze(-1),
+        comb_mix[:orig_tokens].view(orig_tokens, hc_mult, hc_mult),
+        layer_input[:orig_tokens],
     )
 
 
@@ -457,6 +496,10 @@ def mhc_post_tilelang(
         mhc_post_tilelang as _mhc_post_kernel,
     )
 
+    padded, orig_tokens = _sm12x_pad_token_tensors(
+        x, residual, post_layer_mix, comb_res_mix
+    )
+    x, residual, post_layer_mix, comb_res_mix = padded
     out = torch.empty_like(residual)
     _mhc_post_kernel(
         comb_res_mix,
@@ -467,7 +510,7 @@ def mhc_post_tilelang(
         residual.shape[-2],
         residual.shape[-1],
     )
-    return out
+    return out[:orig_tokens]
 
 
 def mhc_fused_post_pre_tilelang(
@@ -547,10 +590,15 @@ def mhc_fused_post_pre_tilelang(
     assert hidden_size % n_splits == 0
 
     residual_flat = residual.view(-1, hc_mult, hidden_size)
+    orig_tokens = residual_flat.shape[0]
+    x_flat = x.reshape(orig_tokens, hidden_size)
+    post_layer_mix_flat = post_layer_mix.reshape(orig_tokens, hc_mult)
+    comb_res_mix_flat = comb_res_mix.reshape(orig_tokens, hc_mult, hc_mult)
+    padded, orig_tokens = _sm12x_pad_token_tensors(
+        residual_flat, x_flat, post_layer_mix_flat, comb_res_mix_flat
+    )
+    residual_flat, x_flat, post_layer_mix_flat, comb_res_mix_flat = padded
     num_tokens = residual_flat.shape[0]
-    x_flat = x.view(num_tokens, hidden_size)
-    post_layer_mix_flat = post_layer_mix.view(num_tokens, hc_mult)
-    comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
 
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
@@ -694,10 +742,10 @@ def mhc_fused_post_pre_tilelang(
         )
 
     return (
-        residual_cur.view(*outer_shape, hc_mult, hidden_size),
-        post_mix_cur.view(*outer_shape, hc_mult, 1),
-        comb_mix_cur.view(*outer_shape, hc_mult, hc_mult),
-        layer_input_cur.view(*outer_shape, hidden_size),
+        residual_cur[:orig_tokens].view(*outer_shape, hc_mult, hidden_size),
+        post_mix_cur[:orig_tokens].view(*outer_shape, hc_mult, 1),
+        comb_mix_cur[:orig_tokens].view(*outer_shape, hc_mult, hc_mult),
+        layer_input_cur[:orig_tokens].view(*outer_shape, hidden_size),
     )
 
 
@@ -766,12 +814,14 @@ def hc_head_fused_kernel_tilelang(
     hc_eps: float,
 ) -> torch.Tensor:
     """Apply the fused hc_head kernel and return the (T, H) bf16 result."""
+    padded, orig_tokens = _sm12x_pad_token_tensors(hs_flat)
+    hs_flat = padded[0]
     num_tokens, hc_mult, hidden_size = hs_flat.shape
     out = torch.empty(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_flat.device
     )
-    if num_tokens == 0:
-        return out
+    if orig_tokens == 0:
+        return out[:orig_tokens]
     from vllm.model_executor.kernels.mhc.tilelang_kernels import hc_head_fuse_tilelang
 
     hc_head_fuse_tilelang(
@@ -785,7 +835,7 @@ def hc_head_fused_kernel_tilelang(
         hc_eps,
         hc_mult,
     )
-    return out
+    return out[:orig_tokens]
 
 
 def _hc_head_fused_kernel_tilelang_fake(

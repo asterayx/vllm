@@ -7,8 +7,11 @@ import types
 import torch
 
 from vllm.model_executor.kernels.mhc.tilelang import (
+    _pad_token_rows,
+    _sm12x_pad_token_tensors,
     mhc_pdl_enabled,
     mhc_pre_broadcast_tilelang,
+    sm12x_mhc_min_tokens,
     use_mhc_small_fma,
 )
 
@@ -112,3 +115,36 @@ def test_mhc_pdl_disabled_on_sm12x(monkeypatch):
         lambda fam: False,
     )
     assert mhc_pdl_enabled() is True
+
+
+def test_sm12x_mhc_pads_small_token_dim(monkeypatch):
+    from vllm.model_executor.kernels.mhc import tilelang as mhc_tilelang
+
+    monkeypatch.setattr(
+        mhc_tilelang.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert sm12x_mhc_min_tokens() == 16
+    x = torch.randn(8, 4)
+    padded, orig = _sm12x_pad_token_tensors(x)
+    assert orig == 8
+    assert padded[0].shape == (16, 4)
+    assert torch.equal(padded[0][:8], x)
+    assert torch.count_nonzero(padded[0][8:]) == 0
+    assert _pad_token_rows(x, 8).shape == (8, 4)
+
+
+def test_non_sm12x_mhc_does_not_pad(monkeypatch):
+    from vllm.model_executor.kernels.mhc import tilelang as mhc_tilelang
+
+    monkeypatch.setattr(
+        mhc_tilelang.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
+    assert sm12x_mhc_min_tokens() == 0
+    x = torch.randn(8, 4)
+    padded, orig = _sm12x_pad_token_tensors(x)
+    assert orig == 8
+    assert padded[0] is x

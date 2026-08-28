@@ -38,23 +38,42 @@ class InputBuffers:
         )
 
 
-def uniform_dummy_num_reqs(num_tokens: int, max_num_reqs: int) -> int:
-    """Largest request count ≤ max_num_reqs that divides num_tokens.
+# SM12x FlashInfer IMA'd on dummy q_len in {2, 3} after q_len in {1, 4, 6, 8}
+# succeeded. Prefer a wider uniform dummy (e.g. 8 tokens → 2×4, not 4×2).
+_UNSAFE_DUMMY_TOKENS_PER_REQ = frozenset({2, 3})
+
+
+def uniform_dummy_num_reqs(
+    num_tokens: int,
+    max_num_reqs: int,
+    decode_query_len: int = 1,
+) -> int:
+    """Uniform request count ≤ max_num_reqs that divides num_tokens.
 
     PIECEWISE capture descriptors leave ``num_reqs`` unset and previously used
     ``min(num_tokens, max_num_seqs)``, dumping any remainder across requests
     (32 tokens over 6 seqs). SM12x DSpark decode treats those short queries as
     a spec-decode batch and requires ``num_decode_tokens % num_decodes == 0``.
-    A uniform dummy (e.g. 4×8 for size 32) keeps capture valid without
-    dropping non-multiple capture sizes from the CLI.
+
+    Prefer an exact DSpark packing (``tokens_per_req == decode_query_len``)
+    when it fits, then the largest divisor whose ``tokens_per_req`` is not in
+    ``{2, 3}``. Size 8 with ``max_num_seqs=6`` becomes 2×4, not 4×2.
     """
     if num_tokens <= 0:
         return 1
     limit = min(num_tokens, max(max_num_reqs, 1))
+    if decode_query_len > 1 and num_tokens % decode_query_len == 0:
+        packed = num_tokens // decode_query_len
+        if 1 <= packed <= limit:
+            return packed
+    fallback = 1
     for num_reqs in range(limit, 0, -1):
-        if num_tokens % num_reqs == 0:
+        if num_tokens % num_reqs != 0:
+            continue
+        fallback = num_reqs
+        if num_tokens // num_reqs not in _UNSAFE_DUMMY_TOKENS_PER_REQ:
             return num_reqs
-    return 1
+    return fallback
 
 
 @dataclass

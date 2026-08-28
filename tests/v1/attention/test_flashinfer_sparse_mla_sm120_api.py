@@ -9,6 +9,7 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     _required_sm120_sparse_topk,
+    sm12x_q_len_spans,
     sm12x_use_per_request_decode,
     spec_decode_uniform_next_n,
 )
@@ -165,3 +166,28 @@ def test_non_sm12x_keeps_batched_spec_decode(monkeypatch):
     assert not sm12x_use_per_request_decode(2, 6)
     assert not sm12x_use_per_request_decode(4, 6)
     assert not sm12x_use_per_request_decode(6, 6)
+
+
+def test_sm12x_splits_q_len_2_into_two_q_len_1(monkeypatch):
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert sm12x_q_len_spans(2) == [(0, 1), (1, 2)]
+    assert sm12x_q_len_spans(1) == [(0, 1)]
+    assert sm12x_q_len_spans(4) == [(0, 4)]
+    assert sm12x_q_len_spans(6) == [(0, 6)]
+
+
+def test_non_sm12x_keeps_q_len_2(monkeypatch):
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
+    assert sm12x_q_len_spans(2) == [(0, 2)]

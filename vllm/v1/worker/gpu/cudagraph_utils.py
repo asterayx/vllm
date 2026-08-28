@@ -516,8 +516,15 @@ class ModelCudaGraphManager(CudaGraphManager):
         ) -> Callable[[CUDAGraphMode], None]:
             num_tokens = desc.num_tokens
             num_reqs = desc.num_reqs or uniform_dummy_num_reqs(
-                num_tokens, self.max_num_reqs
+                num_tokens, self.max_num_reqs, self.decode_query_len
             )
+            if current_platform.is_device_capability_family(120):
+                logger.info(
+                    "SM12x CUDA-graph dummy: tokens=%d reqs=%d q_len=%d",
+                    num_tokens,
+                    num_reqs,
+                    num_tokens // num_reqs if num_reqs else 0,
+                )
 
             # Set LoRA state before capture so kernels see correct adapters.
             if lora_capture_hook is not None:

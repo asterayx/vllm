@@ -62,11 +62,11 @@ def test_make_dummy_distributes_remainder(num_reqs: int, num_tokens: int):
     [
         (32, 6, 4),  # DSpark capture size that used to assert 32/6
         (16, 6, 4),
-        (8, 6, 4),
+        (8, 6, 2),  # avoid q_len=2 (was 4×2; SM12x IMA)
         (24, 6, 6),
         (36, 6, 6),
         (1, 6, 1),
-        (2, 6, 2),
+        (2, 6, 2),  # 1-token-per-req; q_len=1 is safe
         (4, 6, 4),
     ],
 )
@@ -77,6 +77,9 @@ def test_uniform_dummy_num_reqs_keeps_dspark_capture_sizes_divisible(
     num_reqs = uniform_dummy_num_reqs(num_tokens, max_num_seqs)
     assert num_reqs == expected_reqs
     assert num_tokens % num_reqs == 0
+    tokens_per_req = num_tokens // num_reqs
+    if num_tokens > max_num_seqs:
+        assert tokens_per_req not in {2, 3}
 
 
 def test_piecewise_dummy_batch_32x6_is_uniform_spec_decode_safe():
@@ -93,3 +96,25 @@ def test_piecewise_dummy_batch_32x6_is_uniform_spec_decode_safe():
     assert len(query_lens) == num_reqs
     assert query_lens.min() == query_lens.max() == 8
     assert num_tokens % num_reqs == 0
+
+
+def test_uniform_dummy_prefers_dspark_query_len():
+    """Exact DSpark packing when it fits; otherwise skip q_len in {2, 3}."""
+    assert uniform_dummy_num_reqs(24, 6, decode_query_len=6) == 4
+    assert uniform_dummy_num_reqs(36, 6, decode_query_len=6) == 6
+    assert uniform_dummy_num_reqs(12, 6, decode_query_len=6) == 2
+    assert uniform_dummy_num_reqs(8, 6, decode_query_len=6) == 2
+
+
+def test_piecewise_dummy_batch_8x6_avoids_q_len_2():
+    """Size 8 used to be 4×2 and IMA'd on SM12x after 4×4 succeeded."""
+    num_tokens = 8
+    max_num_seqs = 6
+    num_reqs = uniform_dummy_num_reqs(num_tokens, max_num_seqs, decode_query_len=6)
+    buffers = InputBuffers(max_num_seqs, num_tokens, torch.device("cpu"))
+    batch = InputBatch.make_dummy(num_reqs, num_tokens, buffers)
+    query_lens = batch.query_start_loc_np[1:] - batch.query_start_loc_np[:-1]
+
+    assert num_reqs == 2
+    assert int(batch.num_scheduled_tokens.sum()) == num_tokens
+    assert query_lens.min() == query_lens.max() == 4

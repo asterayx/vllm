@@ -113,6 +113,17 @@ def sm12x_use_per_request_decode(next_n: int | None, decode_query_len: int) -> b
     return next_n != decode_query_len
 
 
+def sm12x_q_len_spans(q_len: int) -> list[tuple[int, int]]:
+    """Split SM12x ``q_len=2`` decode into two ``q_len=1`` launches.
+
+    Per-request ``[1, 2, ...]`` still IMA'd on GB10 after the batched
+    ``next_n=2`` path was disabled. ``q_len`` in {1, 4, 6, 8} is safe.
+    """
+    if q_len == 2 and current_platform.is_device_capability_family(120):
+        return [(0, 1), (1, 2)]
+    return [(0, q_len)]
+
+
 def _required_sm120_sparse_topk(vllm_config: VllmConfig, window_size: int) -> int:
     """Return the SM120 DSV4 SWA specialization needed by this model."""
     if not vllm_config.attention_config.use_non_causal:
@@ -759,6 +770,58 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             q = padded_query
         return q.contiguous()
 
+    def _launch_per_request_decode(
+        self,
+        q: torch.Tensor,
+        output: torch.Tensor,
+        swa_cache: torch.Tensor,
+        extra_cache: torch.Tensor | None,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        extra_sparse_indices: torch.Tensor | None,
+        extra_sparse_lengths: torch.Tensor | None,
+        token_start: int,
+        token_end: int,
+    ) -> None:
+        """Launch FlashInfer decode for ``[token_start, token_end)``.
+
+        On SM12x, ``q_len=2`` is split into two ``q_len=1`` launches.
+        """
+        q_len = token_end - token_start
+        spans = sm12x_q_len_spans(q_len)
+        if q_len == 2 and len(spans) > 1:
+            logger.info_once(
+                "SM12x FlashInfer: splitting q_len=2 into two q_len=1 launches"
+            )
+        for off0, off1 in spans:
+            start = token_start + off0
+            end = token_start + off1
+            span_len = end - start
+            esi = (
+                extra_sparse_indices[start:end].reshape(1, span_len, -1)
+                if extra_sparse_indices is not None
+                else None
+            )
+            esl = (
+                extra_sparse_lengths[start:end].reshape(1, span_len)
+                if extra_sparse_lengths is not None
+                else None
+            )
+            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                query=q[start:end].reshape(1, span_len, *q.shape[1:]),
+                swa_kv_cache=swa_cache,
+                workspace_buffer=self._get_workspace(q.device),
+                sparse_indices=swa_indices[start:end].reshape(1, span_len, -1),
+                compressed_kv_cache=extra_cache,
+                out=output[start:end].reshape(1, span_len, *output.shape[1:]),
+                bmm1_scale=self.scale,
+                sinks=self.attn_sink,
+                kv_layout="NHD",
+                swa_topk_lens=swa_lens[start:end].reshape(1, span_len),
+                extra_sparse_indices=esi,
+                extra_sparse_topk_lens=esl,
+            )
+
     def _forward_decode(
         self,
         q: torch.Tensor,
@@ -849,30 +912,17 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 re_ = int(query_start_loc_cpu[i + 1])
                 if re_ <= rs:
                     continue
-                ql = re_ - rs
-                esi = (
-                    extra_sparse_indices[rs:re_].reshape(1, ql, -1)
-                    if extra_sparse_indices is not None
-                    else None
-                )
-                esl = (
-                    extra_sparse_lengths[rs:re_].reshape(1, ql)
-                    if extra_sparse_lengths is not None
-                    else None
-                )
-                flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-                    query=q[rs:re_].reshape(1, ql, *q.shape[1:]),
-                    swa_kv_cache=swa_cache,
-                    workspace_buffer=self._get_workspace(q.device),
-                    sparse_indices=swa_indices[rs:re_].reshape(1, ql, -1),
-                    compressed_kv_cache=extra_cache,
-                    out=output[rs:re_].reshape(1, ql, *output.shape[1:]),
-                    bmm1_scale=self.scale,
-                    sinks=self.attn_sink,
-                    kv_layout="NHD",
-                    swa_topk_lens=swa_lens[rs:re_].reshape(1, ql),
-                    extra_sparse_indices=esi,
-                    extra_sparse_topk_lens=esl,
+                self._launch_per_request_decode(
+                    q,
+                    output,
+                    swa_cache,
+                    extra_cache,
+                    swa_indices,
+                    swa_lens,
+                    extra_sparse_indices,
+                    extra_sparse_lengths,
+                    rs,
+                    re_,
                 )
             return
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
@@ -1011,34 +1061,17 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     )
                     if re_ <= rs:
                         continue
-                    ql = re_ - rs
-                    esi = (
-                        extra_sparse_indices[rs:re_].reshape(1, ql, -1)
-                        if extra_sparse_indices is not None
-                        else None
-                    )
-                    esl = (
-                        extra_sparse_lengths[rs:re_].reshape(1, ql)
-                        if extra_sparse_lengths is not None
-                        else None
-                    )
-                    flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-                        query=q[rs:re_].reshape(1, ql, *q.shape[1:]),
-                        swa_kv_cache=swa_kv_paged,
-                        workspace_buffer=self._get_workspace(q.device),
-                        sparse_indices=swa_metadata.prefill_swa_indices[rs:re_].reshape(
-                            1, ql, -1
-                        ),
-                        compressed_kv_cache=extra_kv_paged,
-                        out=output[rs:re_].reshape(1, ql, *output.shape[1:]),
-                        bmm1_scale=self.scale,
-                        sinks=self.attn_sink,
-                        kv_layout="NHD",
-                        swa_topk_lens=swa_metadata.prefill_swa_lens[rs:re_].reshape(
-                            1, ql
-                        ),
-                        extra_sparse_indices=esi,
-                        extra_sparse_topk_lens=esl,
+                    self._launch_per_request_decode(
+                        q,
+                        output,
+                        swa_kv_paged,
+                        extra_kv_paged,
+                        swa_metadata.prefill_swa_indices,
+                        swa_metadata.prefill_swa_lens,
+                        extra_sparse_indices,
+                        extra_sparse_lengths,
+                        rs,
+                        re_,
                     )
                 continue
             flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
