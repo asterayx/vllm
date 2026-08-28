@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Pack the already-built host venv into vllm-gb10:dspark. Does not compile vLLM.
-# Run from the repo root on the Spark that already has ~/.venv/vllm028.
+# Run from the repo root on the Spark that already has the compiled venv.
 #
-#   ./docker/gb10/pack-venv.sh
-#   INSTALL_FLASHINFER_NIGHTLY=1 ./docker/gb10/pack-venv.sh
+#   VENV=/home/roccen/.venvs/vllm028 ./docker/gb10/pack-venv.sh
+#   INSTALL_FLASHINFER_NIGHTLY=1 VENV=/home/roccen/.venvs/vllm028 ./docker/gb10/pack-venv.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -12,12 +12,20 @@ if [[ "$(uname -m)" != "aarch64" ]]; then
   exit 1
 fi
 
-VENV="${VENV:-${HOME}/.venv/vllm028}"
+if [[ -z "${VENV:-}" ]]; then
+  for candidate in "${HOME}/.venvs/vllm028" "${HOME}/.venv/vllm028"; do
+    if [[ -x "${candidate}/bin/python" ]]; then
+      VENV="${candidate}"
+      break
+    fi
+  done
+fi
+VENV="${VENV:-${HOME}/.venvs/vllm028}"
 IMAGE="${VLLM_GB10_IMAGE:-vllm-gb10:dspark}"
 INSTALL_FLASHINFER_NIGHTLY="${INSTALL_FLASHINFER_NIGHTLY:-0}"
 
 if [[ ! -x "${VENV}/bin/python" ]]; then
-  echo "No venv at ${VENV}. Set VENV=..." >&2
+  echo "No venv at ${VENV}. Set VENV=/home/roccen/.venvs/vllm028" >&2
   exit 1
 fi
 

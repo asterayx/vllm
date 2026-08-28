@@ -1,5 +1,5 @@
 # Pack an already-built host venv + this repo. No vLLM compile, no torch download.
-#   VENV=~/.venv/vllm028 ./docker/gb10/pack-venv.sh
+#   VENV=/home/roccen/.venvs/vllm028 ./docker/gb10/pack-venv.sh
 #
 # Optional FlashInfer 0814 overlay (wheel only):
 #   INSTALL_FLASHINFER_NIGHTLY=1 ./docker/gb10/pack-venv.sh
@@ -12,6 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:/usr/local/cuda/bin:${PATH} \
+    PYTHONPATH=/opt/vllm \
     CUDA_HOME=/usr/local/cuda \
     TORCH_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_CUDA_ARCH_LIST=12.1a \
@@ -42,7 +43,7 @@ ARG INSTALL_FLASHINFER_NIGHTLY=0
 RUN if [ "${INSTALL_FLASHINFER_NIGHTLY}" = "1" ]; then \
       curl -LsSf https://astral.sh/uv/install.sh | sh \
       && /root/.local/bin/uv pip install --python /opt/venv/bin/python \
-           /opt/vllm/requirements/flashinfer-sm12x-nightly.txt \
+           -r /opt/vllm/requirements/flashinfer-sm12x-nightly.txt \
       && /root/.local/bin/uv pip uninstall --python /opt/venv/bin/python \
            flashinfer-jit-cache || true; \
     fi

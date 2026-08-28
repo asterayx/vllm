@@ -29,6 +29,7 @@ services:
       HF_HOME: /root/.cache/huggingface
       HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
       TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-1}
+      PYTHONPATH: /opt/vllm
       VLLM_HOST_IP: ${VLLM_HOST_IP}
       VLLM_USE_DEEP_GEMM: "0"
       VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
@@ -52,6 +53,12 @@ services:
       - bash
       - -lc
       - >
+        for site in /opt/venv/lib/python*/site-packages; do
+        [ -d "$$site" ] || continue;
+        rm -f "$$site"/__editable__.vllm* "$$site"/__editable___vllm*;
+        echo /opt/vllm > "$$site"/_vllm_relocated.pth;
+        done;
+        export PYTHONPATH=/opt/vllm;
         exec vllm serve /models/DeepSeek-V4-Flash-0731
         --served-model-name deepseek-v4-flash-0731
         --trust-remote-code

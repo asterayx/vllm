@@ -28,6 +28,7 @@ exec docker run --rm -it --name "${NAME}" \
   -v "${HF_CACHE}/flashinfer:/root/.cache/flashinfer" \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
+  -e PYTHONPATH=/opt/vllm \
   -e VLLM_HOST_IP="${VLLM_HOST_IP}" \
   -e VLLM_USE_DEEP_GEMM=0 \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
@@ -47,8 +48,17 @@ exec docker run --rm -it --name "${NAME}" \
   -e TP_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-enp1s0f1np1}" \
   -e NCCL_IB_HCA="${NCCL_IB_HCA:-rocep1s0f1,roceP2p1s0f1}" \
   -e NCCL_DEBUG="${NCCL_DEBUG:-WARN}" \
-  --entrypoint vllm \
+  --entrypoint bash \
   "${IMAGE}" \
+  -c 'export PATH=/opt/venv/bin:${PATH}
+       for site in /opt/venv/lib/python*/site-packages; do
+         [ -d "$site" ] || continue
+         rm -f "$site"/__editable__.vllm* "$site"/__editable___vllm*
+         echo /opt/vllm > "$site"/_vllm_relocated.pth
+       done
+       export PYTHONPATH=/opt/vllm${PYTHONPATH:+:$PYTHONPATH}
+       exec vllm "$@"' \
+  vllm \
   serve "${MODEL_PATH}" \
   --served-model-name deepseek-v4-flash-0731 \
   --host 0.0.0.0 --port "${VLLM_PORT:-30001}" \
