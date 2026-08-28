@@ -457,3 +457,80 @@ def test_forward_prefill_q_len_2_is_one_padded_launch(monkeypatch):
     assert shapes == [torch.Size([1, 6, 8, 512])]
     assert shapes[0][1] != 4
     assert shapes[0] != torch.Size([65, 8, 512])
+
+
+def test_forward_prefill_c4a_q_len_2_is_one_padded_launch(monkeypatch):
+    """Spark mixed-warmup seed is C4A; still one [1, 6], never [1, 4]."""
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    shapes: list[torch.Size] = []
+    extra_shapes: list[torch.Size] = []
+
+    def _fake_launch(**launch_kwargs):
+        shapes.append(launch_kwargs["query"].shape)
+        extra = launch_kwargs["extra_sparse_indices"]
+        extra_shapes.append(extra.shape)
+
+    monkeypatch.setattr(
+        fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
+    )
+    monkeypatch.setattr(
+        fi_sparse,
+        "compute_global_topk_indices_and_lens",
+        lambda *args, **kwargs: (
+            torch.zeros(2, 8, dtype=torch.int32),
+            torch.ones(2, dtype=torch.int32),
+        ),
+    )
+    dummy = SimpleNamespace(
+        compress_ratio=4,
+        PREFILL_CHUNK_SIZE=4,
+        scale=1.0,
+        attn_sink=None,
+        kv_cache_torch_dtype=torch.bfloat16,
+        topk_indices_buffer=torch.zeros(2, 8, dtype=torch.int32),
+        _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
+        _as_sparse_cache=DeepseekV4FlashInferSM120Attention._as_sparse_cache,
+    )
+    dummy._prepare_query = (
+        DeepseekV4FlashInferSM120Attention._prepare_query.__get__(dummy)
+    )
+    dummy._launch_per_request_decode = (
+        DeepseekV4FlashInferSM120Attention._launch_per_request_decode.__get__(
+            dummy
+        )
+    )
+    swa = SimpleNamespace(
+        num_prefills=1,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefill_tokens=2,
+        query_start_loc_cpu=torch.tensor([0, 2]),
+        prefill_swa_indices=torch.zeros(2, 16, dtype=torch.int32),
+        prefill_swa_lens=torch.ones(2, dtype=torch.int32),
+        token_to_req_indices=torch.zeros(2, dtype=torch.int32),
+        is_valid_token=torch.ones(2, dtype=torch.bool),
+    )
+    attn = SimpleNamespace(
+        block_table=torch.zeros(1, 4, dtype=torch.int32),
+        block_size=64,
+    )
+    q = torch.zeros(2, 8, 512, dtype=torch.bfloat16)
+    output = torch.zeros(2, 8, 512, dtype=torch.bfloat16)
+    DeepseekV4FlashInferSM120Attention._forward_prefill(
+        dummy, q, torch.zeros(1), torch.zeros(1), output, attn, swa
+    )
+    assert shapes == [torch.Size([1, 6, 8, 512])]
+    assert extra_shapes == [torch.Size([1, 6, 8])]
+    assert shapes[0][1] != 4
