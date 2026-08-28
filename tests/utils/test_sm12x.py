@@ -278,3 +278,22 @@ def test_sm12x_c128a_split_matches_swa_for_mixed_warmup(monkeypatch):
     assert split_decodes_and_prefills(mixed, decode_threshold=6) == (2, 0, 3, 0)
     names = DeepseekV4SparseMLAMetadataBuilder._build_c128a_metadata.__code__.co_names
     assert "sm12x_treat_short_extends_as_decodes" in names
+
+
+def test_sm12x_dspark_dummy_syncs_only_on_eager_warmup(monkeypatch):
+    """Spark 16:53: synchronize inside torch.cuda.graph aborted DSpark 0/3."""
+    from vllm.v1.worker.gpu.spec_decode.dflash import cudagraph as dflash_cg
+
+    synced: list[bool] = []
+    monkeypatch.setattr(
+        dflash_cg.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    monkeypatch.setattr(
+        dflash_cg.torch.cuda, "synchronize", lambda: synced.append(True)
+    )
+    dflash_cg._sync_after_eager_dspark_dummy(False)
+    assert synced == []
+    dflash_cg._sync_after_eager_dspark_dummy(True)
+    assert synced == [True]

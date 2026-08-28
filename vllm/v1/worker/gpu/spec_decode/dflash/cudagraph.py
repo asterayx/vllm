@@ -25,6 +25,16 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _sync_after_eager_dspark_dummy(warmup: bool) -> None:
+    """Flush pending IMA after eager DSpark warmup only.
+
+    ``torch.cuda.synchronize`` inside ``torch.cuda.graph`` raises
+    ``cudaErrorStreamCaptureUnsupported`` (Spark 16:53, progress 0/3).
+    """
+    if warmup and current_platform.is_device_capability_family(120):
+        torch.cuda.synchronize()
+
+
 def _prepare_dflash_inputs_to_capture(
     num_reqs: int,
     num_tokens: int,
@@ -133,8 +143,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
                     num_tokens_across_dp,
                     cg_mode,
                 )
-                if current_platform.is_device_capability_family(120):
-                    torch.cuda.synchronize()
+                _sync_after_eager_dspark_dummy(warmup)
 
             return _run
 
