@@ -22,6 +22,10 @@ exec docker run --rm -it --name "${NAME}" \
   --gpus all --ipc=host --network host --privileged \
   --shm-size=64g --ulimit memlock=-1 --ulimit stack=67108864 \
   --device /dev/infiniband \
+  -v /dev/infiniband:/dev/infiniband \
+  -v /sys/class/infiniband:/sys/class/infiniband \
+  -v /etc/libibverbs.d:/etc/libibverbs.d:ro \
+  -v /usr/lib/aarch64-linux-gnu/libibverbs:/usr/lib/aarch64-linux-gnu/libibverbs:ro \
   -v "${MODEL_HOST}:${MODEL_PATH}:ro" \
   -v "${VLLM_CACHE}:/root/.cache/vllm" \
   -v "${HF_CACHE}:/root/.cache/huggingface" \

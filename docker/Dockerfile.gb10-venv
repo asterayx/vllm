@@ -25,6 +25,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         libibverbs1 \
+        ibverbs-providers \
+        ibverbs-utils \
+        libmlx5-1 \
+        librdmacm1 \
         rdma-core \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python
