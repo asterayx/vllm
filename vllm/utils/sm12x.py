@@ -48,6 +48,20 @@ def sm12x_mixed_warmup_decode_prompt_len() -> int:
     return 2
 
 
+def sm12x_mixed_warmup_prefill_len(requested_prefill: int) -> int:
+    """Scheduled mixed-step prefill tokens.
+
+    On SM12x keep ``q_len=2`` so FlashInfer pads one decode launch.
+    Growing the scheduled prefill to 16 makes a 16-token *real* prefill,
+    which is not the pad path and already IMA'd at 4 real tokens.
+    """
+    if requested_prefill <= 0:
+        return requested_prefill
+    if current_platform.is_device_capability_family(120):
+        return sm12x_mixed_warmup_decode_prompt_len()
+    return requested_prefill
+
+
 def sm12x_align_decode_q_len(q_len: int) -> int:
     """Snap a FlashInfer decode-form q_len to a GB10-safe width.
 

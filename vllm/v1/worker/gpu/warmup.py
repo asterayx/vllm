@@ -13,8 +13,8 @@ from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.utils.math_utils import cdiv
 from vllm.utils.sm12x import (
-    sm12x_align_prefill_q_len,
     sm12x_mixed_warmup_decode_prompt_len,
+    sm12x_mixed_warmup_prefill_len,
 )
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -95,7 +95,7 @@ def run_mixed_prefill_decode_warmup(
     decode_prompt_len = sm12x_mixed_warmup_decode_prompt_len()
     decode_scheduled_tokens = 1
     requested_prefill = num_tokens - decode_scheduled_tokens
-    prefill_len = sm12x_align_prefill_q_len(requested_prefill)
+    prefill_len = sm12x_mixed_warmup_prefill_len(requested_prefill)
     mixed_tokens = decode_scheduled_tokens + prefill_len
     if prefill_len != requested_prefill or decode_prompt_len != 2:
         logger.info_once(
