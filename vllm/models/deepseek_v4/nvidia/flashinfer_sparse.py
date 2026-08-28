@@ -26,7 +26,11 @@ from vllm.models.deepseek_v4.sparse_mla import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
-from vllm.utils.sm12x import sm12x_align_decode_q_len, sm12x_align_prefill_q_len
+from vllm.utils.sm12x import (
+    SM12X_SPARSE_PREFILL_MIN_TOKENS,
+    sm12x_align_decode_q_len,
+    sm12x_use_padded_prefill_kernel,
+)
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
@@ -142,6 +146,14 @@ def _batch_token_span(
     if sl.ndim == 1:
         return sl.reshape(1, target)
     return sl.reshape(1, target, *sl.shape[1:])
+
+
+def _pad_token_dim(t: torch.Tensor, target: int, fill: int | float = 0) -> torch.Tensor:
+    """Pad ``t`` along dim 0 to ``target`` rows."""
+    n = t.shape[0]
+    if n >= target:
+        return t
+    return torch.cat((t, t.new_full((target - n, *t.shape[1:]), fill)), dim=0)
 
 
 def _required_sm120_sparse_topk(vllm_config: VllmConfig, window_size: int) -> int:
@@ -802,19 +814,15 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         extra_sparse_lengths: torch.Tensor | None,
         token_start: int,
         token_end: int,
-        *,
-        is_prefill: bool = False,
     ) -> None:
         """Launch FlashInfer decode for ``[token_start, token_end)``.
 
-        On SM12x, pad unsupported q_len instead of splitting a 2-token
-        prefill into two q_len=1 launches (the second token's KV is not
-        in cache yet). Decode uses capture-proven widths; real prefills
-        pad to the MHC/MoE width because q_len=4 still IMA'd as a seed.
+        On SM12x, pad unsupported decode q_len instead of splitting a
+        2-token span into two q_len=1 launches. Real short prefills go
+        through ``_launch_padded_sm12x_prefill_chunk``, not this path.
         """
         q_len = token_end - token_start
-        align = sm12x_align_prefill_q_len if is_prefill else sm12x_align_decode_q_len
-        launch_len = align(q_len)
+        launch_len = sm12x_align_decode_q_len(q_len)
         if launch_len != q_len:
             logger.info_once(
                 "SM12x FlashInfer: padding q_len=%d -> %d to avoid small-batch IMA",
@@ -861,6 +869,59 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         )
         if launch_len != q_len:
             output[token_start:token_end].copy_(out[0, :q_len])
+
+    def _launch_padded_sm12x_prefill_chunk(
+        self,
+        q_chunk: torch.Tensor,
+        output_chunk: torch.Tensor,
+        swa_cache: torch.Tensor,
+        extra_cache: torch.Tensor | None,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        extra_sparse_indices: torch.Tensor | None,
+        extra_sparse_lengths: torch.Tensor | None,
+    ) -> None:
+        """Pad a short SM12x prefill into one >64-token prefill-kernel launch.
+
+        Do not split q_len=2 into decode launches. Decode-form q_len=4 still
+        IMA'd as a real seed after capture.
+        """
+        orig = q_chunk.shape[0]
+        target = SM12X_SPARSE_PREFILL_MIN_TOKENS
+        if orig != target:
+            logger.info_once(
+                "SM12x FlashInfer: padding prefill tokens=%d -> %d "
+                "to use SM120 prefill kernel",
+                orig,
+                target,
+            )
+        out = _pad_token_dim(output_chunk, target)
+        esi = (
+            _pad_token_dim(extra_sparse_indices, target, fill=-1)
+            if extra_sparse_indices is not None
+            else None
+        )
+        esl = (
+            _pad_token_dim(extra_sparse_lengths, target)
+            if extra_sparse_lengths is not None
+            else None
+        )
+        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+            query=_pad_token_dim(q_chunk, target),
+            swa_kv_cache=swa_cache,
+            workspace_buffer=self._get_workspace(q_chunk.device),
+            sparse_indices=_pad_token_dim(swa_indices, target, fill=-1),
+            compressed_kv_cache=extra_cache,
+            out=out,
+            bmm1_scale=self.scale,
+            sinks=self.attn_sink,
+            kv_layout="NHD",
+            swa_topk_lens=_pad_token_dim(swa_lens, target),
+            extra_sparse_indices=esi,
+            extra_sparse_topk_lens=esl,
+        )
+        if orig != target:
+            output_chunk.copy_(out[:orig])
 
     def _forward_decode(
         self,
@@ -1088,12 +1149,24 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."
                 )
+            if sm12x_use_padded_prefill_kernel(q_chunk.shape[0]):
+                # Decode-form reuse IMA'd on real SM12x prefills (q_len=2
+                # split and q_len=4 seed). Pad once into the >64 kernel.
+                self._launch_padded_sm12x_prefill_chunk(
+                    q_chunk,
+                    output[query_start:query_end],
+                    swa_kv_paged,
+                    extra_kv_paged,
+                    swa_indices_chunk,
+                    swa_lens_chunk,
+                    extra_sparse_indices_chunk,
+                    extra_sparse_lengths_chunk,
+                )
+                continue
             if q_chunk.shape[0] <= 64:
                 # SM120's sparse prefill kernel asserts num_tokens > 64.
-                # Small segments (the DSpark draft's k-token pass, short
-                # chunked-prefill tails) must use the uniform decode-form
-                # [1, q_len, ...] call, which FlashInfer routes to its
-                # sparse_mla_sm120_decode_dsv4 kernels (q_len <= 64 legal).
+                # Off SM12x, small segments use the uniform decode-form
+                # [1, q_len, ...] call (q_len <= 64 legal).
                 for ri in range(chunk_start, chunk_end):
                     rs = int(query_start_loc_cpu[num_decodes + ri] - prefill_token_base)
                     re_ = int(
@@ -1112,7 +1185,6 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                         extra_sparse_lengths,
                         rs,
                         re_,
-                        is_prefill=True,
                     )
                 continue
             flashinfer_trtllm_batch_decode_sparse_mla_dsv4(

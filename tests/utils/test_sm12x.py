@@ -5,6 +5,7 @@ import torch
 
 from vllm.utils.sm12x import (
     SM12X_SAFE_MIN_TOKENS,
+    SM12X_SPARSE_PREFILL_MIN_TOKENS,
     extend_padding_mask,
     pad_token_rows,
     sm12x_align_decode_q_len,
@@ -12,6 +13,7 @@ from vllm.utils.sm12x import (
     sm12x_align_tokens,
     sm12x_mixed_warmup_decode_prompt_len,
     sm12x_pad_token_rows,
+    sm12x_use_padded_prefill_kernel,
 )
 
 
@@ -41,10 +43,15 @@ def test_sm12x_align_decode_q_len_snaps_to_safe_widths(monkeypatch):
     assert sm12x_align_decode_q_len(2) == 4
     assert sm12x_align_decode_q_len(15) == 16
     assert sm12x_align_decode_q_len(1) == 1
-    assert sm12x_align_prefill_q_len(2) == SM12X_SAFE_MIN_TOKENS
-    assert sm12x_align_prefill_q_len(4) == SM12X_SAFE_MIN_TOKENS
-    assert sm12x_align_prefill_q_len(16) == SM12X_SAFE_MIN_TOKENS
-    assert sm12x_mixed_warmup_decode_prompt_len() == SM12X_SAFE_MIN_TOKENS
+    assert sm12x_align_prefill_q_len(2) == SM12X_SPARSE_PREFILL_MIN_TOKENS
+    assert sm12x_align_prefill_q_len(4) == SM12X_SPARSE_PREFILL_MIN_TOKENS
+    assert sm12x_align_prefill_q_len(16) == SM12X_SPARSE_PREFILL_MIN_TOKENS
+    assert sm12x_align_prefill_q_len(65) == SM12X_SPARSE_PREFILL_MIN_TOKENS
+    assert sm12x_mixed_warmup_decode_prompt_len() == SM12X_SPARSE_PREFILL_MIN_TOKENS
+    assert sm12x_use_padded_prefill_kernel(2)
+    assert sm12x_use_padded_prefill_kernel(4)
+    assert sm12x_use_padded_prefill_kernel(16)
+    assert not sm12x_use_padded_prefill_kernel(65)
 
 
 def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
@@ -58,6 +65,7 @@ def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
     assert sm12x_align_tokens(8) == 8
     assert sm12x_mixed_warmup_decode_prompt_len() == 2
     assert sm12x_align_prefill_q_len(2) == 2
+    assert not sm12x_use_padded_prefill_kernel(2)
 
 
 def test_sm12x_pad_token_rows(monkeypatch):

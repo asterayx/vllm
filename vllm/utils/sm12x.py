@@ -22,6 +22,10 @@ SM12X_SAFE_MIN_TOKENS = 16
 # launches also IMA'd (token 1's KV is not in cache yet).
 SM12X_SAFE_DECODE_Q_LENS = (1, 4, 6, 8, 16, 24, 32, 36)
 
+# SM120 sparse prefill kernel asserts num_tokens > 64. Decode-form
+# reuse (q_len=2 split, q_len=4 real seed) IMA'd after capture.
+SM12X_SPARSE_PREFILL_MIN_TOKENS = 65
+
 
 def sm12x_align_tokens(num_tokens: int, min_tokens: int = SM12X_SAFE_MIN_TOKENS) -> int:
     """Return a safe token count for SM12x kernels. Unchanged off SM12x."""
@@ -37,13 +41,12 @@ def sm12x_align_tokens(num_tokens: int, min_tokens: int = SM12X_SAFE_MIN_TOKENS)
 def sm12x_mixed_warmup_decode_prompt_len() -> int:
     """Prefill length used to seed mixed-warmup's decode request.
 
-    SM12x FlashInfer IMA'd on the historical 2-token seed and on a 4-token
-    real seed (q_len=4 survived capture only as a dummy decode). Seed at
-    the MHC/MoE width; short prefills pad via
-    :func:`sm12x_align_prefill_q_len`.
+    SM12x FlashInfer IMA'd on 2-token and 4-token real seeds that reused
+    the decode-form kernel (``q_len <= 64``). Seed above that threshold so
+    the SM120 prefill kernel runs instead of a padded decode launch.
     """
     if current_platform.is_device_capability_family(120):
-        return SM12X_SAFE_MIN_TOKENS
+        return SM12X_SPARSE_PREFILL_MIN_TOKENS
     return 2
 
 
@@ -62,19 +65,26 @@ def sm12x_align_decode_q_len(q_len: int) -> int:
 
 
 def sm12x_align_prefill_q_len(q_len: int) -> int:
-    """Snap a FlashInfer decode-form *prefill* q_len to a GB10-safe width.
+    """Snap a short SM12x prefill to the SM120 prefill-kernel minimum.
 
-    SM120's sparse prefill kernel requires ``num_tokens > 64``, so short
-    prefills reuse the decode-form launch. Capture-proven decode widths
-    (4, 6, 8) still IMA'd as a real seed prefill: do not split ``q_len=2``
-    into two ``q_len=1`` launches, and do not stop at those decode widths.
-    Pad to :data:`SM12X_SAFE_MIN_TOKENS` instead.
+    Do not split ``q_len=2`` into two decode launches, and do not keep a
+    real prefill on decode-form widths that already IMA'd (2, 4, 16).
+    Unchanged off SM12x.
     """
     if q_len <= 0 or not current_platform.is_device_capability_family(120):
         return q_len
-    if q_len < SM12X_SAFE_MIN_TOKENS:
-        return SM12X_SAFE_MIN_TOKENS
-    return sm12x_align_decode_q_len(q_len)
+    if q_len < SM12X_SPARSE_PREFILL_MIN_TOKENS:
+        return SM12X_SPARSE_PREFILL_MIN_TOKENS
+    return q_len
+
+
+def sm12x_use_padded_prefill_kernel(num_tokens: int) -> bool:
+    """Whether a short SM12x prefill must pad into the >64-token kernel."""
+    return (
+        num_tokens > 0
+        and num_tokens <= 64
+        and current_platform.is_device_capability_family(120)
+    )
 
 
 def pad_token_rows(t: torch.Tensor, target: int) -> torch.Tensor:
