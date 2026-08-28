@@ -18,17 +18,22 @@ _cutedsl_available: bool | None = None
 
 def is_available() -> bool:
     global _cutedsl_available
-    if _cutedsl_available is not None:
-        return _cutedsl_available
-    try:
-        import cutlass  # noqa: F401
-        import cutlass.cute  # noqa: F401
+    if _cutedsl_available is None:
+        try:
+            import cutlass  # noqa: F401
+            import cutlass.cute  # noqa: F401
 
-        _cutedsl_available = True
-    except ImportError:
-        _cutedsl_available = False
-        logger.info("cuteDSL (CUTLASS Python) not available, ll_bf16_gemm disabled")
-    return _cutedsl_available
+            _cutedsl_available = True
+        except ImportError:
+            _cutedsl_available = False
+            logger.info(
+                "cuteDSL (CUTLASS Python) not available, ll_bf16_gemm disabled"
+            )
+    if not _cutedsl_available:
+        return False
+    from vllm.utils.cutedsl import cutedsl_jit_supported
+
+    return cutedsl_jit_supported()
 
 
 # Default configs

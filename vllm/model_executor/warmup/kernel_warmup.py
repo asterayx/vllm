@@ -80,6 +80,9 @@ def _warmup_ll_bf16_router_gemm(model: torch.nn.Module) -> None:
     )
 
     if not is_ll_bf16_gemm_available():
+        logger.debug_once(
+            "Skipping ll_bf16 router GEMM warmup: CuteDSL JIT unavailable."
+        )
         return
 
     shapes = _ll_bf16_router_shapes_from_model(model)
