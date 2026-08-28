@@ -2,8 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SM12x (GB10 / SM120/SM121) small-batch alignment helpers."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import torch
 
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -52,3 +56,35 @@ def sm12x_pad_token_rows(
             target,
         )
     return pad_token_rows(t, target), orig
+
+
+def extend_padding_mask(
+    is_padding: torch.Tensor | None, num_tokens: int
+) -> torch.Tensor | None:
+    """Slice or grow ``is_padding`` so it has exactly ``num_tokens`` rows.
+
+    Extra rows from SM12x kernel alignment are marked True (not real tokens).
+    """
+    if is_padding is None:
+        return None
+    n = is_padding.shape[0]
+    if n >= num_tokens:
+        return is_padding[:num_tokens]
+    extra = num_tokens - n
+    return torch.cat((is_padding, is_padding.new_ones((extra,), dtype=torch.bool)))
+
+
+@contextmanager
+def sm12x_align_is_padding(num_tokens: int) -> Iterator[None]:
+    """Temporarily grow ForwardContext.is_padding to ``num_tokens``."""
+    if not is_forward_context_available():
+        yield
+        return
+    ctx = get_forward_context()
+    orig = ctx.is_padding
+    if orig is not None and orig.shape[0] != num_tokens:
+        ctx.is_padding = extend_padding_mask(orig, num_tokens)
+    try:
+        yield
+    finally:
+        ctx.is_padding = orig

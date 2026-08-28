@@ -5,6 +5,7 @@ import torch
 
 from vllm.utils.sm12x import (
     SM12X_SAFE_MIN_TOKENS,
+    extend_padding_mask,
     pad_token_rows,
     sm12x_align_tokens,
     sm12x_pad_token_rows,
@@ -52,3 +53,15 @@ def test_sm12x_pad_token_rows(monkeypatch):
     assert torch.equal(padded[:8], x)
     assert torch.count_nonzero(padded[8:]) == 0
     assert pad_token_rows(x, 8).shape == (8, 4)
+
+
+def test_extend_padding_mask_grows_with_true():
+    """topk_softplus_sqrt requires is_padding.numel() == padded token count."""
+    mask = torch.tensor([False, False, True, True, False, False, True, True])
+    extended = extend_padding_mask(mask, 16)
+    assert extended is not None
+    assert extended.shape == (16,)
+    assert torch.equal(extended[:8], mask)
+    assert torch.all(extended[8:])
+    assert extend_padding_mask(mask, 4).shape == (4,)
+    assert extend_padding_mask(None, 16) is None

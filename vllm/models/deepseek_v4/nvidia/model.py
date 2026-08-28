@@ -89,7 +89,7 @@ from vllm.utils.flashinfer_moe_ep import (
     validate_fi_moe_ep_config,
 )
 from vllm.utils.math_utils import cdiv
-from vllm.utils.sm12x import sm12x_pad_token_rows
+from vllm.utils.sm12x import sm12x_align_is_padding, sm12x_pad_token_rows
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -973,37 +973,37 @@ class DeepseekV4MoE(nn.Module):
         )
         if input_ids is not None and hidden_states.shape[0] != orig_tokens:
             input_ids = sm12x_pad_token_rows(input_ids.reshape(-1))[0]
-        router_logits, _ = self.gate(hidden_states)
-        topk_weights, topk_ids = fused_topk_bias(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            scoring_func=self.scoring_func,
-            e_score_correction_bias=self.gate.e_score_correction_bias.data
-            if self.gate.e_score_correction_bias is not None
-            else None,
-            topk=self.n_activated_experts,
-            renormalize=self.renormalize,
-            indices_type=self.hash_indices_dtype,
-            input_tokens=input_ids,
-            hash_indices_table=self.gate.tid2eid,
-            routed_scaling_factor=self.routed_scaling_factor,
-        )
-        activation_clamp = (
-            float(self.swiglu_limit) if self.swiglu_limit is not None else None
-        )
-        final_hidden_states = self.experts(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            activation_clamp=activation_clamp,
-        )
-
-        if (
-            self.shared_experts is not None
-            and not self.experts.has_fused_shared_experts
-        ):
-            shared_output = self.shared_experts(hidden_states)
-            final_hidden_states += shared_output
+        with sm12x_align_is_padding(hidden_states.shape[0]):
+            router_logits, _ = self.gate(hidden_states)
+            topk_weights, topk_ids = fused_topk_bias(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.gate.e_score_correction_bias.data
+                if self.gate.e_score_correction_bias is not None
+                else None,
+                topk=self.n_activated_experts,
+                renormalize=self.renormalize,
+                indices_type=self.hash_indices_dtype,
+                input_tokens=input_ids,
+                hash_indices_table=self.gate.tid2eid,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+            activation_clamp = (
+                float(self.swiglu_limit) if self.swiglu_limit is not None else None
+            )
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                activation_clamp=activation_clamp,
+            )
+            if (
+                self.shared_experts is not None
+                and not self.experts.has_fused_shared_experts
+            ):
+                shared_output = self.shared_experts(hidden_states)
+                final_hidden_states += shared_output
 
         return final_hidden_states[:orig_tokens].view(org_shape)
 
@@ -1016,11 +1016,12 @@ class DeepseekV4MoE(nn.Module):
         )
         if input_ids is not None and hidden_states.shape[0] != orig_tokens:
             input_ids = sm12x_pad_token_rows(input_ids.reshape(-1))[0]
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            router_logits=hidden_states,
-            input_ids=input_ids,
-        )
+        with sm12x_align_is_padding(hidden_states.shape[0]):
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=hidden_states,
+                input_ids=input_ids,
+            )
         return final_hidden_states[:orig_tokens].view(org_shape)
 
     def finalize_mega_moe_weights(self) -> None:
