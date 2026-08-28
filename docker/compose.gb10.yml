@@ -1,9 +1,8 @@
-# Two-node GB10 DSpark. Same compose file on both Sparks; swap env file.
-#   cp docker/gb10.env.example docker/gb10.head.env
-#   cp docker/gb10.env.example docker/gb10.worker.env
-# Start worker first, then head:
+# Same compose on both Sparks; swap env file.
+# Worker first:
 #   docker compose --env-file docker/gb10.worker.env -f docker/compose.gb10.yml up -d
 #   docker compose --env-file docker/gb10.head.env   -f docker/compose.gb10.yml up -d
+# Or raw docker run: NODE_RANK=0 ./docker/gb10/run.sh
 
 name: vllm-gb10-dspark
 
@@ -11,6 +10,7 @@ services:
   vllm:
     image: ${VLLM_GB10_IMAGE:-vllm-gb10:dspark}
     pull_policy: never
+    privileged: true
     network_mode: host
     ipc: host
     shm_size: "64gb"
@@ -21,23 +21,39 @@ services:
       memlock: -1
       stack: 67108864
     volumes:
-      - ${HF_CACHE:?set HF_CACHE in the env file}:/root/.cache/huggingface
+      - ${MODEL_HOST:?set MODEL_HOST}:/models/DeepSeek-V4-Flash-0731:ro
+      - ${VLLM_CACHE:?set VLLM_CACHE}:/root/.cache/vllm
+      - ${HF_CACHE:?set HF_CACHE}:/root/.cache/huggingface
       - ${HF_CACHE}/flashinfer:/root/.cache/flashinfer
     environment:
       HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
+      TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-1}
+      VLLM_HOST_IP: ${VLLM_HOST_IP}
       VLLM_USE_DEEP_GEMM: "0"
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
       TORCH_CUDA_ARCH_LIST: "12.1a"
       FLASHINFER_CUDA_ARCH_LIST: "12.1a"
+      FLASHINFER_DISABLE_VERSION_CHECK: "1"
+      NCCL_NET: ${NCCL_NET:-IB}
       NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-0}
-      NCCL_IB_HCA: ${NCCL_IB_HCA}
+      NCCL_IB_MERGE_NICS: ${NCCL_IB_MERGE_NICS:-1}
+      NCCL_CROSS_NIC: ${NCCL_CROSS_NIC:-1}
+      NCCL_CUMEM_ENABLE: ${NCCL_CUMEM_ENABLE:-0}
+      NCCL_NVLS_ENABLE: ${NCCL_NVLS_ENABLE:-0}
+      NCCL_IB_ROCE_VERSION_NUM: ${NCCL_IB_ROCE_VERSION_NUM:-2}
+      NCCL_IB_ADDR_FAMILY: ${NCCL_IB_ADDR_FAMILY:-AF_INET}
       NCCL_SOCKET_IFNAME: ${NCCL_SOCKET_IFNAME}
       GLOO_SOCKET_IFNAME: ${NCCL_SOCKET_IFNAME}
+      TP_SOCKET_IFNAME: ${NCCL_SOCKET_IFNAME}
+      NCCL_IB_HCA: ${NCCL_IB_HCA}
       NCCL_DEBUG: ${NCCL_DEBUG:-WARN}
     command:
       - bash
       - -lc
       - >
-        exec vllm serve ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}
+        exec vllm serve /models/DeepSeek-V4-Flash-0731
+        --served-model-name deepseek-v4-flash-0731
         --trust-remote-code
         --tokenizer-mode deepseek_v4
         --tool-call-parser deepseek_v4
@@ -46,19 +62,23 @@ services:
         --kv-cache-dtype fp8_ds_mla
         --block-size 256
         --tensor-parallel-size 2
+        --pipeline-parallel-size 1
         --nnodes ${NNODES:-2}
         --node-rank ${NODE_RANK}
         --master-addr ${MASTER_ADDR}
         --master-port ${MASTER_PORT:-29500}
         --distributed-executor-backend mp
         --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.85}
-        --max-model-len auto
-        --max-num-seqs ${MAX_NUM_SEQS:-8}
+        --max-model-len ${MAX_MODEL_LEN:-524288}
+        --max-num-seqs ${MAX_NUM_SEQS:-6}
         --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS:-8192}
+        --max-cudagraph-capture-size ${MAX_CUGRAPH:-36}
         --enable-prefix-caching
-        --max-cudagraph-capture-size 64
+        --async-scheduling
+        --enable-chunked-prefill
+        --enable-flashinfer-autotune
         --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
         --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
         --host 0.0.0.0
-        --port ${VLLM_PORT:-8000}
+        --port ${VLLM_PORT:-30001}
         ${HEADLESS}
