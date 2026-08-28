@@ -27,6 +27,8 @@ SM12X_SAFE_MIN_TOKENS = 16
 #   that captured (dummy 6×6 and speculator pad 5→6).
 SM12X_SAFE_DECODE_Q_LENS = (1, 6, 8, 16, 24, 32, 36)
 SM12X_SAFE_PREFILL_DECODE_Q_LENS = SM12X_SAFE_DECODE_Q_LENS
+# Per-request [1, q_len] widths that IMA'd on GB10 (raw or decode-aligned).
+SM12X_UNSAFE_PER_REQUEST_Q_LENS = (2, 3, 4)
 
 
 def sm12x_align_tokens(num_tokens: int, min_tokens: int = SM12X_SAFE_MIN_TOKENS) -> int:
@@ -94,6 +96,25 @@ def sm12x_disable_attn_aux_streams() -> bool:
     Shared experts disable their aux stream on SM12x for the same reason.
     """
     return current_platform.is_device_capability_family(120)
+
+
+def reject_sm12x_unsafe_decode_query(query: torch.Tensor) -> None:
+    """Refuse SM12x per-request FlashInfer shapes that IMA'd on GB10.
+
+    ``[1, 2]`` / ``[1, 3]`` / ``[1, 4]`` are the mixed-warmup seed
+    widths. Batched ``[B>1, 4]`` CUDA-graph dummies survived; do not
+    reject those.
+    """
+    if (
+        query.ndim == 4
+        and query.shape[0] == 1
+        and int(query.shape[1]) in SM12X_UNSAFE_PER_REQUEST_Q_LENS
+        and current_platform.is_device_capability_family(120)
+    ):
+        raise RuntimeError(
+            "SM12x FlashInfer refused per-request query shape "
+            f"{tuple(query.shape)}; pad q_len to 6"
+        )
 
 
 def sm12x_align_prefill_q_len(q_len: int) -> int:

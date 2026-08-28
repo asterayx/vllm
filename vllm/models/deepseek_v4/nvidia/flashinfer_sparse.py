@@ -26,7 +26,10 @@ from vllm.models.deepseek_v4.sparse_mla import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
-from vllm.utils.sm12x import sm12x_align_prefill_q_len
+from vllm.utils.sm12x import (
+    reject_sm12x_unsafe_decode_query,
+    sm12x_align_prefill_q_len,
+)
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
@@ -111,6 +114,9 @@ def sm12x_use_per_request_decode(next_n: int | None, decode_query_len: int) -> b
         return False
     if not current_platform.is_device_capability_family(120):
         return False
+    # Even if next_n == decode_query_len, [1, 2] / [1, 4] IMA'd.
+    if next_n in (2, 3, 4):
+        return True
     return next_n != decode_query_len
 
 
@@ -671,6 +677,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         self._decode_query_len = 1 + (
             speculative_config.num_speculative_tokens if speculative_config else 0
         )
+        if current_platform.is_device_capability_family(120):
+            logger.info_once(
+                "SM12x FlashInfer: per-request q_len 2/3/4 pad to 6 "
+                "(never [1, 4])"
+            )
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
         # Per-tensor FP8 cache path scales.
         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
@@ -841,6 +852,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 q_len,
                 launch_len,
             )
+        query = _batch_token_span(q, token_start, token_end, launch_len)
+        reject_sm12x_unsafe_decode_query(query)
         esi = (
             _batch_token_span(
                 extra_sparse_indices,
@@ -861,7 +874,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         else:
             out = _batch_token_span(output, token_start, token_end, launch_len)
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-            query=_batch_token_span(q, token_start, token_end, launch_len),
+            query=query,
             swa_kv_cache=swa_cache,
             workspace_buffer=self._get_workspace(q.device),
             sparse_indices=_batch_token_span(
@@ -984,6 +997,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     re_,
                 )
             return
+        reject_sm12x_unsafe_decode_query(q)
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=q,
             swa_kv_cache=swa_cache,

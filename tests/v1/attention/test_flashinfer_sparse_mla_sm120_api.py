@@ -153,7 +153,9 @@ def test_sm12x_dummy_next_n_uses_per_request_decode(monkeypatch):
         lambda fam: fam == 120,
     )
     assert sm12x_use_per_request_decode(2, 6)
+    assert sm12x_use_per_request_decode(2, 2)
     assert sm12x_use_per_request_decode(4, 6)
+    assert sm12x_use_per_request_decode(4, 4)
     assert sm12x_use_per_request_decode(8, 6)
     assert not sm12x_use_per_request_decode(6, 6)
     assert not sm12x_use_per_request_decode(None, 6)
@@ -372,7 +374,8 @@ def test_forward_decode_q_len_2_is_one_padded_launch(monkeypatch):
         scale=1.0,
         attn_sink=None,
         kv_cache_torch_dtype=torch.bfloat16,
-        _decode_query_len=6,
+        # next_n=2 must pad even if this equals decode_query_len.
+        _decode_query_len=2,
         _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
         _as_sparse_cache=DeepseekV4FlashInferSM120Attention._as_sparse_cache,
         swa_cache_layer=SimpleNamespace(kv_cache=torch.zeros(2, 1, 1, 512)),

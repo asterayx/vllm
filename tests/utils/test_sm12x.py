@@ -3,12 +3,14 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.utils.sm12x import (
     SM12X_SAFE_MIN_TOKENS,
     extend_padding_mask,
     pad_token_rows,
+    reject_sm12x_unsafe_decode_query,
     sm12x_align_decode_q_len,
     sm12x_align_prefill_q_len,
     sm12x_align_tokens,
@@ -52,6 +54,12 @@ def test_sm12x_align_decode_q_len_snaps_to_safe_widths(monkeypatch):
     assert sm12x_align_prefill_q_len(4) == 6
     assert sm12x_align_prefill_q_len(5) == 6
     assert sm12x_align_prefill_q_len(16) == 16
+    reject_sm12x_unsafe_decode_query(torch.zeros(1, 6, 8, 512))
+    reject_sm12x_unsafe_decode_query(torch.zeros(2, 4, 8, 512))
+    with pytest.raises(RuntimeError, match="refused per-request query shape"):
+        reject_sm12x_unsafe_decode_query(torch.zeros(1, 4, 8, 512))
+    with pytest.raises(RuntimeError, match="refused per-request query shape"):
+        reject_sm12x_unsafe_decode_query(torch.zeros(1, 2, 8, 512))
     assert sm12x_mixed_warmup_decode_prompt_len() == 2
     assert sm12x_mixed_warmup_prefill_len(15) == 2
     assert sm12x_mixed_warmup_prefill_len(2) == 2
