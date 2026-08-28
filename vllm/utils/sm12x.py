@@ -34,14 +34,24 @@ def sm12x_align_tokens(num_tokens: int, min_tokens: int = SM12X_SAFE_MIN_TOKENS)
     return num_tokens
 
 
+def sm12x_skip_mixed_sparse_mla_warmup() -> bool:
+    """Whether to skip mixed prefill+decode sparse-MLA warmup on SM12x.
+
+    After PIECEWISE/FULL capture, a short real seed prefill still IMA'd on
+    GB10 (async fault, reported at MHC pad). Capture already covers the
+    safe decode-form widths; live short prefills use padded launches.
+    """
+    return current_platform.is_device_capability_family(120)
+
+
 def sm12x_mixed_warmup_decode_prompt_len() -> int:
     """Prefill length used to seed mixed-warmup's decode request.
 
-    SM12x FlashInfer IMA'd on the historical 2-token seed. q_len=4 survived
-    CUDA-graph capture on GB10.
+    SM12x FlashInfer IMA'd on the historical 2-token seed. Use the MHC/MoE
+    safe width so a bypassed warmup does not re-enter the small-batch path.
     """
     if current_platform.is_device_capability_family(120):
-        return 4
+        return SM12X_SAFE_MIN_TOKENS
     return 2
 
 
