@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.utils.sm12x import SM12X_SPARSE_PREFILL_MIN_TOKENS
+from vllm.utils.sm12x import SM12X_SAFE_MIN_TOKENS
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
 
@@ -55,7 +55,7 @@ def test_mixed_warmup_skipped_for_single_seq(max_num_reqs):
 
 
 def test_mixed_warmup_sm12x_seeds_at_safe_prefill_width(monkeypatch):
-    """SM12x must run mixed warmup with a >64-token seed, not skip or q_len=2/4."""
+    """SM12x must run mixed warmup with a 2-token seed and padded prefill."""
     from vllm.utils import sm12x as sm12x_utils
 
     monkeypatch.setattr(
@@ -74,8 +74,8 @@ def test_mixed_warmup_sm12x_seeds_at_safe_prefill_width(monkeypatch):
         worker_sample_tokens=lambda grammar_output=None: None,
         num_tokens=16,
     )
-    assert scheduled[0] == {"_v2_mixed_warmup_decode_": SM12X_SPARSE_PREFILL_MIN_TOKENS}
+    assert scheduled[0] == {"_v2_mixed_warmup_decode_": 2}
     assert scheduled[1] == {
         "_v2_mixed_warmup_decode_": 1,
-        "_v2_mixed_warmup_prefill_": SM12X_SPARSE_PREFILL_MIN_TOKENS,
+        "_v2_mixed_warmup_prefill_": SM12X_SAFE_MIN_TOKENS,
     }
