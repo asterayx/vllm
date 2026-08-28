@@ -844,16 +844,20 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 "SM12x FlashInfer must not launch per-request q_len=4 "
                 f"(real q_len={q_len}); pad to 6"
             )
+        query = _batch_token_span(q, token_start, token_end, launch_len)
+        reject_sm12x_unsafe_decode_query(query)
         if launch_len != q_len:
-            logger.info_once(
+            # Always emit q_len=2/3/4 pads so Spark mixed-warmup can be
+            # confirmed; capture's 4→6 must not hide the later 2→6.
+            log = logger.info if q_len in (2, 3, 4) else logger.info_once
+            log(
                 "SM12x FlashInfer: one decode-form launch padding %s "
-                "q_len=%d -> %d (never q_len=4)",
+                "q_len=%d -> %d query.shape=%s (never q_len=4)",
                 "prefill" if is_prefill else "decode",
                 q_len,
                 launch_len,
+                tuple(query.shape),
             )
-        query = _batch_token_span(q, token_start, token_end, launch_len)
-        reject_sm12x_unsafe_decode_query(query)
         esi = (
             _batch_token_span(
                 extra_sparse_indices,
