@@ -398,12 +398,17 @@ class MistralConfigParser(ConfigParserBase):
 _CONFIG_FORMAT_TO_CONFIG_PARSER: dict[str, type[ConfigParserBase]] = {
     "hf": HFConfigParser,
     "mistral": MistralConfigParser,
+    # DeepSeek-V4 checkpoints use HuggingFace config.json. Accept the
+    # model_type / tokenizer-mode name so --config-format deepseek_v4
+    # is not rejected as an unknown parser.
+    "deepseek_v4": HFConfigParser,
 }
 
 ConfigFormat = Literal[
     "auto",
     "hf",
     "mistral",
+    "deepseek_v4",
 ]
 
 
