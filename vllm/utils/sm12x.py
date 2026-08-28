@@ -17,14 +17,16 @@ logger = init_logger(__name__)
 # MoE (same compiled kernels, dynamic token count). Pad small batches up.
 SM12X_SAFE_MIN_TOKENS = 16
 
-# Per-request FlashInfer decode-form q_len that survived GB10 CUDA-graph
-# capture. 2 and 3 IMA; splitting a 2-token *prefill* into two q_len=1
-# launches also IMA'd (token 1's KV is not in cache yet).
-SM12X_SAFE_DECODE_Q_LENS = (1, 4, 6, 8, 16, 24, 32, 36)
-
-# Prefill stays on decode kernels (FlashInfer SM120: num_tokens <= 64).
-# Skip 4: a 4-token *real* seed IMA'd. 6 is the DSpark width that captured.
-SM12X_SAFE_PREFILL_DECODE_Q_LENS = (1, 6, 8, 16, 24, 32, 36)
+# Per-request FlashInfer decode-form q_len. FlashInfer SM120 keeps
+# num_tokens <= 64 on decode kernels. Skip 2, 3, and 4:
+# - 2/3 IMA as a raw launch
+# - splitting a 2-token prefill into two q_len=1 launches IMA'd
+#   (token 1's KV is not in cache yet)
+# - [1, 4] IMA'd on mixed-warmup seed (2 real tokens decode-aligned
+#   to 4) and on a 4-token real first prefill. 6 is the DSpark width
+#   that captured (dummy 6×6 and speculator pad 5→6).
+SM12X_SAFE_DECODE_Q_LENS = (1, 6, 8, 16, 24, 32, 36)
+SM12X_SAFE_PREFILL_DECODE_Q_LENS = SM12X_SAFE_DECODE_Q_LENS
 
 
 def sm12x_align_tokens(num_tokens: int, min_tokens: int = SM12X_SAFE_MIN_TOKENS) -> int:
@@ -65,15 +67,11 @@ def sm12x_mixed_warmup_prefill_len(requested_prefill: int) -> int:
 def sm12x_align_decode_q_len(q_len: int) -> int:
     """Snap a FlashInfer decode-form q_len to a GB10-safe width.
 
-    Unchanged off SM12x. Values already in ``SM12X_SAFE_DECODE_Q_LENS`` or
-    larger than the last entry are left as-is.
+    Same widths as :func:`sm12x_align_prefill_q_len`. Decode-align used
+    to snap 2→4 because 4 is in the capture dummy list; mixed warmup
+    then launched ``[1, 4]`` and IMA'd. Unchanged off SM12x.
     """
-    if q_len <= 0 or not current_platform.is_device_capability_family(120):
-        return q_len
-    for safe in SM12X_SAFE_DECODE_Q_LENS:
-        if q_len <= safe:
-            return safe
-    return q_len
+    return sm12x_align_prefill_q_len(q_len)
 
 
 def sm12x_treat_short_extends_as_decodes() -> bool:

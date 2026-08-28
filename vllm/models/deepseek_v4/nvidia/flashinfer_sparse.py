@@ -119,7 +119,7 @@ def sm12x_q_len_spans(q_len: int) -> list[tuple[int, int]]:
 
     Splitting ``q_len=2`` into two ``q_len=1`` launches IMA'd on a 2-token
     SM12x prefill: the second token's KV is not in cache yet. Pad to a
-    safe width with :func:`sm12x_align_decode_q_len` instead.
+    safe width with :func:`sm12x_align_prefill_q_len` (never 4).
     """
     return [(0, q_len)]
 
@@ -818,17 +818,25 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
         On SM12x, pad unsupported q_len instead of splitting a 2-token
         prefill into two q_len=1 launches. Extra rows repeat the last
-        real token (valid KV indices). Always use the prefill align
-        (skip width 4): DSpark's decode_threshold is k+1=6, so a
-        2-token first prefill can still arrive here as a "decode"
-        and decode-align would launch the ``[1, 4]`` that IMA'd.
+        real token (valid KV indices). Always skip width 4: DSpark's
+        decode_threshold is k+1=6, so a 2-token first prefill can
+        arrive here as a "decode" and the old decode-align launched
+        ``[1, 4]``, which IMA'd (reported at o_proj Triton).
         """
         q_len = token_end - token_start
         launch_len = sm12x_align_prefill_q_len(q_len)
+        if (
+            current_platform.is_device_capability_family(120)
+            and launch_len == 4
+        ):
+            raise RuntimeError(
+                "SM12x FlashInfer must not launch per-request q_len=4 "
+                f"(real q_len={q_len}); pad to 6"
+            )
         if launch_len != q_len:
             logger.info_once(
-                "SM12x FlashInfer: padding %s q_len=%d -> %d to avoid "
-                "small-batch IMA",
+                "SM12x FlashInfer: one decode-form launch padding %s "
+                "q_len=%d -> %d (never q_len=4)",
                 "prefill" if is_prefill else "decode",
                 q_len,
                 launch_len,

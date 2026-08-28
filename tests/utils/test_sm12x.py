@@ -43,7 +43,9 @@ def test_sm12x_align_decode_q_len_snaps_to_safe_widths(monkeypatch):
         "is_device_capability_family",
         lambda fam: fam == 120,
     )
-    assert sm12x_align_decode_q_len(2) == 4
+    assert sm12x_align_decode_q_len(2) == 6
+    assert sm12x_align_decode_q_len(3) == 6
+    assert sm12x_align_decode_q_len(4) == 6
     assert sm12x_align_decode_q_len(15) == 16
     assert sm12x_align_decode_q_len(1) == 1
     assert sm12x_align_prefill_q_len(2) == 6

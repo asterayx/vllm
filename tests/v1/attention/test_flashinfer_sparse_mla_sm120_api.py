@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.config import set_current_vllm_config
@@ -195,9 +196,9 @@ def test_sm12x_aligns_unsafe_decode_q_len(monkeypatch):
         lambda fam: fam == 120,
     )
     assert sm12x_align_decode_q_len(1) == 1
-    assert sm12x_align_decode_q_len(2) == 4
-    assert sm12x_align_decode_q_len(3) == 4
-    assert sm12x_align_decode_q_len(4) == 4
+    assert sm12x_align_decode_q_len(2) == 6
+    assert sm12x_align_decode_q_len(3) == 6
+    assert sm12x_align_decode_q_len(4) == 6
     assert sm12x_align_decode_q_len(5) == 6
     assert sm12x_align_decode_q_len(15) == 16
     assert sm12x_align_decode_q_len(16) == 16
@@ -298,6 +299,26 @@ def test_launch_per_request_decode_pads_q_len_2_once(monkeypatch):
     )
     assert _launch_per_request_shapes(monkeypatch, 2) == [torch.Size([1, 6, 8, 512])]
     assert _launch_per_request_shapes(monkeypatch, 4) == [torch.Size([1, 6, 8, 512])]
+
+
+def test_launch_per_request_rejects_q_len_4(monkeypatch):
+    """The 15:52 Spark IMA was a leftover 2→4 decode align."""
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    monkeypatch.setattr(fi_sparse, "sm12x_align_prefill_q_len", lambda q_len: 4)
+    with pytest.raises(RuntimeError, match="must not launch per-request q_len=4"):
+        _launch_per_request(monkeypatch, 2)
 
 
 def test_launch_per_request_prefill_pads_q_len_2_once(monkeypatch):
