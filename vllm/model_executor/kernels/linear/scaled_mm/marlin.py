@@ -72,6 +72,11 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
             # Update layer with new values
             replace_parameter(layer, "weight", weight.data)
             replace_parameter(layer, scale_name, weight_scale.data)
+        # DSv4 wo_a is consumed by fp8_einsum and must keep the checkpoint
+        # FP8 block layout. Marlin packing changes (N, K) into a workspace
+        # format and DeepGEMM then asserts m/n/k.
+        if getattr(layer, "is_bmm", False):
+            return
         # Non-block: callers must pass weight in (K, N) layout.
 
         layer.input_scale = None

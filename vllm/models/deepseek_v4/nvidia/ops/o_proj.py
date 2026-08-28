@@ -6,6 +6,10 @@ import torch.nn as nn
 from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
+from vllm.models.deepseek_v4.nvidia.ops.fp8_einsum import (
+    _use_deepseek_v4_sm12x_triton_fp8_einsum,
+    deepseek_v4_fp8_einsum,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum
 
@@ -16,9 +20,10 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
     SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128.
     SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1.
     SM12x (GB10 / DGX Spark): Hopper K-granularity (1, 128, 128) with
-    FP32 activation scales. Treating major>=10 as SM100 packs UE8M0 into
-    int32; the Python ``fp8_einsum`` fallback then does ``scale.to(float32)``
-    on those packed ints and o_proj becomes noise.
+    FP32 activation scales, dispatched to the Triton ``fp8_einsum``
+    fallback. Compiled DeepGEMM einsum asserts
+    ``m == m_ and n == n_ and k == k_`` on this recipe, and treating
+    major>=10 as SM100 packs UE8M0 into int32 (o_proj becomes noise).
 
     Returns ``(einsum_recipe, tma_aligned_scales)`` for ``deep_gemm_fp8_o_proj``.
     """
@@ -74,11 +79,22 @@ def deep_gemm_fp8_o_proj(
         wo_a.weight_scale if hasattr(wo_a, "weight_scale") else wo_a.weight_scale_inv
     )
     weight = wo_a.weight
-    # fp8_einsum's "bhr,hdr->bhd" runs get_shape<3> on B and its scale and
-    # does not reshape: both must be 3D (h, d, r) = (n_groups, o_lora_rank, D)
-    # and (n_groups, o_lora_rank // 128, D // 128). Layers loaded outside the
-    # DeepGEMM scaled-mm path (b12x / FlashMLA / FlashInfer backends) keep
-    # the flat checkpoint layout (n_groups*o_lora_rank, D).
+    if _use_deepseek_v4_sm12x_triton_fp8_einsum(
+        "bhr,hdr->bhd", einsum_recipe, weight_scale
+    ):
+        deepseek_v4_fp8_einsum(
+            o_fp8,
+            o_scale,
+            weight,
+            weight_scale,
+            z,
+            equation="bhr,hdr->bhd",
+            recipe=einsum_recipe,
+        )
+        return wo_b(z.flatten(1))
+    # DeepGEMM "bhr,hdr->bhd" runs get_shape<3> on B and does not reshape.
+    # Layers loaded outside the DeepGEMM scaled-mm path keep the flat
+    # checkpoint layout (n_groups*o_lora_rank, D).
     if weight.ndim == 2:
         weight = weight.view(n_groups, o_lora_rank, -1)
         weight_scale = weight_scale.view(n_groups, o_lora_rank // 128, -1)
