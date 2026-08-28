@@ -76,6 +76,17 @@ def sm12x_align_decode_q_len(q_len: int) -> int:
     return q_len
 
 
+def sm12x_disable_attn_aux_streams() -> bool:
+    """Do not overlap indexer/compressor GEMMs on SM12x aux streams.
+
+    ``maybe_execute_in_parallel`` already drops aux during breakable
+    CUDA-graph capture. Mixed warmup is eager after capture and is the
+    first time those aux streams run; Marlin already IMA'd on aux.
+    Shared experts disable their aux stream on SM12x for the same reason.
+    """
+    return current_platform.is_device_capability_family(120)
+
+
 def sm12x_skip_short_context_indexer() -> bool:
     """Whether to skip the eager short-context indexer fill on SM12x.
 

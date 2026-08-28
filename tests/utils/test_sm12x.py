@@ -11,6 +11,7 @@ from vllm.utils.sm12x import (
     sm12x_align_prefill_q_len,
     sm12x_align_tokens,
     sm12x_mixed_warmup_decode_prompt_len,
+    sm12x_disable_attn_aux_streams,
     sm12x_mixed_warmup_prefill_len,
     sm12x_pad_token_rows,
     sm12x_skip_short_context_indexer,
@@ -51,6 +52,7 @@ def test_sm12x_align_decode_q_len_snaps_to_safe_widths(monkeypatch):
     assert sm12x_mixed_warmup_prefill_len(15) == 2
     assert sm12x_mixed_warmup_prefill_len(2) == 2
     assert sm12x_skip_short_context_indexer() is True
+    assert sm12x_disable_attn_aux_streams() is True
 
 
 def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
@@ -66,6 +68,7 @@ def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
     assert sm12x_mixed_warmup_prefill_len(15) == 15
     assert sm12x_align_prefill_q_len(2) == 2
     assert sm12x_skip_short_context_indexer() is False
+    assert sm12x_disable_attn_aux_streams() is False
 
 
 def test_sm12x_pad_token_rows(monkeypatch):

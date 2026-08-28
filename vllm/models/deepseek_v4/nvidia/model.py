@@ -89,7 +89,11 @@ from vllm.utils.flashinfer_moe_ep import (
     validate_fi_moe_ep_config,
 )
 from vllm.utils.math_utils import cdiv
-from vllm.utils.sm12x import sm12x_align_is_padding, sm12x_pad_token_rows
+from vllm.utils.sm12x import (
+    sm12x_align_is_padding,
+    sm12x_disable_attn_aux_streams,
+    sm12x_pad_token_rows,
+)
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -1278,7 +1282,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # DeepseekV4Attention._run_parallel_input_projections
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
         # kv_score). fused_wqa_wkv stays on the default stream.
-        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        # SM12x: maybe_execute_in_parallel already drops aux during
+        # breakable capture. Mixed warmup is eager after capture and
+        # would overlap indexer/compressor for the first time; Marlin
+        # already IMA'd on aux. Keep sequential like shared experts.
+        aux_stream_list = (
+            None
+            if sm12x_disable_attn_aux_streams()
+            else [torch.cuda.Stream() for _ in range(3)]
+        )
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(
