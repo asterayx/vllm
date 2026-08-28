@@ -59,6 +59,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.utils.sm12x import sm12x_skip_short_context_indexer
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -890,6 +891,7 @@ class DeepseekV4Indexer(nn.Module):
             if (
                 indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens
                 and not torch.cuda.is_current_stream_capturing()
+                and not sm12x_skip_short_context_indexer()
             ):
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache

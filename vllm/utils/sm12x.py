@@ -76,6 +76,17 @@ def sm12x_align_decode_q_len(q_len: int) -> int:
     return q_len
 
 
+def sm12x_skip_short_context_indexer() -> bool:
+    """Whether to skip the eager short-context indexer fill on SM12x.
+
+    That path is already skipped during CUDA-graph capture. Mixed warmup
+    is the first eager short prefill afterwards; a 4-token real seed
+    IMA'd there. Stay on the captured full indexer, then pad FlashInfer
+    ``q_len=2`` to one decode launch.
+    """
+    return current_platform.is_device_capability_family(120)
+
+
 def sm12x_align_prefill_q_len(q_len: int) -> int:
     """Pad a short SM12x prefill to one decode-form launch.
 

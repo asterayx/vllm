@@ -227,27 +227,29 @@ def test_non_sm12x_keeps_q_len_2(monkeypatch):
     assert sm12x_align_prefill_q_len(2) == 2
 
 
-def test_batch_token_span_pads_indices_with_sentinels():
-    """Padded decode-form rows must not attend; use -1 / zero lens."""
+def test_batch_token_span_repeats_last_real_row():
+    """Padded decode-form rows reuse the last real token's indices/lens."""
     indices = torch.tensor([[10, 11], [12, 13]], dtype=torch.int32)
-    lens = torch.tensor([2, 2], dtype=torch.int32)
-    padded = _batch_token_span(indices, 0, 2, 4, fill=-1)
+    lens = torch.tensor([2, 3], dtype=torch.int32)
+    padded = _batch_token_span(indices, 0, 2, 4)
     padded_lens = _batch_token_span(lens, 0, 2, 4)
     assert padded.shape == (1, 4, 2)
     assert torch.equal(padded[0, :2], indices)
-    assert torch.equal(padded[0, 2:], torch.full((2, 2), -1, dtype=torch.int32))
+    assert torch.equal(padded[0, 2:], indices[-1:].expand(2, -1))
     assert padded_lens.shape == (1, 4)
     assert torch.equal(padded_lens[0, :2], lens)
-    assert torch.equal(padded_lens[0, 2:], torch.zeros(2, dtype=torch.int32))
+    assert torch.equal(padded_lens[0, 2:], torch.tensor([3, 3], dtype=torch.int32))
+    sentinels = _batch_token_span(indices, 0, 2, 4, fill=-1)
+    assert torch.equal(sentinels[0, 2:], torch.full((2, 2), -1, dtype=torch.int32))
 
 
-def _launch_per_request_shapes(monkeypatch, q_len: int, **kwargs) -> list[torch.Size]:
+def _launch_per_request(monkeypatch, q_len: int, **kwargs) -> list[dict]:
     from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
 
-    shapes: list[torch.Size] = []
+    launches: list[dict] = []
 
     def _fake_launch(**launch_kwargs):
-        shapes.append(launch_kwargs["query"].shape)
+        launches.append(launch_kwargs)
 
     monkeypatch.setattr(
         fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
@@ -257,23 +259,32 @@ def _launch_per_request_shapes(monkeypatch, q_len: int, **kwargs) -> list[torch.
         attn_sink=None,
         _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
     )
-    q = torch.zeros(q_len, 8, 512)
+    q = torch.arange(q_len * 8 * 512, dtype=torch.float32).view(q_len, 8, 512)
     output = torch.zeros(q_len, 8, 512)
+    swa_indices = torch.arange(q_len * 16, dtype=torch.int32).view(q_len, 16)
+    swa_lens = torch.arange(1, q_len + 1, dtype=torch.int32)
     DeepseekV4FlashInferSM120Attention._launch_per_request_decode(
         dummy,
         q,
         output,
         torch.zeros(1),
         None,
-        torch.zeros(q_len, 16, dtype=torch.int32),
-        torch.ones(q_len, dtype=torch.int32),
+        swa_indices,
+        swa_lens,
         None,
         None,
         0,
         q_len,
         **kwargs,
     )
-    return shapes
+    return launches
+
+
+def _launch_per_request_shapes(monkeypatch, q_len: int, **kwargs) -> list[torch.Size]:
+    return [
+        launch["query"].shape
+        for launch in _launch_per_request(monkeypatch, q_len, **kwargs)
+    ]
 
 
 def test_launch_per_request_decode_pads_q_len_2_once(monkeypatch):
@@ -297,9 +308,15 @@ def test_launch_per_request_prefill_pads_q_len_2_once(monkeypatch):
         "is_device_capability_family",
         lambda fam: fam == 120,
     )
-    assert _launch_per_request_shapes(monkeypatch, 2, is_prefill=True) == [
-        torch.Size([1, 6, 8, 512])
-    ]
+    launches = _launch_per_request(monkeypatch, 2, is_prefill=True)
+    assert [launch["query"].shape for launch in launches] == [torch.Size([1, 6, 8, 512])]
+    query = launches[0]["query"]
+    indices = launches[0]["sparse_indices"]
+    lens = launches[0]["swa_topk_lens"]
+    assert torch.equal(query[0, 2:], query[0, 1:2].expand(4, -1, -1))
+    assert torch.equal(indices[0, 2:], indices[0, 1:2].expand(4, -1))
+    assert torch.equal(lens[0, 2:], lens[0, 1:2].expand(4))
+    assert not torch.any(indices == -1)
     assert _launch_per_request_shapes(monkeypatch, 4, is_prefill=True) == [
         torch.Size([1, 6, 8, 512])
     ]

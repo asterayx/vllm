@@ -129,16 +129,23 @@ def _batch_token_span(
     start: int,
     end: int,
     target: int,
-    fill: int | float = 0,
+    fill: int | float | None = None,
 ) -> torch.Tensor:
-    """Slice ``t[start:end]`` and pad dim 0 to ``target`` as ``[1, target, ...]``."""
+    """Slice ``t[start:end]`` and pad dim 0 to ``target`` as ``[1, target, ...]``.
+
+    Extra rows repeat the last real row so the SM120 decode kernel sees
+    valid cache indices (``-1`` / zero-lens dummy rows IMA). ``fill``
+    overrides that with a constant when a caller needs sentinels.
+    """
     sl = t[start:end]
     n = sl.shape[0]
     if n < target:
-        sl = torch.cat(
-            (sl, sl.new_full((target - n, *sl.shape[1:]), fill)),
-            dim=0,
-        )
+        extra = target - n
+        if fill is None and n > 0:
+            pad = sl[-1:].expand(extra, *sl.shape[1:]).contiguous()
+        else:
+            pad = sl.new_full((extra, *sl.shape[1:]), 0 if fill is None else fill)
+        sl = torch.cat((sl, pad), dim=0)
     if sl.ndim == 1:
         return sl.reshape(1, target)
     return sl.reshape(1, target, *sl.shape[1:])
@@ -808,8 +815,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         """Launch FlashInfer decode for ``[token_start, token_end)``.
 
         On SM12x, pad unsupported q_len instead of splitting a 2-token
-        prefill into two q_len=1 launches. Prefills skip width 4 (real
-        seed IMA'd) and snap to a capture-proven decode-form width.
+        prefill into two q_len=1 launches. Extra rows repeat the last
+        real token (valid KV indices). Prefills skip width 4 (real seed
+        IMA'd) and snap to a capture-proven decode-form width.
         """
         q_len = token_end - token_start
         align = sm12x_align_prefill_q_len if is_prefill else sm12x_align_decode_q_len
@@ -826,7 +834,6 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 token_start,
                 token_end,
                 launch_len,
-                fill=-1,
             ).reshape(1, launch_len, -1)
             if extra_sparse_indices is not None
             else None
@@ -845,7 +852,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             swa_kv_cache=swa_cache,
             workspace_buffer=self._get_workspace(q.device),
             sparse_indices=_batch_token_span(
-                swa_indices, token_start, token_end, launch_len, fill=-1
+                swa_indices, token_start, token_end, launch_len
             ).reshape(1, launch_len, -1),
             compressed_kv_cache=extra_cache,
             out=out,
