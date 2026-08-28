@@ -147,8 +147,10 @@ def _batch_token_span(
             pad = sl.new_full((extra, *sl.shape[1:]), 0 if fill is None else fill)
         sl = torch.cat((sl, pad), dim=0)
     if sl.ndim == 1:
-        return sl.reshape(1, target)
-    return sl.reshape(1, target, *sl.shape[1:])
+        out = sl.reshape(1, target)
+    else:
+        out = sl.reshape(1, target, *sl.shape[1:])
+    return out.contiguous()
 
 
 def _required_sm120_sparse_topk(vllm_config: VllmConfig, window_size: int) -> int:

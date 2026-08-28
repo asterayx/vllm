@@ -321,3 +321,57 @@ def test_launch_per_request_prefill_pads_q_len_2_once(monkeypatch):
     assert _launch_per_request_shapes(monkeypatch, 4, is_prefill=True) == [
         torch.Size([1, 6, 8, 512])
     ]
+
+
+def test_forward_decode_q_len_2_is_one_padded_launch(monkeypatch):
+    """A 2-token seed labeled decode must still be one [1, 6], not [1, 2]."""
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    shapes: list[torch.Size] = []
+
+    def _fake_launch(**launch_kwargs):
+        shapes.append(launch_kwargs["query"].shape)
+        assert launch_kwargs["query"].is_contiguous()
+
+    monkeypatch.setattr(
+        fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
+    )
+    dummy = SimpleNamespace(
+        scale=1.0,
+        attn_sink=None,
+        kv_cache_torch_dtype=torch.bfloat16,
+        _decode_query_len=6,
+        _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
+        _as_sparse_cache=DeepseekV4FlashInferSM120Attention._as_sparse_cache,
+        swa_cache_layer=SimpleNamespace(kv_cache=torch.zeros(2, 1, 1, 512)),
+    )
+    dummy._prepare_query = (
+        DeepseekV4FlashInferSM120Attention._prepare_query.__get__(dummy)
+    )
+    dummy._launch_per_request_decode = (
+        DeepseekV4FlashInferSM120Attention._launch_per_request_decode.__get__(dummy)
+    )
+    swa = SimpleNamespace(
+        num_decodes=1,
+        num_decode_tokens=2,
+        decode_swa_indices=torch.zeros(2, 16, dtype=torch.int32),
+        decode_swa_lens=torch.ones(2, dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2]),
+    )
+    q = torch.zeros(2, 8, 512, dtype=torch.bfloat16)
+    output = torch.zeros(2, 8, 512, dtype=torch.bfloat16)
+    DeepseekV4FlashInferSM120Attention._forward_decode(
+        dummy, q, None, swa, None, True, output
+    )
+    assert shapes == [torch.Size([1, 6, 8, 512])]
