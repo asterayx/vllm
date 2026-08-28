@@ -42,9 +42,11 @@ rsync -a --delete \
   --exclude '.pytest_cache/' \
   ./ "${STAGE}/src/"
 cp docker/gb10/relocate-venv.sh "${STAGE}/relocate-venv.sh"
+cp docker/gb10/install-ibverbs.sh "${STAGE}/install-ibverbs.sh"
 cp docker/Dockerfile.gb10-venv "${STAGE}/Dockerfile"
+./docker/gb10/collect-ibverbs.sh "${STAGE}/ibverbs"
 
-echo "Packing ${VENV} + $(pwd) -> ${IMAGE} (no vLLM compile)"
+echo "Packing ${VENV} + host ibverbs + $(pwd) -> ${IMAGE} (no vLLM compile)"
 docker build \
   --platform linux/arm64 \
   -f "${STAGE}/Dockerfile" \

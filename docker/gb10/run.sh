@@ -24,8 +24,6 @@ exec docker run --rm -it --name "${NAME}" \
   --device /dev/infiniband \
   -v /dev/infiniband:/dev/infiniband \
   -v /sys/class/infiniband:/sys/class/infiniband \
-  -v /etc/libibverbs.d:/etc/libibverbs.d:ro \
-  -v /usr/lib/aarch64-linux-gnu/libibverbs:/usr/lib/aarch64-linux-gnu/libibverbs:ro \
   -v "${MODEL_HOST}:${MODEL_PATH}:ro" \
   -v "${VLLM_CACHE}:/root/.cache/vllm" \
   -v "${HF_CACHE}:/root/.cache/huggingface" \
