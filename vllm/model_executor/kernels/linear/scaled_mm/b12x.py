@@ -27,6 +27,16 @@ from .BlockScaledMMLinearKernel import (
 from .ScaledMMLinearKernel import FP8ScaledMMLinearKernel
 
 
+def _is_sm121_device(compute_capability: int | None) -> bool:
+    """GB10 reports sm_121a; official b12x 1.2.6 compiles these GEMMs as sm_120."""
+    if compute_capability == 121:
+        return True
+    cap = current_platform.get_device_capability()
+    if cap is None:
+        return False
+    return cap.to_int() == 121
+
+
 def _run_b12x_fp8_block_scaled_mm(
     a: torch.Tensor,
     weight: torch.Tensor,
@@ -54,11 +64,15 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         cls,
         compute_capability: int | None = None,
     ) -> tuple[bool, str | None]:
-        del compute_capability
         if not current_platform.is_cuda():
             return False, "B12X FP8 kernels are only available on CUDA"
         if not current_platform.is_device_capability_family(120):
             return False, "B12X FP8 kernels require a Blackwell 12x device"
+        if _is_sm121_device(compute_capability):
+            return (
+                False,
+                "B12X block-FP8 dense GEMM IMAs on SM121 (sm_120 TMA vs sm_121a)",
+            )
         blockscaled = _import_b12x_blockscaled()
         if blockscaled is None:
             return False, "Install the B12X backend with `pip install vllm[b12x]`"
