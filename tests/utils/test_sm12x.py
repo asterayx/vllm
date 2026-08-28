@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import torch
 
 from vllm.utils.sm12x import (
@@ -10,10 +12,11 @@ from vllm.utils.sm12x import (
     sm12x_align_decode_q_len,
     sm12x_align_prefill_q_len,
     sm12x_align_tokens,
-    sm12x_mixed_warmup_decode_prompt_len,
     sm12x_disable_attn_aux_streams,
+    sm12x_mixed_warmup_decode_prompt_len,
     sm12x_mixed_warmup_prefill_len,
     sm12x_pad_token_rows,
+    sm12x_treat_short_extends_as_decodes,
 )
 
 
@@ -50,6 +53,7 @@ def test_sm12x_align_decode_q_len_snaps_to_safe_widths(monkeypatch):
     assert sm12x_mixed_warmup_decode_prompt_len() == 2
     assert sm12x_mixed_warmup_prefill_len(15) == 2
     assert sm12x_mixed_warmup_prefill_len(2) == 2
+    assert sm12x_treat_short_extends_as_decodes() is False
     assert sm12x_disable_attn_aux_streams() is True
 
 
@@ -65,6 +69,7 @@ def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
     assert sm12x_mixed_warmup_decode_prompt_len() == 2
     assert sm12x_mixed_warmup_prefill_len(15) == 15
     assert sm12x_align_prefill_q_len(2) == 2
+    assert sm12x_treat_short_extends_as_decodes() is True
     assert sm12x_disable_attn_aux_streams() is False
 
 
@@ -95,3 +100,32 @@ def test_extend_padding_mask_grows_with_true():
     assert torch.all(extended[8:])
     assert extend_padding_mask(mask, 4).shape == (4,)
     assert extend_padding_mask(None, 16) is None
+
+
+def test_sm12x_keeps_q_len_2_seed_on_prefill_split(monkeypatch):
+    """DSpark threshold=6 must not swallow a 2-token first prefill as decode."""
+    from vllm.utils import sm12x as sm12x_utils
+    from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    cam = SimpleNamespace(
+        max_query_len=2,
+        num_reqs=1,
+        num_actual_tokens=2,
+        query_start_loc_cpu=torch.tensor([0, 2]),
+        is_prefilling=torch.tensor([True]),
+    )
+    assert split_decodes_and_prefills(
+        cam,
+        decode_threshold=6,
+        treat_short_extends_as_decodes=True,
+    ) == (1, 0, 2, 0)
+    assert split_decodes_and_prefills(
+        cam,
+        decode_threshold=6,
+        treat_short_extends_as_decodes=sm12x_treat_short_extends_as_decodes(),
+    ) == (0, 1, 0, 2)

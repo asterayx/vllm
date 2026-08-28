@@ -1098,6 +1098,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 # SM120's sparse prefill kernel asserts num_tokens > 64.
                 # Small segments use one padded decode-form [1, q_len, ...]
                 # call (q_len <= 64 legal). Do not split q_len=2.
+                # Reached only when the SWA split keeps short first
+                # prefills as prefills (DSpark threshold is k+1=6).
                 for ri in range(chunk_start, chunk_end):
                     rs = int(query_start_loc_cpu[num_decodes + ri] - prefill_token_base)
                     re_ = int(

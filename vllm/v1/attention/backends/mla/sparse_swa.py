@@ -17,6 +17,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import resolve_sm120_dsv4_topk
 from vllm.utils.math_utils import cdiv, next_power_of_2
+from vllm.utils.sm12x import sm12x_treat_short_extends_as_decodes
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -535,7 +536,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # Split into decode and prefill portions using configurable threshold
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
             split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=self.decode_threshold
+                common_attn_metadata,
+                decode_threshold=self.decode_threshold,
+                treat_short_extends_as_decodes=sm12x_treat_short_extends_as_decodes(),
             )
         )
 

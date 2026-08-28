@@ -76,6 +76,17 @@ def sm12x_align_decode_q_len(q_len: int) -> int:
     return q_len
 
 
+def sm12x_treat_short_extends_as_decodes() -> bool:
+    """Whether short first prefills may ride the decode split.
+
+    DSpark sets ``decode_threshold = k+1 = 6``. A 2-token mixed-warmup
+    seed then becomes an all-decode batch and FlashInfer launches
+    ``[1, 4]`` (decode align), the width that IMA'd. On SM12x keep those
+    requests on the prefill path so ``q_len=2`` pads to one ``[1, 6]``.
+    """
+    return not current_platform.is_device_capability_family(120)
+
+
 def sm12x_disable_attn_aux_streams() -> bool:
     """Do not overlap indexer/compressor GEMMs on SM12x aux streams.
 
