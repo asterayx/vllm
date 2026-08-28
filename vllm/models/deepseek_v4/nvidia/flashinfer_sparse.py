@@ -26,7 +26,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
-from vllm.utils.sm12x import sm12x_align_decode_q_len, sm12x_align_prefill_q_len
+from vllm.utils.sm12x import sm12x_align_prefill_q_len
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
@@ -816,15 +816,18 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
         On SM12x, pad unsupported q_len instead of splitting a 2-token
         prefill into two q_len=1 launches. Extra rows repeat the last
-        real token (valid KV indices). Prefills skip width 4 (real seed
-        IMA'd) and snap to a capture-proven decode-form width.
+        real token (valid KV indices). Always use the prefill align
+        (skip width 4): DSpark's decode_threshold is k+1=6, so a
+        2-token first prefill can still arrive here as a "decode"
+        and decode-align would launch the ``[1, 4]`` that IMA'd.
         """
         q_len = token_end - token_start
-        align = sm12x_align_prefill_q_len if is_prefill else sm12x_align_decode_q_len
-        launch_len = align(q_len)
+        launch_len = sm12x_align_prefill_q_len(q_len)
         if launch_len != q_len:
             logger.info_once(
-                "SM12x FlashInfer: padding q_len=%d -> %d to avoid small-batch IMA",
+                "SM12x FlashInfer: padding %s q_len=%d -> %d to avoid "
+                "small-batch IMA",
+                "prefill" if is_prefill else "decode",
                 q_len,
                 launch_len,
             )

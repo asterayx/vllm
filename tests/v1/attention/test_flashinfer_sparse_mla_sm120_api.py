@@ -288,7 +288,7 @@ def _launch_per_request_shapes(monkeypatch, q_len: int, **kwargs) -> list[torch.
 
 
 def test_launch_per_request_decode_pads_q_len_2_once(monkeypatch):
-    """A 2-token SM12x decode-form launch must be one [1, 4], not two [1, 1]."""
+    """A 2-token SM12x launch must be one [1, 6], not [1, 4] or two [1, 1]."""
     from vllm.utils import sm12x as sm12x_utils
 
     monkeypatch.setattr(
@@ -296,7 +296,8 @@ def test_launch_per_request_decode_pads_q_len_2_once(monkeypatch):
         "is_device_capability_family",
         lambda fam: fam == 120,
     )
-    assert _launch_per_request_shapes(monkeypatch, 2) == [torch.Size([1, 4, 8, 512])]
+    assert _launch_per_request_shapes(monkeypatch, 2) == [torch.Size([1, 6, 8, 512])]
+    assert _launch_per_request_shapes(monkeypatch, 4) == [torch.Size([1, 6, 8, 512])]
 
 
 def test_launch_per_request_prefill_pads_q_len_2_once(monkeypatch):
