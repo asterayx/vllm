@@ -26,7 +26,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
-from vllm.utils.sm12x import sm12x_align_decode_q_len
+from vllm.utils.sm12x import sm12x_align_decode_q_len, sm12x_align_prefill_q_len
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
@@ -802,15 +802,19 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         extra_sparse_lengths: torch.Tensor | None,
         token_start: int,
         token_end: int,
+        *,
+        is_prefill: bool = False,
     ) -> None:
         """Launch FlashInfer decode for ``[token_start, token_end)``.
 
-        On SM12x, pad unsupported q_len (2, 3, 5, 7, 9-15, ...) to a width
-        that survived CUDA-graph capture. Do not split q_len=2: a short
-        prefill's second token is not in the KV cache yet.
+        On SM12x, pad unsupported q_len instead of splitting a 2-token
+        prefill into two q_len=1 launches (the second token's KV is not
+        in cache yet). Decode uses capture-proven widths; real prefills
+        pad to the MHC/MoE width because q_len=4 still IMA'd as a seed.
         """
         q_len = token_end - token_start
-        launch_len = sm12x_align_decode_q_len(q_len)
+        align = sm12x_align_prefill_q_len if is_prefill else sm12x_align_decode_q_len
+        launch_len = align(q_len)
         if launch_len != q_len:
             logger.info_once(
                 "SM12x FlashInfer: padding q_len=%d -> %d to avoid small-batch IMA",
@@ -1108,6 +1112,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                         extra_sparse_lengths,
                         rs,
                         re_,
+                        is_prefill=True,
                     )
                 continue
             flashinfer_trtllm_batch_decode_sparse_mla_dsv4(

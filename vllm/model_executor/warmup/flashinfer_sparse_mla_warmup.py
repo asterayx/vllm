@@ -14,7 +14,6 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import autotune as flashinfer_autotune
 from vllm.utils.flashinfer import has_flashinfer
-from vllm.utils.sm12x import sm12x_skip_mixed_sparse_mla_warmup
 from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
 
 if TYPE_CHECKING:
@@ -210,7 +209,7 @@ def _deepseek_v4_sparse_mla_decode_autotune(
 def flashinfer_sparse_mla_decode_autotune_warmup(worker: "Worker") -> None:
     """Autotune generic FlashInfer sparse MLA decode when selected."""
     runner = worker.model_runner
-    if runner.is_pooling_model or sm12x_skip_mixed_sparse_mla_warmup():
+    if runner.is_pooling_model:
         return
 
     max_tokens = worker.scheduler_config.max_num_batched_tokens
@@ -224,12 +223,6 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     """Warm DSv4 sparse-MLA mixed prefill+decode attention."""
     runner = worker.model_runner
     if runner.is_pooling_model or not _has_deepseek_v4_sparse_mla_backend(runner):
-        return
-    if sm12x_skip_mixed_sparse_mla_warmup():
-        logger.info(
-            "Skipping DeepSeek V4 sparse MLA mixed warmup on SM12x; "
-            "CUDA-graph capture already covered safe q_len widths."
-        )
         return
 
     max_tokens = worker.scheduler_config.max_num_batched_tokens

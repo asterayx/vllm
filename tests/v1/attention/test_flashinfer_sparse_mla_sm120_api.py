@@ -17,7 +17,11 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils import flashinfer as fi_utils
-from vllm.utils.sm12x import sm12x_align_decode_q_len
+from vllm.utils.sm12x import (
+    SM12X_SAFE_MIN_TOKENS,
+    sm12x_align_decode_q_len,
+    sm12x_align_prefill_q_len,
+)
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseSM120Backend,
 )
@@ -202,6 +206,10 @@ def test_sm12x_aligns_unsafe_decode_q_len(monkeypatch):
     assert sm12x_align_decode_q_len(15) == 16
     assert sm12x_align_decode_q_len(16) == 16
     assert sm12x_align_decode_q_len(36) == 36
+    assert sm12x_align_prefill_q_len(2) == SM12X_SAFE_MIN_TOKENS
+    assert sm12x_align_prefill_q_len(4) == SM12X_SAFE_MIN_TOKENS
+    assert sm12x_align_prefill_q_len(8) == SM12X_SAFE_MIN_TOKENS
+    assert sm12x_align_prefill_q_len(16) == SM12X_SAFE_MIN_TOKENS
 
 
 def test_non_sm12x_keeps_q_len_2(monkeypatch):
@@ -220,6 +228,7 @@ def test_non_sm12x_keeps_q_len_2(monkeypatch):
     )
     assert sm12x_q_len_spans(2) == [(0, 2)]
     assert sm12x_align_decode_q_len(2) == 2
+    assert sm12x_align_prefill_q_len(2) == 2
 
 
 def test_batch_token_span_pads_indices_with_sentinels():
@@ -236,20 +245,13 @@ def test_batch_token_span_pads_indices_with_sentinels():
     assert torch.equal(padded_lens[0, 2:], torch.zeros(2, dtype=torch.int32))
 
 
-def test_launch_per_request_decode_pads_q_len_2_once(monkeypatch):
-    """A 2-token SM12x prefill must be one [1, 4] launch, not two [1, 1]."""
+def _launch_per_request_shapes(monkeypatch, q_len: int, **kwargs) -> list[torch.Size]:
     from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
-    from vllm.utils import sm12x as sm12x_utils
 
-    monkeypatch.setattr(
-        sm12x_utils.current_platform,
-        "is_device_capability_family",
-        lambda fam: fam == 120,
-    )
     shapes: list[torch.Size] = []
 
-    def _fake_launch(**kwargs):
-        shapes.append(kwargs["query"].shape)
+    def _fake_launch(**launch_kwargs):
+        shapes.append(launch_kwargs["query"].shape)
 
     monkeypatch.setattr(
         fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
@@ -259,19 +261,49 @@ def test_launch_per_request_decode_pads_q_len_2_once(monkeypatch):
         attn_sink=None,
         _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
     )
-    q = torch.zeros(2, 8, 512)
-    output = torch.zeros(2, 8, 512)
+    q = torch.zeros(q_len, 8, 512)
+    output = torch.zeros(q_len, 8, 512)
     DeepseekV4FlashInferSM120Attention._launch_per_request_decode(
         dummy,
         q,
         output,
         torch.zeros(1),
         None,
-        torch.zeros(2, 16, dtype=torch.int32),
-        torch.ones(2, dtype=torch.int32),
+        torch.zeros(q_len, 16, dtype=torch.int32),
+        torch.ones(q_len, dtype=torch.int32),
         None,
         None,
         0,
-        2,
+        q_len,
+        **kwargs,
     )
-    assert shapes == [torch.Size([1, 4, 8, 512])]
+    return shapes
+
+
+def test_launch_per_request_decode_pads_q_len_2_once(monkeypatch):
+    """A 2-token SM12x decode-form launch must be one [1, 4], not two [1, 1]."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert _launch_per_request_shapes(monkeypatch, 2) == [torch.Size([1, 4, 8, 512])]
+
+
+def test_launch_per_request_prefill_pads_q_len_2_to_16_once(monkeypatch):
+    """A short SM12x prefill must be one [1, 16] launch, not a split or q_len=4."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert _launch_per_request_shapes(monkeypatch, 2, is_prefill=True) == [
+        torch.Size([1, 16, 8, 512])
+    ]
+    assert _launch_per_request_shapes(monkeypatch, 4, is_prefill=True) == [
+        torch.Size([1, 16, 8, 512])
+    ]

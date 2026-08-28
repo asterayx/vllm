@@ -34,21 +34,13 @@ def sm12x_align_tokens(num_tokens: int, min_tokens: int = SM12X_SAFE_MIN_TOKENS)
     return num_tokens
 
 
-def sm12x_skip_mixed_sparse_mla_warmup() -> bool:
-    """Whether to skip mixed prefill+decode sparse-MLA warmup on SM12x.
-
-    After PIECEWISE/FULL capture, a short real seed prefill still IMA'd on
-    GB10 (async fault, reported at MHC pad). Capture already covers the
-    safe decode-form widths; live short prefills use padded launches.
-    """
-    return current_platform.is_device_capability_family(120)
-
-
 def sm12x_mixed_warmup_decode_prompt_len() -> int:
     """Prefill length used to seed mixed-warmup's decode request.
 
-    SM12x FlashInfer IMA'd on the historical 2-token seed. Use the MHC/MoE
-    safe width so a bypassed warmup does not re-enter the small-batch path.
+    SM12x FlashInfer IMA'd on the historical 2-token seed and on a 4-token
+    real seed (q_len=4 survived capture only as a dummy decode). Seed at
+    the MHC/MoE width; short prefills pad via
+    :func:`sm12x_align_prefill_q_len`.
     """
     if current_platform.is_device_capability_family(120):
         return SM12X_SAFE_MIN_TOKENS
@@ -67,6 +59,22 @@ def sm12x_align_decode_q_len(q_len: int) -> int:
         if q_len <= safe:
             return safe
     return q_len
+
+
+def sm12x_align_prefill_q_len(q_len: int) -> int:
+    """Snap a FlashInfer decode-form *prefill* q_len to a GB10-safe width.
+
+    SM120's sparse prefill kernel requires ``num_tokens > 64``, so short
+    prefills reuse the decode-form launch. Capture-proven decode widths
+    (4, 6, 8) still IMA'd as a real seed prefill: do not split ``q_len=2``
+    into two ``q_len=1`` launches, and do not stop at those decode widths.
+    Pad to :data:`SM12X_SAFE_MIN_TOKENS` instead.
+    """
+    if q_len <= 0 or not current_platform.is_device_capability_family(120):
+        return q_len
+    if q_len < SM12X_SAFE_MIN_TOKENS:
+        return SM12X_SAFE_MIN_TOKENS
+    return sm12x_align_decode_q_len(q_len)
 
 
 def pad_token_rows(t: torch.Tensor, target: int) -> torch.Tensor:
