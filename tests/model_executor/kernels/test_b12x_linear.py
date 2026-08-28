@@ -23,6 +23,7 @@ from vllm.model_executor.kernels.linear import (
     B12xNvFp4LinearKernel,
     B12xTensorFP8ScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
+    MarlinFP8ScaledMMLinearKernel,
     Mxfp8LinearLayerConfig,
     TritonFp8BlockScaledMMKernel,
     init_fp8_linear_kernel,
@@ -254,6 +255,56 @@ def test_b12x_block_fp8_sm121_falls_back_with_forced_backend(monkeypatch) -> Non
                 "B12X block-FP8 dense GEMM IMAs on SM121 (sm_120 TMA vs sm_121a)",
             )
         ),
+    )
+    monkeypatch.setattr(
+        TritonFp8BlockScaledMMKernel,
+        "is_supported",
+        classmethod(lambda cls, compute_capability=None: (True, None)),
+    )
+    monkeypatch.setattr(
+        TritonFp8BlockScaledMMKernel,
+        "can_implement",
+        classmethod(lambda cls, config: (True, None)),
+    )
+
+    config = FP8ScaledMMLinearLayerConfig(
+        activation_quant_key=kFp8Dynamic128Sym,
+        weight_quant_key=kFp8Static128BlockSym,
+        input_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        weight_shape=(2048, 4096),
+    )
+    kernel_cls = linear_mod.choose_scaled_mm_linear_kernel(
+        config=config,
+        possible_kernels=linear_mod._POSSIBLE_FP8_BLOCK_KERNELS,
+    )
+
+    assert kernel_cls is TritonFp8BlockScaledMMKernel
+
+
+def test_sm121_block_fp8_skips_marlin_and_selects_triton(monkeypatch) -> None:
+    import vllm.model_executor.kernels.linear as linear_mod
+
+    monkeypatch.setattr(linear_mod.current_platform, "_enum", PlatformEnum.CUDA)
+    monkeypatch.setattr(linear_mod, "_get_linear_backend", lambda: "auto")
+    monkeypatch.setitem(
+        linear_mod._POSSIBLE_FP8_BLOCK_KERNELS,
+        PlatformEnum.CUDA,
+        [
+            B12xFp8BlockScaledMMKernel,
+            MarlinFP8ScaledMMLinearKernel,
+            TritonFp8BlockScaledMMKernel,
+        ],
+    )
+    monkeypatch.setattr(
+        B12xFp8BlockScaledMMKernel,
+        "is_supported",
+        classmethod(lambda cls, compute_capability=None: (False, "SM121")),
+    )
+    monkeypatch.setattr(
+        MarlinFP8ScaledMMLinearKernel,
+        "is_supported",
+        classmethod(lambda cls, compute_capability=None: (False, "SM12x")),
     )
     monkeypatch.setattr(
         TritonFp8BlockScaledMMKernel,

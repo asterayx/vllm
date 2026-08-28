@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SM12x must not pick Cutlass block FP8 for DSv4 UE8M0 scales."""
+"""SM12x FP8 linear selection: skip Cutlass UE8M0 and Marlin weight-only."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -11,6 +12,13 @@ from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel impo
 )
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
     CutlassFp8BlockScaledMMKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
+    MarlinFP8ScaledMMLinearKernel,
+)
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    SharedExperts,
+    SharedExpertsOrder,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _upcast_e8m0_to_fp32,
@@ -28,6 +36,54 @@ def test_cutlass_block_fp8_unsupported_on_sm12x():
     assert ok is False
     assert reason is not None
     assert "SM12x" in reason
+
+
+def test_marlin_fp8_unsupported_on_sm12x():
+    with patch(
+        "vllm.model_executor.kernels.linear.scaled_mm.marlin.current_platform"
+    ) as mock_platform:
+        mock_platform.is_cuda.return_value = True
+        mock_platform.is_device_capability_family.side_effect = lambda fam: fam == 120
+        ok, reason = MarlinFP8ScaledMMLinearKernel.is_supported(121)
+    assert ok is False
+    assert reason is not None
+    assert "SM12x" in reason
+
+
+def test_shared_experts_disables_aux_stream_on_sm12x():
+    platform = SimpleNamespace(
+        is_cuda=lambda: True,
+        is_device_capability_family=lambda fam: fam == 120,
+    )
+    moe_config = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(
+            enable_eplb=False,
+            all2all_backend="",
+            use_fi_nvl_two_sided_kernels=False,
+        )
+    )
+    with (
+        patch(
+            "vllm.model_executor.layers.fused_moe.runner.shared_experts."
+            "current_platform",
+            platform,
+        ),
+        patch(
+            "vllm.model_executor.layers.fused_moe.runner.shared_experts.aux_stream",
+            lambda: object(),
+        ),
+    ):
+        experts = SharedExperts(
+            layer=torch.nn.Identity(),
+            moe_config=moe_config,
+            enable_dbo=False,
+            mk_can_overlap_shared_experts=lambda: False,
+        )
+    assert experts._stream is None
+    hidden = torch.zeros(8, 16)
+    assert experts._determine_shared_experts_order(hidden) is (
+        SharedExpertsOrder.NO_OVERLAP
+    )
 
 
 def test_ue8m0_weight_scale_upcasts_to_float32():
