@@ -86,7 +86,7 @@ services:
         --async-scheduling
         --enable-chunked-prefill
         --enable-flashinfer-autotune
-        --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
+        --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,4,8,16,24,32,36]}'
         --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
         --host 0.0.0.0
         --port ${VLLM_PORT:-30001}

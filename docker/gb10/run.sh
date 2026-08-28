@@ -17,8 +17,12 @@ HEADLESS="${HEADLESS:-}"
 NAME="${NAME:-dspark-tp2-rank${NODE_RANK}}"
 
 mkdir -p "${VLLM_CACHE}" "${HF_CACHE}/flashinfer"
+docker rm -f "${NAME}" 2>/dev/null || true
 
-exec docker run --rm -it --name "${NAME}" \
+# 6 seqs * (1 + DSpark k=5) = 36; include 36 so capture is not truncated to 32.
+CUGRAPH_CFG='{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,4,8,16,24,32,36]}'
+
+docker run -d --name "${NAME}" \
   --gpus all --ipc=host --network host --privileged \
   --shm-size=64g --ulimit memlock=-1 --ulimit stack=67108864 \
   --device /dev/infiniband \
@@ -81,5 +85,7 @@ exec docker run --rm -it --name "${NAME}" \
   --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' \
   --enable-prefix-caching --async-scheduling --enable-chunked-prefill \
   --enable-flashinfer-autotune \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
+  --compilation-config "${CUGRAPH_CFG}" \
   ${HEADLESS}
+
+echo "started ${NAME}; logs: docker logs -f ${NAME}"
