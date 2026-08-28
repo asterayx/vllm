@@ -140,6 +140,57 @@ def test_sm12x_does_not_fill_compressed_prefill_slots(monkeypatch):
     assert sm12x_skip_padded_prefill_c4a([2]) is False
 
 
+def test_sm12x_o_proj_pads_small_batches(monkeypatch):
+    """Spark 23:54: o_proj ran on 2 tokens after SWA-only [1, 6]."""
+    from vllm.models.deepseek_v4.nvidia.ops import o_proj as o_proj_mod
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    seen: dict[str, int] = {}
+
+    def _fake_rope(o, positions, *args, **kwargs):
+        seen["o"] = o.shape[0]
+        seen["pos"] = positions.shape[0]
+        return torch.zeros_like(o), torch.ones(o.shape[0], 1)
+
+    class _W(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.zeros(1)
+            self.weight_scale = torch.ones(1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            seen["wo"] = x.shape[0]
+            return x
+
+    monkeypatch.setattr(o_proj_mod, "fused_inv_rope_fp8_quant", _fake_rope)
+    monkeypatch.setattr(
+        o_proj_mod, "_use_deepseek_v4_sm12x_triton_fp8_einsum", lambda *a, **k: True
+    )
+    monkeypatch.setattr(o_proj_mod, "deepseek_v4_fp8_einsum", lambda *a, **k: None)
+    wo = _W()
+    out = o_proj_mod.deep_gemm_fp8_o_proj(
+        torch.zeros(2, 4, 8),
+        torch.arange(2),
+        torch.zeros(1),
+        wo,
+        wo,
+        n_groups=1,
+        heads_per_group=4,
+        nope_dim=4,
+        rope_dim=4,
+        o_lora_rank=8,
+        einsum_recipe=(1, 128, 128),
+        tma_aligned_scales=False,
+    )
+    assert seen == {"o": 16, "pos": 16, "wo": 16}
+    assert out.shape[0] == 2
+
+
 def _dspark_full_decode_capture_sizes(
     decode_query_len: int,
     capture_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 24, 32, 36),

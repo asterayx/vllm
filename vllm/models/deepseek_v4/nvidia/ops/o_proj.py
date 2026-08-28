@@ -12,6 +12,7 @@ from vllm.models.deepseek_v4.nvidia.ops.fp8_einsum import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum
+from vllm.utils.sm12x import sm12x_pad_token_rows
 
 
 def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
@@ -59,7 +60,14 @@ def deep_gemm_fp8_o_proj(
 
     Shared by the FlashMLA and FlashInfer CUDA backends. ``einsum_recipe`` /
     ``tma_aligned_scales`` come from ``compute_fp8_einsum_recipe``.
+
+    Spark 23:54: mixed-warmup seed launched SWA-only ``[1, 6]`` then
+    IMA'd at ``wo_b`` all_reduce. MHC/MoE already pad ``<16`` tokens;
+    o_proj did not.
     """
+    o, orig_tokens = sm12x_pad_token_rows(o, what="o_proj")
+    if o.shape[0] != orig_tokens:
+        positions, _ = sm12x_pad_token_rows(positions)
     o_fp8, o_scale = fused_inv_rope_fp8_quant(
         o,
         positions,
@@ -91,7 +99,7 @@ def deep_gemm_fp8_o_proj(
             equation="bhr,hdr->bhd",
             recipe=einsum_recipe,
         )
-        return wo_b(z.flatten(1))
+        return wo_b(z.flatten(1))[:orig_tokens]
     # DeepGEMM "bhr,hdr->bhd" runs get_shape<3> on B and does not reshape.
     # Layers loaded outside the DeepGEMM scaled-mm path keep the flat
     # checkpoint layout (n_groups*o_lora_rank, D).
@@ -105,4 +113,4 @@ def deep_gemm_fp8_o_proj(
         z,
         recipe=einsum_recipe,
     )
-    return wo_b(z.flatten(1))
+    return wo_b(z.flatten(1))[:orig_tokens]
