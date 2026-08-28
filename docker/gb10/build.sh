@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build the GB10 image on this Spark. Run from the repo root.
+# From-scratch image (re-downloads torch, recompiles vLLM). Prefer
+# docker/gb10/pack-venv.sh if this Spark already has ~/.venv/vllm028.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
