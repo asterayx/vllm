@@ -286,6 +286,13 @@ class CutlassFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 
     @classmethod
     def is_supported(cls, compute_capability=None):
+        if current_platform.is_device_capability_family(120):
+            return (
+                False,
+                "Cutlass block FP8 dispatch requires float scales; SM12x "
+                "DeepSeek-V4 checkpoints store UE8M0 and fail "
+                "dispatch_scaled_mm. Use Triton or B12X.",
+            )
         if not CUTLASS_BLOCK_FP8_SUPPORTED:
             return (
                 False,
