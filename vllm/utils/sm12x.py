@@ -31,10 +31,6 @@ SM12X_UNSAFE_PER_REQUEST_Q_LENS = (2, 3)
 # already went green in main capture. 6=1×6 MHC-pads to 16. Drop
 # 18=3×6 and 12=2×6 (main capture never ran those token counts).
 SM12X_DSPARK_SAFE_CAPTURE_TOKENS = (6, 24, 36)
-# SM120 sparse *prefill* kernel asserts num_tokens > 64. Decode-form
-# [1, 6] launched on the mixed-warmup seed (Spark 17:03) then IMA'd;
-# DSpark [1, 6] *decode* dummies were fine. First prefills use this.
-SM12X_PREFILL_KERNEL_MIN_TOKENS = 65
 
 
 def sm12x_align_tokens(num_tokens: int, min_tokens: int = SM12X_SAFE_MIN_TOKENS) -> int:
@@ -146,16 +142,6 @@ def reject_sm12x_unsafe_decode_query(query: torch.Tensor) -> None:
             "SM12x FlashInfer refused per-request query shape "
             f"{tuple(query.shape)}; pad q_len to 6"
         )
-
-
-def sm12x_align_prefill_kernel_tokens(num_tokens: int) -> int:
-    """Grow a short SM12x prefill so FlashInfer uses the >64 kernel."""
-    if (
-        0 < num_tokens <= 64
-        and current_platform.is_device_capability_family(120)
-    ):
-        return SM12X_PREFILL_KERNEL_MIN_TOKENS
-    return num_tokens
 
 
 def sm12x_align_prefill_q_len(q_len: int) -> int:

@@ -488,6 +488,9 @@ def _compute_global_topk_indices_and_lens_kernel(
     token_idx = tl.program_id(0)
     is_valid_token = tl.load(is_valid_token_ptr + token_idx)
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    # SM12x pads first-prefill q_len=2 to one [1, 6] decode-form launch
+    # (Spark 17:03). Bound both block-table axes so padded/stale
+    # indexer rows cannot IMA past the table.
     req_ok = (req_idx >= 0) & (req_idx < num_reqs)
 
     count = tl.zeros((), dtype=tl.int32)

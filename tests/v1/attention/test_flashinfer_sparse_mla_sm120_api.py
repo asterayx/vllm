@@ -10,7 +10,6 @@ from vllm.config import set_current_vllm_config
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferSM120Attention,
     _batch_token_span,
-    _repeat_last_rows,
     _required_sm120_sparse_topk,
     sm12x_q_len_spans,
     sm12x_use_per_request_decode,
@@ -401,16 +400,8 @@ def test_forward_decode_q_len_2_is_one_padded_launch(monkeypatch):
     assert shapes == [torch.Size([1, 6, 8, 512])]
 
 
-def test_repeat_last_rows_pads_to_prefill_kernel_width():
-    x = torch.arange(2 * 3, dtype=torch.int32).view(2, 3)
-    padded = _repeat_last_rows(x, 65)
-    assert padded.shape == (65, 3)
-    assert torch.equal(padded[:2], x)
-    assert torch.equal(padded[2:], x[-1:].expand(63, -1))
-
-
-def test_forward_prefill_q_len_2_uses_sm120_prefill_kernel(monkeypatch):
-    """Spark 17:03: decode-form [1, 6] IMA'd on a first prefill."""
+def test_forward_prefill_q_len_2_is_one_padded_launch(monkeypatch):
+    """Spark 17:03: mixed-warmup seed is one [1, 6], never [1, 4] or 65."""
     from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
     from vllm.utils import sm12x as sm12x_utils
 
@@ -424,10 +415,6 @@ def test_forward_prefill_q_len_2_uses_sm120_prefill_kernel(monkeypatch):
         "is_device_capability_family",
         lambda fam: fam == 120,
     )
-    monkeypatch.setattr(
-        fi_sparse.torch.cuda, "is_current_stream_capturing", lambda: False
-    )
-    monkeypatch.setattr(fi_sparse.torch.cuda, "synchronize", lambda: None)
     shapes: list[torch.Size] = []
 
     def _fake_launch(**launch_kwargs):
@@ -448,6 +435,11 @@ def test_forward_prefill_q_len_2_uses_sm120_prefill_kernel(monkeypatch):
     dummy._prepare_query = (
         DeepseekV4FlashInferSM120Attention._prepare_query.__get__(dummy)
     )
+    dummy._launch_per_request_decode = (
+        DeepseekV4FlashInferSM120Attention._launch_per_request_decode.__get__(
+            dummy
+        )
+    )
     swa = SimpleNamespace(
         num_prefills=1,
         num_decodes=0,
@@ -462,6 +454,6 @@ def test_forward_prefill_q_len_2_uses_sm120_prefill_kernel(monkeypatch):
     DeepseekV4FlashInferSM120Attention._forward_prefill(
         dummy, q, None, torch.zeros(1), output, None, swa
     )
-    assert shapes == [torch.Size([65, 8, 512])]
-    assert shapes[0][0] != 6
-    assert shapes[0][0] != 4
+    assert shapes == [torch.Size([1, 6, 8, 512])]
+    assert shapes[0][1] != 4
+    assert shapes[0] != torch.Size([65, 8, 512])
