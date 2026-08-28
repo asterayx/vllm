@@ -17,6 +17,11 @@ logger = init_logger(__name__)
 # MoE (same compiled kernels, dynamic token count). Pad small batches up.
 SM12X_SAFE_MIN_TOKENS = 16
 
+# Per-request FlashInfer decode-form q_len that survived GB10 CUDA-graph
+# capture. 2 and 3 IMA; splitting a 2-token *prefill* into two q_len=1
+# launches also IMA'd (token 1's KV is not in cache yet).
+SM12X_SAFE_DECODE_Q_LENS = (1, 4, 6, 8, 16, 24, 32, 36)
+
 
 def sm12x_align_tokens(num_tokens: int, min_tokens: int = SM12X_SAFE_MIN_TOKENS) -> int:
     """Return a safe token count for SM12x kernels. Unchanged off SM12x."""
@@ -27,6 +32,31 @@ def sm12x_align_tokens(num_tokens: int, min_tokens: int = SM12X_SAFE_MIN_TOKENS)
     ):
         return min_tokens
     return num_tokens
+
+
+def sm12x_mixed_warmup_decode_prompt_len() -> int:
+    """Prefill length used to seed mixed-warmup's decode request.
+
+    SM12x FlashInfer IMA'd on the historical 2-token seed. q_len=4 survived
+    CUDA-graph capture on GB10.
+    """
+    if current_platform.is_device_capability_family(120):
+        return 4
+    return 2
+
+
+def sm12x_align_decode_q_len(q_len: int) -> int:
+    """Snap a FlashInfer decode-form q_len to a GB10-safe width.
+
+    Unchanged off SM12x. Values already in ``SM12X_SAFE_DECODE_Q_LENS`` or
+    larger than the last entry are left as-is.
+    """
+    if q_len <= 0 or not current_platform.is_device_capability_family(120):
+        return q_len
+    for safe in SM12X_SAFE_DECODE_Q_LENS:
+        if q_len <= safe:
+            return safe
+    return q_len
 
 
 def pad_token_rows(t: torch.Tensor, target: int) -> torch.Tensor:

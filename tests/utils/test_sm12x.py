@@ -7,7 +7,9 @@ from vllm.utils.sm12x import (
     SM12X_SAFE_MIN_TOKENS,
     extend_padding_mask,
     pad_token_rows,
+    sm12x_align_decode_q_len,
     sm12x_align_tokens,
+    sm12x_mixed_warmup_decode_prompt_len,
     sm12x_pad_token_rows,
 )
 
@@ -27,6 +29,20 @@ def test_sm12x_align_tokens_pads_small_batches(monkeypatch):
     assert sm12x_align_tokens(0) == 0
 
 
+def test_sm12x_align_decode_q_len_snaps_to_safe_widths(monkeypatch):
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert sm12x_align_decode_q_len(2) == 4
+    assert sm12x_align_decode_q_len(15) == 16
+    assert sm12x_align_decode_q_len(1) == 1
+    assert sm12x_mixed_warmup_decode_prompt_len() == 4
+
+
 def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
     from vllm.utils import sm12x as sm12x_utils
 
@@ -36,6 +52,7 @@ def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
         lambda fam: False,
     )
     assert sm12x_align_tokens(8) == 8
+    assert sm12x_mixed_warmup_decode_prompt_len() == 2
 
 
 def test_sm12x_pad_token_rows(monkeypatch):

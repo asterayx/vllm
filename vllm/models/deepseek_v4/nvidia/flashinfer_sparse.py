@@ -26,6 +26,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
+from vllm.utils.sm12x import sm12x_align_decode_q_len
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
@@ -114,14 +115,33 @@ def sm12x_use_per_request_decode(next_n: int | None, decode_query_len: int) -> b
 
 
 def sm12x_q_len_spans(q_len: int) -> list[tuple[int, int]]:
-    """Split SM12x ``q_len=2`` decode into two ``q_len=1`` launches.
+    """Return one span covering ``q_len``. Kept for tests; do not split.
 
-    Per-request ``[1, 2, ...]`` still IMA'd on GB10 after the batched
-    ``next_n=2`` path was disabled. ``q_len`` in {1, 4, 6, 8} is safe.
+    Splitting ``q_len=2`` into two ``q_len=1`` launches IMA'd on a 2-token
+    SM12x prefill: the second token's KV is not in cache yet. Pad to a
+    safe width with :func:`sm12x_align_decode_q_len` instead.
     """
-    if q_len == 2 and current_platform.is_device_capability_family(120):
-        return [(0, 1), (1, 2)]
     return [(0, q_len)]
+
+
+def _batch_token_span(
+    t: torch.Tensor,
+    start: int,
+    end: int,
+    target: int,
+    fill: int | float = 0,
+) -> torch.Tensor:
+    """Slice ``t[start:end]`` and pad dim 0 to ``target`` as ``[1, target, ...]``."""
+    sl = t[start:end]
+    n = sl.shape[0]
+    if n < target:
+        sl = torch.cat(
+            (sl, sl.new_full((target - n, *sl.shape[1:]), fill)),
+            dim=0,
+        )
+    if sl.ndim == 1:
+        return sl.reshape(1, target)
+    return sl.reshape(1, target, *sl.shape[1:])
 
 
 def _required_sm120_sparse_topk(vllm_config: VllmConfig, window_size: int) -> int:
@@ -785,42 +805,58 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     ) -> None:
         """Launch FlashInfer decode for ``[token_start, token_end)``.
 
-        On SM12x, ``q_len=2`` is split into two ``q_len=1`` launches.
+        On SM12x, pad unsupported q_len (2, 3, 5, 7, 9-15, ...) to a width
+        that survived CUDA-graph capture. Do not split q_len=2: a short
+        prefill's second token is not in the KV cache yet.
         """
         q_len = token_end - token_start
-        spans = sm12x_q_len_spans(q_len)
-        if q_len == 2 and len(spans) > 1:
+        launch_len = sm12x_align_decode_q_len(q_len)
+        if launch_len != q_len:
             logger.info_once(
-                "SM12x FlashInfer: splitting q_len=2 into two q_len=1 launches"
+                "SM12x FlashInfer: padding q_len=%d -> %d to avoid small-batch IMA",
+                q_len,
+                launch_len,
             )
-        for off0, off1 in spans:
-            start = token_start + off0
-            end = token_start + off1
-            span_len = end - start
-            esi = (
-                extra_sparse_indices[start:end].reshape(1, span_len, -1)
-                if extra_sparse_indices is not None
-                else None
-            )
-            esl = (
-                extra_sparse_lengths[start:end].reshape(1, span_len)
-                if extra_sparse_lengths is not None
-                else None
-            )
-            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-                query=q[start:end].reshape(1, span_len, *q.shape[1:]),
-                swa_kv_cache=swa_cache,
-                workspace_buffer=self._get_workspace(q.device),
-                sparse_indices=swa_indices[start:end].reshape(1, span_len, -1),
-                compressed_kv_cache=extra_cache,
-                out=output[start:end].reshape(1, span_len, *output.shape[1:]),
-                bmm1_scale=self.scale,
-                sinks=self.attn_sink,
-                kv_layout="NHD",
-                swa_topk_lens=swa_lens[start:end].reshape(1, span_len),
-                extra_sparse_indices=esi,
-                extra_sparse_topk_lens=esl,
-            )
+        esi = (
+            _batch_token_span(
+                extra_sparse_indices,
+                token_start,
+                token_end,
+                launch_len,
+                fill=-1,
+            ).reshape(1, launch_len, -1)
+            if extra_sparse_indices is not None
+            else None
+        )
+        esl = (
+            _batch_token_span(extra_sparse_lengths, token_start, token_end, launch_len)
+            if extra_sparse_lengths is not None
+            else None
+        )
+        if launch_len == q_len:
+            out = output[token_start:token_end].reshape(1, q_len, *output.shape[1:])
+        else:
+            out = _batch_token_span(output, token_start, token_end, launch_len)
+        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+            query=_batch_token_span(q, token_start, token_end, launch_len),
+            swa_kv_cache=swa_cache,
+            workspace_buffer=self._get_workspace(q.device),
+            sparse_indices=_batch_token_span(
+                swa_indices, token_start, token_end, launch_len, fill=-1
+            ).reshape(1, launch_len, -1),
+            compressed_kv_cache=extra_cache,
+            out=out,
+            bmm1_scale=self.scale,
+            sinks=self.attn_sink,
+            kv_layout="NHD",
+            swa_topk_lens=_batch_token_span(
+                swa_lens, token_start, token_end, launch_len
+            ),
+            extra_sparse_indices=esi,
+            extra_sparse_topk_lens=esl,
+        )
+        if launch_len != q_len:
+            output[token_start:token_end].copy_(out[0, :q_len])
 
     def _forward_decode(
         self,

@@ -12,6 +12,7 @@ from vllm import PoolingParams, SamplingParams
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.utils.math_utils import cdiv
+from vllm.utils.sm12x import sm12x_mixed_warmup_decode_prompt_len
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -88,7 +89,7 @@ def run_mixed_prefill_decode_warmup(
 
     decode_req_id = f"{req_id_prefix}_decode_"
     prefill_req_id = f"{req_id_prefix}_prefill_"
-    decode_prompt_len = 2
+    decode_prompt_len = sm12x_mixed_warmup_decode_prompt_len()
     decode_scheduled_tokens = 1
     prefill_len = num_tokens - decode_scheduled_tokens
     decode_token_ids = list(range(decode_prompt_len))

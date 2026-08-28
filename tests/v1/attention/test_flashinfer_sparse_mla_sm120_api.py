@@ -15,6 +15,7 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils import flashinfer as fi_utils
+from vllm.utils.sm12x import sm12x_align_decode_q_len
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseSM120Backend,
 )
@@ -168,7 +169,8 @@ def test_non_sm12x_keeps_batched_spec_decode(monkeypatch):
     assert not sm12x_use_per_request_decode(6, 6)
 
 
-def test_sm12x_splits_q_len_2_into_two_q_len_1(monkeypatch):
+def test_sm12x_keeps_q_len_2_as_one_span(monkeypatch):
+    """Do not split q_len=2: a 2-token prefill's second KV is not written yet."""
     from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
 
     monkeypatch.setattr(
@@ -176,18 +178,43 @@ def test_sm12x_splits_q_len_2_into_two_q_len_1(monkeypatch):
         "is_device_capability_family",
         lambda fam: fam == 120,
     )
-    assert sm12x_q_len_spans(2) == [(0, 1), (1, 2)]
+    assert sm12x_q_len_spans(2) == [(0, 2)]
     assert sm12x_q_len_spans(1) == [(0, 1)]
     assert sm12x_q_len_spans(4) == [(0, 4)]
     assert sm12x_q_len_spans(6) == [(0, 6)]
 
 
+def test_sm12x_aligns_unsafe_decode_q_len(monkeypatch):
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert sm12x_align_decode_q_len(1) == 1
+    assert sm12x_align_decode_q_len(2) == 4
+    assert sm12x_align_decode_q_len(3) == 4
+    assert sm12x_align_decode_q_len(4) == 4
+    assert sm12x_align_decode_q_len(5) == 6
+    assert sm12x_align_decode_q_len(15) == 16
+    assert sm12x_align_decode_q_len(16) == 16
+    assert sm12x_align_decode_q_len(36) == 36
+
+
 def test_non_sm12x_keeps_q_len_2(monkeypatch):
     from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+    from vllm.utils import sm12x as sm12x_utils
 
     monkeypatch.setattr(
         fi_sparse.current_platform,
         "is_device_capability_family",
         lambda fam: False,
     )
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
     assert sm12x_q_len_spans(2) == [(0, 2)]
+    assert sm12x_align_decode_q_len(2) == 2
