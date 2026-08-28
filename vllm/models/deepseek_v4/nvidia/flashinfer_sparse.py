@@ -30,6 +30,7 @@ from vllm.utils.sm12x import (
     SM12X_SAFE_PREFILL_DECODE_Q_LENS,
     reject_sm12x_unsafe_decode_query,
     sm12x_align_decode_q_len,
+    sm12x_align_prefill_kernel_tokens,
     sm12x_align_prefill_q_len,
 )
 from vllm.v1.attention.backend import MultipleOf
@@ -160,6 +161,16 @@ def _batch_token_span(
     else:
         out = sl.reshape(1, target, *sl.shape[1:])
     return out.contiguous()
+
+
+def _repeat_last_rows(t: torch.Tensor, target: int) -> torch.Tensor:
+    """Pad ``t`` along dim 0 by repeating the last real row."""
+    n = t.shape[0]
+    if n >= target or n == 0:
+        return t
+    extra = target - n
+    pad = t[-1:].expand(extra, *t.shape[1:]).contiguous()
+    return torch.cat((t, pad), dim=0)
 
 
 def _required_sm120_sparse_topk(vllm_config: VllmConfig, window_size: int) -> int:
@@ -1122,14 +1133,74 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 )
             if q_chunk.shape[0] <= 64:
                 # SM120's sparse prefill kernel asserts num_tokens > 64.
-                # Small segments use one padded decode-form [1, q_len, ...]
-                # call (q_len <= 64 legal). Do not split q_len=2.
-                # Reached only when the SWA split keeps short first
-                # prefills as prefills (DSpark threshold is k+1=6).
+                # Decode-form [1, 6] launched on the mixed-warmup seed
+                # (Spark 17:03) then IMA'd; DSpark [1, 6] decode dummies
+                # were fine. First prefills use the >64 kernel.
+                if current_platform.is_device_capability_family(120):
+                    launch_len = sm12x_align_prefill_kernel_tokens(
+                        q_chunk.shape[0]
+                    )
+                    q_launch = _repeat_last_rows(q_chunk, launch_len)
+                    out_launch = _repeat_last_rows(
+                        output[query_start:query_end], launch_len
+                    )
+                    swa_idx_launch = _repeat_last_rows(
+                        swa_indices_chunk, launch_len
+                    )
+                    swa_len_launch = _repeat_last_rows(
+                        swa_lens_chunk, launch_len
+                    )
+                    esi = (
+                        _repeat_last_rows(extra_sparse_indices_chunk, launch_len)
+                        if extra_sparse_indices_chunk is not None
+                        else None
+                    )
+                    esl = (
+                        _repeat_last_rows(
+                            extra_sparse_lengths_chunk, launch_len
+                        )
+                        if extra_sparse_lengths_chunk is not None
+                        else None
+                    )
+                    if launch_len != q_chunk.shape[0]:
+                        logger.info(
+                            "SM12x FlashInfer: prefill kernel padding "
+                            "q_len=%d -> %d query.shape=%s",
+                            q_chunk.shape[0],
+                            launch_len,
+                            tuple(q_launch.shape),
+                        )
+                    flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                        query=q_launch,
+                        swa_kv_cache=swa_kv_paged,
+                        workspace_buffer=self._get_workspace(q.device),
+                        sparse_indices=swa_idx_launch,
+                        compressed_kv_cache=extra_kv_paged,
+                        out=out_launch,
+                        bmm1_scale=self.scale,
+                        sinks=self.attn_sink,
+                        kv_layout="NHD",
+                        swa_topk_lens=swa_len_launch,
+                        extra_sparse_indices=esi,
+                        extra_sparse_topk_lens=esl,
+                    )
+                    if torch.cuda.is_available() and (
+                        not torch.cuda.is_current_stream_capturing()
+                    ):
+                        torch.cuda.synchronize()
+                    if launch_len != q_chunk.shape[0]:
+                        output[query_start:query_end].copy_(
+                            out_launch[: q_chunk.shape[0]]
+                        )
+                    continue
+                # Off SM12x: one padded decode-form [1, q_len, ...] call.
                 for ri in range(chunk_start, chunk_end):
-                    rs = int(query_start_loc_cpu[num_decodes + ri] - prefill_token_base)
+                    rs = int(
+                        query_start_loc_cpu[num_decodes + ri] - prefill_token_base
+                    )
                     re_ = int(
-                        query_start_loc_cpu[num_decodes + ri + 1] - prefill_token_base
+                        query_start_loc_cpu[num_decodes + ri + 1]
+                        - prefill_token_base
                     )
                     if re_ <= rs:
                         continue

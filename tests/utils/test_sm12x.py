@@ -12,6 +12,7 @@ from vllm.utils.sm12x import (
     pad_token_rows,
     reject_sm12x_unsafe_decode_query,
     sm12x_align_decode_q_len,
+    sm12x_align_prefill_kernel_tokens,
     sm12x_align_prefill_q_len,
     sm12x_align_tokens,
     sm12x_disable_attn_aux_streams,
@@ -56,6 +57,9 @@ def test_sm12x_align_decode_q_len_snaps_to_safe_widths(monkeypatch):
     assert sm12x_align_prefill_q_len(4) == 6
     assert sm12x_align_prefill_q_len(5) == 6
     assert sm12x_align_prefill_q_len(16) == 16
+    assert sm12x_align_prefill_kernel_tokens(2) == 65
+    assert sm12x_align_prefill_kernel_tokens(64) == 65
+    assert sm12x_align_prefill_kernel_tokens(65) == 65
     reject_sm12x_unsafe_decode_query(torch.zeros(1, 6, 8, 512))
     reject_sm12x_unsafe_decode_query(torch.zeros(1, 4, 8, 512))
     reject_sm12x_unsafe_decode_query(torch.zeros(2, 4, 8, 512))

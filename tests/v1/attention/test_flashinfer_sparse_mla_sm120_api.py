@@ -10,6 +10,7 @@ from vllm.config import set_current_vllm_config
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferSM120Attention,
     _batch_token_span,
+    _repeat_last_rows,
     _required_sm120_sparse_topk,
     sm12x_q_len_spans,
     sm12x_use_per_request_decode,
@@ -398,3 +399,69 @@ def test_forward_decode_q_len_2_is_one_padded_launch(monkeypatch):
         dummy, q, None, swa, None, True, output
     )
     assert shapes == [torch.Size([1, 6, 8, 512])]
+
+
+def test_repeat_last_rows_pads_to_prefill_kernel_width():
+    x = torch.arange(2 * 3, dtype=torch.int32).view(2, 3)
+    padded = _repeat_last_rows(x, 65)
+    assert padded.shape == (65, 3)
+    assert torch.equal(padded[:2], x)
+    assert torch.equal(padded[2:], x[-1:].expand(63, -1))
+
+
+def test_forward_prefill_q_len_2_uses_sm120_prefill_kernel(monkeypatch):
+    """Spark 17:03: decode-form [1, 6] IMA'd on a first prefill."""
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    monkeypatch.setattr(
+        fi_sparse.torch.cuda, "is_current_stream_capturing", lambda: False
+    )
+    monkeypatch.setattr(fi_sparse.torch.cuda, "synchronize", lambda: None)
+    shapes: list[torch.Size] = []
+
+    def _fake_launch(**launch_kwargs):
+        shapes.append(launch_kwargs["query"].shape)
+
+    monkeypatch.setattr(
+        fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
+    )
+    dummy = SimpleNamespace(
+        compress_ratio=1,
+        PREFILL_CHUNK_SIZE=4,
+        scale=1.0,
+        attn_sink=None,
+        kv_cache_torch_dtype=torch.bfloat16,
+        _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
+        _as_sparse_cache=DeepseekV4FlashInferSM120Attention._as_sparse_cache,
+    )
+    dummy._prepare_query = (
+        DeepseekV4FlashInferSM120Attention._prepare_query.__get__(dummy)
+    )
+    swa = SimpleNamespace(
+        num_prefills=1,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefill_tokens=2,
+        query_start_loc_cpu=torch.tensor([0, 2]),
+        prefill_swa_indices=torch.zeros(2, 16, dtype=torch.int32),
+        prefill_swa_lens=torch.ones(2, dtype=torch.int32),
+    )
+    q = torch.zeros(2, 8, 512, dtype=torch.bfloat16)
+    output = torch.zeros(2, 8, 512, dtype=torch.bfloat16)
+    DeepseekV4FlashInferSM120Attention._forward_prefill(
+        dummy, q, None, torch.zeros(1), output, None, swa
+    )
+    assert shapes == [torch.Size([65, 8, 512])]
+    assert shapes[0][0] != 6
+    assert shapes[0][0] != 4
