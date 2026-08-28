@@ -18,17 +18,15 @@ logger = init_logger(__name__)
 SM12X_SAFE_MIN_TOKENS = 16
 
 # Per-request FlashInfer decode-form q_len. FlashInfer SM120 keeps
-# num_tokens <= 64 on decode kernels. Skip 2, 3, and 4:
-# - 2/3 IMA as a raw launch
-# - splitting a 2-token prefill into two q_len=1 launches IMA'd
-#   (token 1's KV is not in cache yet)
-# - [1, 4] IMA'd on mixed-warmup seed (2 real tokens decode-aligned
-#   to 4) and on a 4-token real first prefill. 6 is the DSpark width
-#   that captured (dummy 6×6 and speculator pad 5→6).
-SM12X_SAFE_DECODE_Q_LENS = (1, 6, 8, 16, 24, 32, 36)
-SM12X_SAFE_PREFILL_DECODE_Q_LENS = SM12X_SAFE_DECODE_Q_LENS
-# Per-request [1, q_len] widths that IMA'd on GB10 (raw or decode-aligned).
-SM12X_UNSAFE_PER_REQUEST_Q_LENS = (2, 3, 4)
+# num_tokens <= 64 on decode kernels.
+# Decode dummies: 4 real tokens as [1, 4] survived capture (size 16 = 4×4).
+# Do not pad those to [1, 6] by repeating the last row — that IMA'd
+# (async, reported at DSpark capture start).
+# Prefill: 2 and 4 real first-prefills IMA'd at [1, 4]; pad to 6.
+# 2/3 must not snap to 4 (mixed-warmup 2→4 IMA'd).
+SM12X_SAFE_DECODE_Q_LENS = (1, 4, 6, 8, 16, 24, 32, 36)
+SM12X_SAFE_PREFILL_DECODE_Q_LENS = (1, 6, 8, 16, 24, 32, 36)
+SM12X_UNSAFE_PER_REQUEST_Q_LENS = (2, 3)
 
 
 def sm12x_align_tokens(num_tokens: int, min_tokens: int = SM12X_SAFE_MIN_TOKENS) -> int:
@@ -67,13 +65,18 @@ def sm12x_mixed_warmup_prefill_len(requested_prefill: int) -> int:
 
 
 def sm12x_align_decode_q_len(q_len: int) -> int:
-    """Snap a FlashInfer decode-form q_len to a GB10-safe width.
+    """Snap a FlashInfer *decode dummy* q_len to a GB10-safe width.
 
-    Same widths as :func:`sm12x_align_prefill_q_len`. Decode-align used
-    to snap 2→4 because 4 is in the capture dummy list; mixed warmup
-    then launched ``[1, 4]`` and IMA'd. Unchanged off SM12x.
+    Keep 4 (CUDA-graph dummy). Snap 2/3 to 6, not 4. Unchanged off SM12x.
     """
-    return sm12x_align_prefill_q_len(q_len)
+    if q_len <= 0 or not current_platform.is_device_capability_family(120):
+        return q_len
+    for safe in SM12X_SAFE_DECODE_Q_LENS:
+        if safe == 4 and q_len < 4:
+            continue
+        if q_len <= safe:
+            return safe
+    return q_len
 
 
 def sm12x_treat_short_extends_as_decodes() -> bool:
@@ -101,9 +104,8 @@ def sm12x_disable_attn_aux_streams() -> bool:
 def reject_sm12x_unsafe_decode_query(query: torch.Tensor) -> None:
     """Refuse SM12x per-request FlashInfer shapes that IMA'd on GB10.
 
-    ``[1, 2]`` / ``[1, 3]`` / ``[1, 4]`` are the mixed-warmup seed
-    widths. Batched ``[B>1, 4]`` CUDA-graph dummies survived; do not
-    reject those.
+    ``[1, 2]`` / ``[1, 3]`` IMA'd. ``[1, 4]`` is a valid decode dummy
+    (size-16 capture); do not reject it.
     """
     if (
         query.ndim == 4

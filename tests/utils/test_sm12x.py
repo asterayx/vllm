@@ -47,7 +47,8 @@ def test_sm12x_align_decode_q_len_snaps_to_safe_widths(monkeypatch):
     )
     assert sm12x_align_decode_q_len(2) == 6
     assert sm12x_align_decode_q_len(3) == 6
-    assert sm12x_align_decode_q_len(4) == 6
+    assert sm12x_align_decode_q_len(4) == 4
+    assert sm12x_align_decode_q_len(5) == 6
     assert sm12x_align_decode_q_len(15) == 16
     assert sm12x_align_decode_q_len(1) == 1
     assert sm12x_align_prefill_q_len(2) == 6
@@ -55,16 +56,17 @@ def test_sm12x_align_decode_q_len_snaps_to_safe_widths(monkeypatch):
     assert sm12x_align_prefill_q_len(5) == 6
     assert sm12x_align_prefill_q_len(16) == 16
     reject_sm12x_unsafe_decode_query(torch.zeros(1, 6, 8, 512))
+    reject_sm12x_unsafe_decode_query(torch.zeros(1, 4, 8, 512))
     reject_sm12x_unsafe_decode_query(torch.zeros(2, 4, 8, 512))
     with pytest.raises(RuntimeError, match="refused per-request query shape"):
-        reject_sm12x_unsafe_decode_query(torch.zeros(1, 4, 8, 512))
-    with pytest.raises(RuntimeError, match="refused per-request query shape"):
         reject_sm12x_unsafe_decode_query(torch.zeros(1, 2, 8, 512))
+    with pytest.raises(RuntimeError, match="refused per-request query shape"):
+        reject_sm12x_unsafe_decode_query(torch.zeros(1, 3, 8, 512))
     from vllm.utils import flashinfer as fi_utils
 
     with pytest.raises(RuntimeError, match="refused per-request query shape"):
         fi_utils.flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-            query=torch.zeros(1, 4, 8, 512)
+            query=torch.zeros(1, 2, 8, 512)
         )
     assert sm12x_mixed_warmup_decode_prompt_len() == 2
     assert sm12x_mixed_warmup_prefill_len(15) == 2

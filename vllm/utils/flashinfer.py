@@ -162,7 +162,7 @@ _flashinfer_trtllm_batch_decode_sparse_mla_dsv4_impl = _lazy_import_wrapper(
 
 
 def flashinfer_trtllm_batch_decode_sparse_mla_dsv4(*args: Any, **kwargs: Any):
-    """SM12x last line: refuse per-request ``[1, 2]`` / ``[1, 4]``."""
+    """SM12x last line: refuse per-request ``[1, 2]`` / ``[1, 3]``."""
     query = kwargs.get("query", args[0] if args else None)
     if query is not None:
         from vllm.utils.sm12x import reject_sm12x_unsafe_decode_query

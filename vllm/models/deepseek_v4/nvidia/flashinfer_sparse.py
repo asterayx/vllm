@@ -27,7 +27,9 @@ from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
 from vllm.utils.sm12x import (
+    SM12X_SAFE_PREFILL_DECODE_Q_LENS,
     reject_sm12x_unsafe_decode_query,
+    sm12x_align_decode_q_len,
     sm12x_align_prefill_q_len,
 )
 from vllm.v1.attention.backend import MultipleOf
@@ -114,8 +116,9 @@ def sm12x_use_per_request_decode(next_n: int | None, decode_query_len: int) -> b
         return False
     if not current_platform.is_device_capability_family(120):
         return False
-    # Even if next_n == decode_query_len, [1, 2] / [1, 4] IMA'd.
-    if next_n in (2, 3, 4):
+    # 4 is a valid per-request decode dummy ([1, 4] captured). Batched
+    # [B, 4] is untested on GB10; keep per-request. 5 is DSpark draft.
+    if next_n not in SM12X_SAFE_PREFILL_DECODE_Q_LENS:
         return True
     return next_n != decode_query_len
 
@@ -125,7 +128,7 @@ def sm12x_q_len_spans(q_len: int) -> list[tuple[int, int]]:
 
     Splitting ``q_len=2`` into two ``q_len=1`` launches IMA'd on a 2-token
     SM12x prefill: the second token's KV is not in cache yet. Pad to a
-    safe width with :func:`sm12x_align_prefill_q_len` (never 4).
+    safe width with the prefill/decode aligner (prefill never 4).
     """
     return [(0, q_len)]
 
@@ -829,30 +832,22 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
         On SM12x, pad unsupported q_len instead of splitting a 2-token
         prefill into two q_len=1 launches. Extra rows repeat the last
-        real token (valid KV indices). Always skip width 4: DSpark's
-        decode_threshold is k+1=6, so a 2-token first prefill can
-        arrive here as a "decode" and the old decode-align launched
-        ``[1, 4]``, which IMA'd (reported at o_proj Triton).
+        real token (valid KV indices). Decode dummies keep ``q_len=4``
+        as ``[1, 4]``. Prefill ``2``/``4`` and decode ``2``/``5`` pad
+        to 6; never snap ``2``/``3`` to 4.
         """
         q_len = token_end - token_start
-        launch_len = sm12x_align_prefill_q_len(q_len)
-        if (
-            current_platform.is_device_capability_family(120)
-            and launch_len == 4
-        ):
-            raise RuntimeError(
-                "SM12x FlashInfer must not launch per-request q_len=4 "
-                f"(real q_len={q_len}); pad to 6"
-            )
+        align = (
+            sm12x_align_prefill_q_len if is_prefill else sm12x_align_decode_q_len
+        )
+        launch_len = align(q_len)
         query = _batch_token_span(q, token_start, token_end, launch_len)
         reject_sm12x_unsafe_decode_query(query)
         if launch_len != q_len:
-            # Always emit q_len=2/3/4 pads so Spark mixed-warmup can be
-            # confirmed; capture's 4→6 must not hide the later 2→6.
-            log = logger.info if q_len in (2, 3, 4) else logger.info_once
+            log = logger.info if q_len == 2 else logger.info_once
             log(
                 "SM12x FlashInfer: one decode-form launch padding %s "
-                "q_len=%d -> %d query.shape=%s (never q_len=4)",
+                "q_len=%d -> %d query.shape=%s",
                 "prefill" if is_prefill else "decode",
                 q_len,
                 launch_len,
