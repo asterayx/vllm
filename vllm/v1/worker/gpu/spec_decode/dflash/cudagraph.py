@@ -5,6 +5,8 @@ from collections.abc import Callable, Mapping
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -19,6 +21,8 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
 
 
 def _prepare_dflash_inputs_to_capture(
@@ -93,6 +97,13 @@ class DFlashCudaGraphManager(CudaGraphManager):
         ) -> Callable[[CUDAGraphMode], None]:
             num_tokens = desc.num_tokens
             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+            if current_platform.is_device_capability_family(120):
+                logger.info(
+                    "SM12x DSpark CUDA-graph dummy: tokens=%d reqs=%d q_len=%d",
+                    num_tokens,
+                    num_reqs,
+                    num_tokens // num_reqs if num_reqs else 0,
+                )
             num_tokens_across_dp = (
                 torch.full((self.dp_size,), num_tokens, dtype=torch.int32, device="cpu")
                 if self.dp_size > 1

@@ -13,6 +13,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.utils.sm12x import sm12x_align_decode_q_len
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -130,11 +131,22 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             cudagraph_mode = CUDAGraphMode.NONE
 
+        # DSpark sample_from_anchor uses q_len=5. Indexer next_n is k+1=6;
+        # a 5×5=25-token capture dummy IMA'd on SM12x before FlashInfer
+        # could pad. Capture at the decode-aligned width (5→6).
+        capture_query_len = sm12x_align_decode_q_len(self.num_query_per_req)
+        if capture_query_len != self.num_query_per_req:
+            logger.info(
+                "SM12x %s capture: decode_query_len %d -> %d",
+                self._speculator_name,
+                self.num_query_per_req,
+                capture_query_len,
+            )
         self.query_cudagraph_manager = DFlashCudaGraphManager(
             self.vllm_config,
             self.device,
             cudagraph_mode,
-            decode_query_len=self.num_query_per_req,
+            decode_query_len=capture_query_len,
         )
 
     def capture(self) -> None:

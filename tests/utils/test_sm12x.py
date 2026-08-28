@@ -75,6 +75,48 @@ def test_sm12x_align_decode_q_len_snaps_to_safe_widths(monkeypatch):
     assert sm12x_disable_attn_aux_streams() is True
 
 
+def _dspark_full_decode_capture_sizes(
+    decode_query_len: int,
+    capture_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 24, 32, 36),
+    max_num_reqs: int = 6,
+) -> list[int]:
+    """Mirror CudaGraphManager FULL_DECODE_ONLY rounding (largest first)."""
+    max_decode = max_num_reqs * decode_query_len
+    max_cg = max(capture_sizes)
+    sizes: list[int] = []
+    for num_tokens in capture_sizes:
+        rounded = (
+            (num_tokens + decode_query_len - 1) // decode_query_len
+        ) * decode_query_len
+        reqs = rounded // decode_query_len
+        if rounded > max_decode or rounded > max_cg or reqs > max_num_reqs:
+            continue
+        if rounded not in sizes:
+            sizes.append(rounded)
+    sizes.sort(reverse=True)
+    return sizes
+
+
+def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
+    """DSpark sample_from_anchor is q_len=5; capture must use aligned 6.
+
+    q_len=5 first graph is 25=5×5 (16:26 IMA before FlashInfer pad).
+    q_len=6 first graph is 36=6×6 (main capture already green).
+    """
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert sm12x_align_decode_q_len(5) == 6
+    assert _dspark_full_decode_capture_sizes(5) == [25, 20, 10, 5]
+    aligned = sm12x_align_decode_q_len(5)
+    assert _dspark_full_decode_capture_sizes(aligned) == [36, 24, 18, 12, 6]
+    assert 25 not in _dspark_full_decode_capture_sizes(aligned)
+
+
 def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
     from vllm.utils import sm12x as sm12x_utils
 
