@@ -223,9 +223,8 @@ def test_sm12x_dspark_capture_dummy_splits_as_all_decodes(monkeypatch):
         treat_short_extends_as_decodes=sm12x_treat_short_extends_as_decodes(),
     ) == (6, 0, 36, 0)
     cam_missing = SimpleNamespace(**{**cam.__dict__, "is_prefilling": None})
-    with pytest.raises(AssertionError):
-        split_decodes_and_prefills(
-            cam_missing,
-            decode_threshold=6,
-            treat_short_extends_as_decodes=False,
-        )
+    assert split_decodes_and_prefills(
+        cam_missing,
+        decode_threshold=6,
+        treat_short_extends_as_decodes=False,
+    ) == (6, 0, 36, 0)
