@@ -13,6 +13,8 @@ from vllm.utils.sm12x import (
     reject_sm12x_unsafe_decode_query,
     sm12x_align_decode_q_len,
     sm12x_align_prefill_q_len,
+    sm12x_extend_prefill_slots,
+    sm12x_pad_prefill_token_rows,
     sm12x_align_tokens,
     sm12x_disable_attn_aux_streams,
     sm12x_dspark_capture_sizes,
@@ -74,6 +76,22 @@ def test_sm12x_align_decode_q_len_snaps_to_safe_widths(monkeypatch):
     assert sm12x_mixed_warmup_prefill_len(2) == 2
     assert sm12x_treat_short_extends_as_decodes() is False
     assert sm12x_disable_attn_aux_streams() is True
+
+
+def test_sm12x_extend_prefill_slots_stays_in_block():
+    slots = torch.tensor([10, 11], dtype=torch.int64)
+    ext = sm12x_extend_prefill_slots(slots, 6, block_size=256)
+    assert torch.equal(ext, torch.tensor([10, 11, 12, 13, 14, 15], dtype=torch.int64))
+    edge = torch.tensor([254, 255], dtype=torch.int64)
+    reused = sm12x_extend_prefill_slots(edge, 6, block_size=256)
+    assert torch.equal(
+        reused, torch.tensor([254, 255, 255, 255, 255, 255], dtype=torch.int64)
+    )
+    rows = torch.arange(2 * 3, dtype=torch.int32).view(2, 3)
+    padded = sm12x_pad_prefill_token_rows(rows, 6)
+    assert padded.shape == (6, 3)
+    assert torch.equal(padded[:2], rows)
+    assert torch.equal(padded[2:], rows[-1:].expand(4, -1))
 
 
 def _dspark_full_decode_capture_sizes(

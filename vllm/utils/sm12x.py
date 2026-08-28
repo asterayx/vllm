@@ -159,6 +159,43 @@ def sm12x_align_prefill_q_len(q_len: int) -> int:
     return q_len
 
 
+def sm12x_extend_prefill_slots(
+    slot_mapping: torch.Tensor, target: int, block_size: int
+) -> torch.Tensor:
+    """Grow first-prefill slots to the decode-form pad width.
+
+    Spark 17:58: pad q_len=2 -> [1, 6] then IMA. The decode kernel
+    indexes ``q_len`` KV rows, but insert only wrote 2. Extra slots stay
+    in the same block; if that would cross a block, reuse the last slot.
+    """
+    n = slot_mapping.shape[0]
+    if n <= 0 or n >= target or block_size <= 0:
+        return slot_mapping
+    extra = target - n
+    base = slot_mapping[0]
+    ext = base + torch.arange(
+        n, target, device=slot_mapping.device, dtype=slot_mapping.dtype
+    )
+    same_block = (ext // block_size) == (base // block_size)
+    if bool(torch.all(same_block)):
+        return torch.cat((slot_mapping, ext), dim=0)
+    return torch.cat(
+        (slot_mapping, slot_mapping[-1:].expand(extra)),
+        dim=0,
+    )
+
+
+def sm12x_pad_prefill_token_rows(
+    t: torch.Tensor, target: int
+) -> torch.Tensor:
+    """Repeat the last real row so KV insert matches a [1, 6] launch."""
+    n = t.shape[0]
+    if n <= 0 or n >= target:
+        return t
+    extra = target - n
+    return torch.cat((t, t[-1:].expand(extra, *t.shape[1:])), dim=0)
+
+
 def pad_token_rows(t: torch.Tensor, target: int) -> torch.Tensor:
     """Pad ``t`` along dim 0 with zeros up to ``target`` rows."""
     n = t.shape[0]

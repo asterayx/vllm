@@ -682,8 +682,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         )
         if current_platform.is_device_capability_family(120):
             logger.info_once(
-                "SM12x FlashInfer: per-request q_len 2/3/4 pad to 6 "
-                "(never [1, 4])"
+                "SM12x FlashInfer: prefill 2/4/5 and decode 2/3/5 pad "
+                "to [1, 6]; decode dummy q_len=4 stays [1, 4]"
             )
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
         # Per-tensor FP8 cache path scales.

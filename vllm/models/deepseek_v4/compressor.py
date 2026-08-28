@@ -22,6 +22,11 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
 from vllm.platforms import current_platform
+from vllm.utils.sm12x import (
+    sm12x_align_prefill_q_len,
+    sm12x_extend_prefill_slots,
+    sm12x_pad_prefill_token_rows,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -336,6 +341,26 @@ class DeepseekCompressor(nn.Module):
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
+        # Match FlashInfer [1, 6] first-prefill so C4A writes a compressed
+        # page (2 tokens / ratio 4 writes none; 6 / 4 writes one).
+        if (
+            num_actual in (2, 4, 5)
+            and kv.shape[0] == num_actual
+            and positions.shape[0] == num_actual
+        ):
+            launch_len = sm12x_align_prefill_q_len(num_actual)
+            if launch_len != num_actual:
+                slot_mapping = sm12x_extend_prefill_slots(
+                    slot_mapping, launch_len, block_size
+                )
+                kv = sm12x_pad_prefill_token_rows(kv, launch_len)
+                score = sm12x_pad_prefill_token_rows(score, launch_len)
+                positions = sm12x_pad_prefill_token_rows(positions, launch_len)
+                if token_to_req_indices is not None:
+                    token_to_req_indices = sm12x_pad_prefill_token_rows(
+                        token_to_req_indices, launch_len
+                    )
+                num_actual = launch_len
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache
