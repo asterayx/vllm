@@ -248,7 +248,15 @@ def test_batch_token_span_repeats_last_real_row():
     assert torch.equal(sentinels[0, 2:], torch.full((2, 2), -1, dtype=torch.int32))
 
 
-def _launch_per_request(monkeypatch, q_len: int, **kwargs) -> list[dict]:
+def _launch_per_request(
+    monkeypatch,
+    q_len: int,
+    *,
+    extra_cache: torch.Tensor | None = None,
+    extra_sparse_indices: torch.Tensor | None = None,
+    extra_sparse_lengths: torch.Tensor | None = None,
+    **kwargs,
+) -> list[dict]:
     from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
 
     launches: list[dict] = []
@@ -273,11 +281,11 @@ def _launch_per_request(monkeypatch, q_len: int, **kwargs) -> list[dict]:
         q,
         output,
         torch.zeros(1),
-        None,
+        extra_cache,
         swa_indices,
         swa_lens,
-        None,
-        None,
+        extra_sparse_indices,
+        extra_sparse_lengths,
         0,
         q_len,
         **kwargs,
@@ -459,8 +467,65 @@ def test_forward_prefill_q_len_2_is_one_padded_launch(monkeypatch):
     assert shapes[0] != torch.Size([65, 8, 512])
 
 
+def test_launch_per_request_prefill_pad_drops_c4a(monkeypatch):
+    """22:57 IMA: padded C4A extra_sparse into a live extra cache."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    extra_cache = torch.zeros(1)
+    extra_idx = torch.arange(16, dtype=torch.int32).view(2, 8)
+    extra_len = torch.ones(2, dtype=torch.int32)
+    launches = _launch_per_request(
+        monkeypatch,
+        2,
+        extra_cache=extra_cache,
+        extra_sparse_indices=extra_idx,
+        extra_sparse_lengths=extra_len,
+        is_prefill=True,
+    )
+    assert [launch["query"].shape for launch in launches] == [
+        torch.Size([1, 6, 8, 512])
+    ]
+    assert launches[0]["compressed_kv_cache"] is None
+    assert launches[0]["extra_sparse_indices"] is None
+    assert launches[0]["extra_sparse_topk_lens"] is None
+    assert launches[0]["query"].shape[1] != 4
+
+
+def test_launch_per_request_decode_pad_keeps_c4a(monkeypatch):
+    """DSpark decode 5→6 captured with C4A attached; do not drop it."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    extra_cache = torch.zeros(1)
+    extra_idx = torch.arange(40, dtype=torch.int32).view(5, 8)
+    extra_len = torch.ones(5, dtype=torch.int32)
+    launches = _launch_per_request(
+        monkeypatch,
+        5,
+        extra_cache=extra_cache,
+        extra_sparse_indices=extra_idx,
+        extra_sparse_lengths=extra_len,
+    )
+    assert [launch["query"].shape for launch in launches] == [
+        torch.Size([1, 6, 8, 512])
+    ]
+    assert launches[0]["compressed_kv_cache"] is extra_cache
+    assert launches[0]["extra_sparse_indices"] is not None
+    assert launches[0]["extra_sparse_indices"].shape == torch.Size([1, 6, 8])
+    assert launches[0]["extra_sparse_topk_lens"].shape == torch.Size([1, 6])
+
+
 def test_forward_prefill_c4a_q_len_2_is_one_padded_launch(monkeypatch):
-    """Spark mixed-warmup seed is C4A; still one [1, 6], never [1, 4]."""
+    """Spark mixed-warmup seed is C4A; still one SWA-only [1, 6]."""
     from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
     from vllm.utils import sm12x as sm12x_utils
 
@@ -475,12 +540,13 @@ def test_forward_prefill_c4a_q_len_2_is_one_padded_launch(monkeypatch):
         lambda fam: fam == 120,
     )
     shapes: list[torch.Size] = []
-    extra_shapes: list[torch.Size] = []
+    extras: list[torch.Tensor | None] = []
+    caches: list[torch.Tensor | None] = []
 
     def _fake_launch(**launch_kwargs):
         shapes.append(launch_kwargs["query"].shape)
-        extra = launch_kwargs["extra_sparse_indices"]
-        extra_shapes.append(extra.shape)
+        extras.append(launch_kwargs["extra_sparse_indices"])
+        caches.append(launch_kwargs["compressed_kv_cache"])
 
     monkeypatch.setattr(
         fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
@@ -532,5 +598,7 @@ def test_forward_prefill_c4a_q_len_2_is_one_padded_launch(monkeypatch):
         dummy, q, torch.zeros(1), torch.zeros(1), output, attn, swa
     )
     assert shapes == [torch.Size([1, 6, 8, 512])]
-    assert extra_shapes == [torch.Size([1, 6, 8])]
+    assert extras == [None]
+    assert caches == [None]
     assert shapes[0][1] != 4
+    assert shapes[0] != torch.Size([65, 8, 512])

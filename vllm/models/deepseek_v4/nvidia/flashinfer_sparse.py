@@ -835,12 +835,32 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         real token (valid KV indices). Decode dummies keep ``q_len=4``
         as ``[1, 4]``. Prefill ``2``/``4`` and decode ``2``/``5`` pad
         to 6; never snap ``2``/``3`` to 4.
+
+        A padded first-prefill still has only ``q_len`` real indexer
+        rows. Repeating those C4A extra-sparse slots into a live extra
+        cache IMA'd on Spark (22:57, reported at MoE all_reduce). Drop
+        C4A for that launch and keep the SWA ``[1, 6]`` pad. Decode
+        pads such as DSpark ``5→6`` keep C4A — those captured clean.
         """
         q_len = token_end - token_start
         align = (
             sm12x_align_prefill_q_len if is_prefill else sm12x_align_decode_q_len
         )
         launch_len = align(q_len)
+        # Spark 22:57: insert filled 6 SWA slots and FlashInfer launched
+        # [1, 6], then IMA'd on the C4A extra path (2-token topk padded
+        # by repeating the last row). SWA-only for padded prefills.
+        if is_prefill and launch_len != q_len:
+            extra_cache = None
+            extra_sparse_indices = None
+            extra_sparse_lengths = None
+            log = logger.info if q_len == 2 else logger.info_once
+            log(
+                "SM12x FlashInfer: padded prefill launch is SWA-only "
+                "(drop C4A extra cache) q_len=%d -> %d",
+                q_len,
+                launch_len,
+            )
         query = _batch_token_span(q, token_start, token_end, launch_len)
         reject_sm12x_unsafe_decode_query(query)
         if launch_len != q_len:
