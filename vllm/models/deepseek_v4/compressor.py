@@ -16,6 +16,7 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
     compress_norm_rope_store_two_stage_triton,
 )
+from vllm.models.deepseek_v4.common.cutedsl import use_dsv4_cutedsl
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
@@ -197,8 +198,9 @@ class DeepseekCompressor(nn.Module):
     prologue (kv/score split, save_partial_states launch). The
     compress → norm → RoPE → store step is dispatched to a triton kernel
     (``compress_norm_rope_store_triton``) by default, except for the NVIDIA
-    head_dim=128 indexer path which uses the cutedsl kernel
-    (``compress_norm_rope_store_cutedsl``) for better performance.
+    head_dim=512 path which uses CuteDSL
+    (``compress_norm_rope_store_cutedsl``) when ``use_dsv4_cutedsl()``
+    is true. SM12x stays on Triton (cute-to-nvvm ``enable-pyir`` ICE).
     """
 
     def __init__(
@@ -396,17 +398,17 @@ class DeepseekCompressor(nn.Module):
             else None
         )
 
-        # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
-        # does not, so the two callables have different signatures.
+        # CuteDSL (head=512) accepts the full-cache flags; Triton (indexer,
+        # AMD, SM12x) does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        if current_platform.is_cuda() and self.head_dim == 512 and use_dsv4_cutedsl():
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )
 
-            # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
-            # layout and the plain full-cache layout. The full-cache flags
-            # are consumed only here.
+            # head=512 on CUDA uses CuteDSL when the installed cutlass-dsl
+            # compiler matches the Python frontend (Hopper / SM10x).
+            # SM12x cannot JIT cute-to-nvvm (enable-pyir ICE).
             compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
             extra_kwargs: dict[str, Any] = dict(
                 store_full_kv=store_full_kv,
@@ -423,7 +425,7 @@ class DeepseekCompressor(nn.Module):
                 "compress_scratch": self._compress_scratch,
             }
         else:
-            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
+            # Indexer (head=128), SM12x head=512, or non-CUDA (AMD, XPU).
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
 

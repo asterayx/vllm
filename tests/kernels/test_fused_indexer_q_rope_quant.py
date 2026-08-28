@@ -23,6 +23,7 @@ from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
+from vllm.models.deepseek_v4.common.cutedsl import use_dsv4_cutedsl
 from vllm.models.deepseek_v4.common.ops import fused_indexer_q_rope_quant
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
@@ -150,6 +151,8 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
 ):
     if use_cutedsl and not has_cutedsl():
         pytest.skip("cutedsl (cutlass) not installed")
+    if use_cutedsl and not use_dsv4_cutedsl():
+        pytest.skip("CuteDSL DSv4 kernels are disabled on SM12x")
 
     device = "cuda"
     torch.manual_seed(0)
@@ -167,10 +170,10 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
         positions, q, cos_sin_cache, weights, softmax_scale, head_scale, use_fp4
     )
     # use_cutedsl=False: force the triton path even when cutedsl is installed
-    # by patching the dispatcher's has_cutedsl() binding to return False.
+    # by patching the dispatcher's use_dsv4_cutedsl() binding to return False.
     cutedsl_patch = (
         mock.patch(
-            "vllm.models.deepseek_v4.common.ops.fused_indexer_q.has_cutedsl",
+            "vllm.models.deepseek_v4.common.ops.fused_indexer_q.use_dsv4_cutedsl",
             return_value=False,
         )
         if not use_cutedsl
