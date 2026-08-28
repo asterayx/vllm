@@ -31,6 +31,7 @@ from vllm.utils.b12x import (
     get_b12x_fused_moe,
     reuse_packed_weight_storage,
 )
+from vllm.utils.sm12x import sm12x_align_tokens, sm12x_pad_token_rows
 
 logger = init_logger(__name__)
 
@@ -637,7 +638,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         prepared = self._prepared()
         device = prepared.w1_fp4.device
         launch_tokens: dict[tuple[Any, ...], int] = {}
-        for tokens in sorted({int(count) for count in token_counts if int(count) > 0}):
+        for tokens in sorted(
+            {sm12x_align_tokens(int(count)) for count in token_counts if int(count) > 0}
+        ):
             execution_plan = _b12x_moe_execution_plan(
                 tokens=tokens,
                 topk=topk,
@@ -707,7 +710,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         del N, global_num_experts, local_num_experts, expert_tokens_meta
         plan = self._plan(
-            tokens=M,
+            tokens=sm12x_align_tokens(M),
             topk=topk,
             activation=activation,
             apply_router_weight_on_input=self._apply_router_weight_on_input,
@@ -747,14 +750,26 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         prepared = self._prepared()
         topk_ids = _normalize_topk_ids(topk_ids)
         topk_weights = _normalize_topk_weights(topk_weights)
+        hidden_states, orig_tokens = sm12x_pad_token_rows(
+            hidden_states, what="b12x MoE"
+        )
+        if hidden_states.shape[0] != orig_tokens:
+            topk_ids = sm12x_pad_token_rows(topk_ids)[0]
+            topk_weights = sm12x_pad_token_rows(topk_weights)[0]
+        plan_tokens = int(hidden_states.shape[0])
         plan = self._plan(
-            tokens=int(hidden_states.shape[0]),
+            tokens=plan_tokens,
             topk=int(topk_ids.shape[1]),
             activation=activation,
             apply_router_weight_on_input=bool(apply_router_weight_on_input),
         )
         scratch = _workspace_as_b12x_scratch(workspace2, plan)
 
+        kernel_out = (
+            output
+            if plan_tokens == orig_tokens
+            else output.new_empty((plan_tokens, output.shape[-1]))
+        )
         _run_b12x_moe_plan(
             plan=plan,
             scratch=scratch,
@@ -762,9 +777,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             prepared=prepared,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            output=output,
+            output=kernel_out,
             unit_scale_contract=self._quant_mode == "w4a16",
         )
+        if plan_tokens != orig_tokens:
+            output.copy_(kernel_out[:orig_tokens])
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         raise NotImplementedError("LoRA is not supported for B12xExperts")

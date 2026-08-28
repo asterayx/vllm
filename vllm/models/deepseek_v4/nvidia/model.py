@@ -89,6 +89,7 @@ from vllm.utils.flashinfer_moe_ep import (
     validate_fi_moe_ep_config,
 )
 from vllm.utils.math_utils import cdiv
+from vllm.utils.sm12x import sm12x_pad_token_rows
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -967,6 +968,11 @@ class DeepseekV4MoE(nn.Module):
             return self._forward_fused_moe(hidden_states, input_ids)
 
         org_shape = hidden_states.shape
+        hidden_states, orig_tokens = sm12x_pad_token_rows(
+            hidden_states.reshape(org_shape[0], -1), what="MoE"
+        )
+        if input_ids is not None and hidden_states.shape[0] != orig_tokens:
+            input_ids = sm12x_pad_token_rows(input_ids.reshape(-1))[0]
         router_logits, _ = self.gate(hidden_states)
         topk_weights, topk_ids = fused_topk_bias(
             hidden_states=hidden_states,
@@ -999,19 +1005,23 @@ class DeepseekV4MoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
             final_hidden_states += shared_output
 
-        return final_hidden_states.view(org_shape)
+        return final_hidden_states[:orig_tokens].view(org_shape)
 
     def _forward_fused_moe(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
+        hidden_states, orig_tokens = sm12x_pad_token_rows(
+            hidden_states.reshape(org_shape[0], -1), what="MoE"
+        )
+        if input_ids is not None and hidden_states.shape[0] != orig_tokens:
+            input_ids = sm12x_pad_token_rows(input_ids.reshape(-1))[0]
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             router_logits=hidden_states,
             input_ids=input_ids,
         )
-
-        return final_hidden_states.view(org_shape)
+        return final_hidden_states[:orig_tokens].view(org_shape)
 
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:
