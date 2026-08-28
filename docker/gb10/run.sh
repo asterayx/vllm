@@ -8,15 +8,19 @@ set -euo pipefail
 IMAGE="${VLLM_GB10_IMAGE:-vllm-gb10:dspark}"
 MODEL_HOST="${MODEL_HOST:-${HOME}/models/DeepSeek-V4-Flash-0731}"
 MODEL_PATH="${MODEL_PATH:-/models/DeepSeek-V4-Flash-0731}"
+VLLM_SRC="${VLLM_SRC:-$(cd "$(dirname "$0")/../.." && pwd)}"
 VLLM_CACHE="${VLLM_CACHE:-${HOME}/vllm-cache}"
 HF_CACHE="${HF_CACHE:-${HOME}/.cache/huggingface}"
+B12X_CACHE="${B12X_CACHE:-${HOME}/.cache/b12x}"
 MASTER_ADDR="${MASTER_ADDR:-192.168.100.10}"
 VLLM_HOST_IP="${VLLM_HOST_IP:-${MASTER_ADDR}}"
 NODE_RANK="${NODE_RANK:-0}"
 HEADLESS="${HEADLESS:-}"
 NAME="${NAME:-dspark-tp2-rank${NODE_RANK}}"
+LINEAR_BACKEND="${LINEAR_BACKEND:-b12x}"
+MOE_BACKEND="${MOE_BACKEND:-b12x}"
 
-mkdir -p "${VLLM_CACHE}" "${HF_CACHE}/flashinfer"
+mkdir -p "${VLLM_CACHE}" "${HF_CACHE}/flashinfer" "${B12X_CACHE}"
 docker rm -f "${NAME}" 2>/dev/null || true
 
 # 6 seqs * (1 + DSpark k=5) = 36; include 36 so capture is not truncated to 32.
@@ -29,9 +33,11 @@ docker run -d --name "${NAME}" \
   -v /dev/infiniband:/dev/infiniband \
   -v /sys/class/infiniband:/sys/class/infiniband \
   -v "${MODEL_HOST}:${MODEL_PATH}:ro" \
+  -v "${VLLM_SRC}:/opt/vllm" \
   -v "${VLLM_CACHE}:/root/.cache/vllm" \
   -v "${HF_CACHE}:/root/.cache/huggingface" \
   -v "${HF_CACHE}/flashinfer:/root/.cache/flashinfer" \
+  -v "${B12X_CACHE}:/root/.cache/b12x" \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
   -e PYTHONPATH=/opt/vllm \
@@ -41,6 +47,8 @@ docker run -d --name "${NAME}" \
   -e TORCH_CUDA_ARCH_LIST=12.1a \
   -e FLASHINFER_CUDA_ARCH_LIST=12.1a \
   -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
+  -e B12X_CUTE_COMPILE_CACHE_DIR=/root/.cache/b12x/cute_compile \
+  -e B12X_PRINT_COMPILE_PROGRESS="${B12X_PRINT_COMPILE_PROGRESS:-1}" \
   -e NCCL_NET=IB \
   -e NCCL_IB_DISABLE=0 \
   -e NCCL_IB_MERGE_NICS=1 \
@@ -85,6 +93,8 @@ docker run -d --name "${NAME}" \
   --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' \
   --enable-prefix-caching --async-scheduling --enable-chunked-prefill \
   --enable-flashinfer-autotune \
+  --linear-backend "${LINEAR_BACKEND}" \
+  --moe-backend "${MOE_BACKEND}" \
   --compilation-config "${CUGRAPH_CFG}" \
   ${HEADLESS}
 

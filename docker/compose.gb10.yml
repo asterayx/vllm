@@ -3,6 +3,7 @@
 #   docker compose --env-file docker/gb10.worker.env -f docker/compose.gb10.yml up -d
 #   docker compose --env-file docker/gb10.head.env   -f docker/compose.gb10.yml up -d
 # Or raw docker run: NODE_RANK=0 ./docker/gb10/run.sh
+# Official b12x extra (--linear-backend b12x --moe-backend b12x), not flashinfer_b12x.
 
 name: vllm-gb10-dspark
 
@@ -27,6 +28,8 @@ services:
       - ${VLLM_CACHE:?set VLLM_CACHE}:/root/.cache/vllm
       - ${HF_CACHE:?set HF_CACHE}:/root/.cache/huggingface
       - ${HF_CACHE}/flashinfer:/root/.cache/flashinfer
+      - ${B12X_CACHE:-${HOME}/.cache/b12x}:/root/.cache/b12x
+      - ${VLLM_SRC:-/home/roccen/src/vllm}:/opt/vllm
     environment:
       HF_HOME: /root/.cache/huggingface
       HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
@@ -38,6 +41,8 @@ services:
       TORCH_CUDA_ARCH_LIST: "12.1a"
       FLASHINFER_CUDA_ARCH_LIST: "12.1a"
       FLASHINFER_DISABLE_VERSION_CHECK: "1"
+      B12X_CUTE_COMPILE_CACHE_DIR: /root/.cache/b12x/cute_compile
+      B12X_PRINT_COMPILE_PROGRESS: ${B12X_PRINT_COMPILE_PROGRESS:-1}
       NCCL_NET: ${NCCL_NET:-IB}
       NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-0}
       NCCL_IB_MERGE_NICS: ${NCCL_IB_MERGE_NICS:-1}
@@ -86,6 +91,8 @@ services:
         --async-scheduling
         --enable-chunked-prefill
         --enable-flashinfer-autotune
+        --linear-backend ${LINEAR_BACKEND:-b12x}
+        --moe-backend ${MOE_BACKEND:-b12x}
         --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,4,8,16,24,32,36]}'
         --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
         --host 0.0.0.0

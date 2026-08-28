@@ -4,9 +4,13 @@
 # Host ibverbs/mlx5 is collected by pack-venv.sh into the image.
 # To inject IB into an already-packed image without recopying the venv:
 #   ./docker/gb10/pack-ibverbs.sh
+# To inject official b12x==1.2.6 without recopying the venv:
+#   ./docker/gb10/pack-b12x.sh
 #
 # Optional FlashInfer 0814 overlay (wheel only):
 #   INSTALL_FLASHINFER_NIGHTLY=1 ./docker/gb10/pack-venv.sh
+# Optional official b12x extra (stock --moe-backend b12x, not flashinfer_b12x):
+#   INSTALL_B12X=1 ./docker/gb10/pack-venv.sh
 
 ARG CUDA_VERSION=13.0.1
 ARG UBUNTU_VERSION=24.04
@@ -48,6 +52,7 @@ RUN chmod +x /tmp/install-ibverbs.sh \
 COPY venv /opt/venv
 COPY src /opt/vllm
 COPY relocate-venv.sh /tmp/relocate-venv.sh
+COPY install-b12x.sh /tmp/install-b12x.sh
 
 ARG OLD_VENV
 ARG OLD_SRC
@@ -63,6 +68,13 @@ RUN if [ "${INSTALL_FLASHINFER_NIGHTLY}" = "1" ]; then \
       && /root/.local/bin/uv pip uninstall --python /opt/venv/bin/python \
            flashinfer-jit-cache || true; \
     fi
+
+ARG INSTALL_B12X=0
+RUN if [ "${INSTALL_B12X}" = "1" ]; then \
+      chmod +x /tmp/install-b12x.sh \
+      && /tmp/install-b12x.sh /opt/venv/bin/python; \
+    fi \
+    && rm -f /tmp/install-b12x.sh
 
 WORKDIR /opt/vllm
 ENTRYPOINT ["/opt/vllm/docker/gb10/entrypoint.sh"]
