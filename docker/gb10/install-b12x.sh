@@ -45,6 +45,11 @@ uv pip install --python "${PYTHON}" --no-cache \
   -c "${CONSTRAINT}" \
   "b12x==${B12X_VERSION}"
 
+# b12x 1.2.6 has no __version__ (lazy __getattr__). Use package metadata.
 # has_b12x() is computed at import time; verify in a fresh interpreter.
-"${PYTHON}" -c 'import b12x; print("b12x", b12x.__version__)'
+"${PYTHON}" -c '
+import importlib.metadata
+import b12x  # noqa: F401
+print("b12x", importlib.metadata.version("b12x"))
+'
 "${PYTHON}" -c 'from vllm.utils.b12x import has_b12x; assert has_b12x(), "has_b12x is False"'

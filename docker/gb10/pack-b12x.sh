@@ -47,5 +47,7 @@ docker build \
   --build-arg BASE="${IMAGE}" \
   -t "${IMAGE}" \
   "${STAGE}"
-echo "Re-tagged ${IMAGE} with b12x. Sync to the worker, then launch with"
+echo "Re-tagged ${IMAGE} with b12x. Official b12x==1.2.6 pins"
+echo "nvidia-cutlass-dsl==4.6.2 (may replace a packed 4.7.0)."
+echo "Sync to the worker, then launch with"
 echo "  --linear-backend b12x --moe-backend b12x"
