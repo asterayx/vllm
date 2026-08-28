@@ -21,7 +21,9 @@ from vllm.utils.sm12x import (
     sm12x_mixed_warmup_decode_prompt_len,
     sm12x_mixed_warmup_prefill_len,
     sm12x_pad_token_rows,
+    sm12x_should_fill_compressed_prefill_slots,
     sm12x_should_fill_prefill_slots,
+    sm12x_skip_padded_prefill_c4a,
     sm12x_treat_short_extends_as_decodes,
 )
 
@@ -112,6 +114,30 @@ def test_sm12x_fill_slots_skips_capture_and_decode_dummies(monkeypatch):
     monkeypatch.setattr(sm12x_utils, "sm12x_is_capturing", lambda: True)
     assert sm12x_should_fill_prefill_slots(2, 0) is False
     assert sm12x_should_fill_prefill_slots(4, 0) is False
+
+
+def test_sm12x_does_not_fill_compressed_prefill_slots(monkeypatch):
+    """23:42: 6-token C4A write IMA'd after SWA-only [1, 6]."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    monkeypatch.setattr(sm12x_utils, "sm12x_is_capturing", lambda: False)
+    assert sm12x_should_fill_compressed_prefill_slots(2, 0) is False
+    assert sm12x_should_fill_compressed_prefill_slots(4, 0) is False
+    assert sm12x_skip_padded_prefill_c4a([2]) is True
+    assert sm12x_skip_padded_prefill_c4a([2, 4]) is True
+    assert sm12x_skip_padded_prefill_c4a([16]) is False
+    assert sm12x_skip_padded_prefill_c4a([2, 16]) is False
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
+    assert sm12x_skip_padded_prefill_c4a([2]) is False
 
 
 def _dspark_full_decode_capture_sizes(

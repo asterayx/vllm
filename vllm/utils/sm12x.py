@@ -168,11 +168,12 @@ def sm12x_is_capturing() -> bool:
 def sm12x_should_fill_prefill_slots(
     num_tokens: int, num_decode_tokens: int | None = 0
 ) -> bool:
-    """Whether to write extra first-prefill KV/C4A slots for a [1, 6] pad.
+    """Whether to write extra first-prefill SWA KV slots for a [1, 6] pad.
 
     Eager all-prefill only. Spark 18:13: compressor ran this on a
     tokens=4 decode dummy during PIECEWISE capture; ``bool(torch.all)``
-    then host-synced and aborted the graph.
+    then host-synced and aborted the graph. C4A writes stay at the
+    real token count — see ``sm12x_should_fill_compressed_prefill_slots``.
     """
     if num_tokens not in (2, 4, 5):
         return False
@@ -181,6 +182,30 @@ def sm12x_should_fill_prefill_slots(
     if sm12x_align_prefill_q_len(num_tokens) == num_tokens:
         return False
     return not sm12x_is_capturing()
+
+
+def sm12x_should_fill_compressed_prefill_slots(
+    num_tokens: int, num_decode_tokens: int | None = 0
+) -> bool:
+    """Do not pad C4A writes to the SWA [1, 6] width.
+
+    Spark 17:03 / 23:42: a 6-token C4A Triton write, then unused
+    ``compute_global_topk`` on a 2-token indexer, IMA'd after the
+    FlashInfer launch already dropped extra cache. Keep SWA insert.
+    """
+    return False
+
+
+def sm12x_skip_padded_prefill_c4a(query_lens: list[int]) -> bool:
+    """True when every prefill span will launch SWA-only [1, 6]."""
+    if not query_lens or not current_platform.is_device_capability_family(120):
+        return False
+    for q_len in query_lens:
+        if q_len <= 0:
+            continue
+        if q_len > 64 or sm12x_align_prefill_q_len(q_len) == q_len:
+            return False
+    return True
 
 
 def sm12x_extend_prefill_slots(

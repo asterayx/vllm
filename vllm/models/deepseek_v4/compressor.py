@@ -22,13 +22,7 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
 from vllm.platforms import current_platform
-from vllm.utils.sm12x import (
-    sm12x_align_prefill_q_len,
-    sm12x_extend_prefill_slots,
-    sm12x_pad_prefill_token_rows,
-    sm12x_should_fill_prefill_slots,
-    sm12x_treat_short_extends_as_decodes,
-)
+from vllm.utils.sm12x import sm12x_treat_short_extends_as_decodes
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -347,29 +341,9 @@ class DeepseekCompressor(nn.Module):
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
-        # Match FlashInfer [1, 6] first-prefill so C4A writes a compressed
-        # page (2 tokens / ratio 4 writes none; 6 / 4 writes one).
-        # Skip CUDA-graph dummies (Spark 18:13 host-synced mid-capture).
-        if (
-            sm12x_should_fill_prefill_slots(
-                num_actual, state_metadata.num_decode_tokens
-            )
-            and kv.shape[0] == num_actual
-            and positions.shape[0] == num_actual
-        ):
-            launch_len = sm12x_align_prefill_q_len(num_actual)
-            if launch_len != num_actual:
-                slot_mapping = sm12x_extend_prefill_slots(
-                    slot_mapping, launch_len, block_size
-                )
-                kv = sm12x_pad_prefill_token_rows(kv, launch_len)
-                score = sm12x_pad_prefill_token_rows(score, launch_len)
-                positions = sm12x_pad_prefill_token_rows(positions, launch_len)
-                if token_to_req_indices is not None:
-                    token_to_req_indices = sm12x_pad_prefill_token_rows(
-                        token_to_req_indices, launch_len
-                    )
-                num_actual = launch_len
+        # Spark 23:42: do not pad C4A writes to 6. FlashInfer already
+        # launches padded first-prefills SWA-only; a 6-token C4A Triton
+        # write IMA'd (reported at compute_global_topk).
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache

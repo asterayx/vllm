@@ -525,7 +525,7 @@ def test_launch_per_request_decode_pad_keeps_c4a(monkeypatch):
 
 
 def test_forward_prefill_c4a_q_len_2_is_one_padded_launch(monkeypatch):
-    """Spark mixed-warmup seed is C4A; still one SWA-only [1, 6]."""
+    """Spark mixed-warmup seed is C4A; SWA-only [1, 6], no topk kernel."""
     from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
     from vllm.utils import sm12x as sm12x_utils
 
@@ -542,11 +542,19 @@ def test_forward_prefill_c4a_q_len_2_is_one_padded_launch(monkeypatch):
     shapes: list[torch.Size] = []
     extras: list[torch.Tensor | None] = []
     caches: list[torch.Tensor | None] = []
+    topk_calls = {"n": 0}
 
     def _fake_launch(**launch_kwargs):
         shapes.append(launch_kwargs["query"].shape)
         extras.append(launch_kwargs["extra_sparse_indices"])
         caches.append(launch_kwargs["compressed_kv_cache"])
+
+    def _fake_topk(*args, **kwargs):
+        topk_calls["n"] += 1
+        return (
+            torch.zeros(2, 8, dtype=torch.int32),
+            torch.ones(2, dtype=torch.int32),
+        )
 
     monkeypatch.setattr(
         fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
@@ -554,10 +562,7 @@ def test_forward_prefill_c4a_q_len_2_is_one_padded_launch(monkeypatch):
     monkeypatch.setattr(
         fi_sparse,
         "compute_global_topk_indices_and_lens",
-        lambda *args, **kwargs: (
-            torch.zeros(2, 8, dtype=torch.int32),
-            torch.ones(2, dtype=torch.int32),
-        ),
+        _fake_topk,
     )
     dummy = SimpleNamespace(
         compress_ratio=4,
@@ -600,5 +605,6 @@ def test_forward_prefill_c4a_q_len_2_is_one_padded_launch(monkeypatch):
     assert shapes == [torch.Size([1, 6, 8, 512])]
     assert extras == [None]
     assert caches == [None]
+    assert topk_calls["n"] == 0
     assert shapes[0][1] != 4
     assert shapes[0] != torch.Size([65, 8, 512])

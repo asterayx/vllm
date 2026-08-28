@@ -31,6 +31,7 @@ from vllm.utils.sm12x import (
     reject_sm12x_unsafe_decode_query,
     sm12x_align_decode_q_len,
     sm12x_align_prefill_q_len,
+    sm12x_skip_padded_prefill_c4a,
 )
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.compressor_utils import (
@@ -1051,9 +1052,23 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         query_start_loc_cpu = swa_metadata.query_start_loc_cpu
         assert query_start_loc_cpu is not None
         prefill_token_base = query_start_loc_cpu[num_decodes]
+        prefill_q_lens = [
+            int(
+                query_start_loc_cpu[num_decodes + i + 1]
+                - query_start_loc_cpu[num_decodes + i]
+            )
+            for i in range(num_prefills)
+        ]
+        skip_c4a = sm12x_skip_padded_prefill_c4a(prefill_q_lens)
+        if skip_c4a:
+            logger.info_once(
+                "SM12x FlashInfer: skip C4A metadata for padded prefill "
+                "q_lens=%s",
+                prefill_q_lens,
+            )
 
         local_topk_indices: torch.Tensor | None
-        if swa_only:
+        if swa_only or skip_c4a:
             local_topk_indices = None
         elif self.compress_ratio == 4:
             if self.topk_indices_buffer is None:
@@ -1096,7 +1111,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
         q = self._prepare_query(q, output)
         swa_kv_paged = self._as_sparse_cache(swa_k_cache)
-        if swa_only:
+        if swa_only or skip_c4a:
             extra_kv_paged = None
         else:
             if compressed_k_cache is None:
