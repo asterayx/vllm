@@ -12,6 +12,7 @@ from vllm.config.cache import CacheDType
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
+from vllm.utils.sm12x import sm12x_treat_short_extends_as_decodes
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -224,14 +225,16 @@ class DeepseekV4SparseMLAMetadataBuilder(
         req_id_per_token: torch.Tensor,
     ) -> dict[str, torch.Tensor | None]:
         """Pre-compute C128A topk indices for DeepseekV4 (compress_ratio >= 128)."""
-        # Must match SWA's decode split (no `require_uniform=True`) so
-        # `c128a_global_decode_topk_indices.shape[0]` lines up with q in
-        # `_forward_decode`. The per-token C128A kernel handles non-uniform
-        # query lengths.
+        # Must match SWA's decode split (no `require_uniform=True`, same
+        # treat_short_extends) so C128A topk lines up with FlashInfer.
+        # Default treat_short=True + DSpark threshold swallows a 2-token
+        # first prefill as all-decode; SWA keeps it as prefill and
+        # FlashInfer then asserts c128a_prefill_topk_indices is None.
         (num_decodes, _, num_decode_tokens, num_prefill_tokens) = (
             split_decodes_and_prefills(
                 cm,
                 decode_threshold=self.reorder_batch_threshold or 1,
+                treat_short_extends_as_decodes=sm12x_treat_short_extends_as_decodes(),
             )
         )
 

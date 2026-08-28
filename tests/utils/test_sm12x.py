@@ -228,3 +228,53 @@ def test_sm12x_dspark_capture_dummy_splits_as_all_decodes(monkeypatch):
         decode_threshold=6,
         treat_short_extends_as_decodes=False,
     ) == (6, 0, 36, 0)
+
+
+def test_sm12x_c128a_split_matches_swa_for_mixed_warmup(monkeypatch):
+    """C128A must use the same treat_short flag as SWA.
+
+    Default treat_short=True plus DSpark threshold (6 or 11) classifies
+    the 2-token seed and the mixed 1+2 step as all-decode. FlashInfer
+    follows SWA (prefill) and asserts c128a_prefill_topk_indices.
+    """
+    from vllm.models.deepseek_v4.sparse_mla import (
+        DeepseekV4SparseMLAMetadataBuilder,
+    )
+    from vllm.utils import sm12x as sm12x_utils
+    from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+
+    def _split(cam, threshold=6):
+        # Same kwargs as DeepseekV4SparseMLAMetadataBuilder._build_c128a_metadata.
+        return split_decodes_and_prefills(
+            cam,
+            decode_threshold=threshold,
+            treat_short_extends_as_decodes=sm12x_treat_short_extends_as_decodes(),
+        )
+
+    seed = SimpleNamespace(
+        max_query_len=2,
+        num_reqs=1,
+        num_actual_tokens=2,
+        query_start_loc_cpu=torch.tensor([0, 2]),
+        is_prefilling=torch.tensor([True]),
+    )
+    mixed = SimpleNamespace(
+        max_query_len=2,
+        num_reqs=2,
+        num_actual_tokens=3,
+        query_start_loc_cpu=torch.tensor([0, 1, 3]),
+        is_prefilling=torch.tensor([False, True]),
+    )
+    assert _split(seed) == (0, 1, 0, 2)
+    assert _split(mixed) == (1, 1, 1, 2)
+    assert _split(seed, threshold=11) == (0, 1, 0, 2)
+    assert split_decodes_and_prefills(seed, decode_threshold=6) == (1, 0, 2, 0)
+    assert split_decodes_and_prefills(mixed, decode_threshold=6) == (2, 0, 3, 0)
+    names = DeepseekV4SparseMLAMetadataBuilder._build_c128a_metadata.__code__.co_names
+    assert "sm12x_treat_short_extends_as_decodes" in names
