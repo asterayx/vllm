@@ -71,13 +71,16 @@ def test_sm120_dsv4_capability_checks_exact_dispatch_shape(monkeypatch) -> None:
     monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: True)
     monkeypatch.setattr(fi_utils, "_get_submodule", lambda _name: fake_module)
     fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
+    fi_utils.resolve_sm120_dsv4_topk.cache_clear()
 
     assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 128)
     assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 192)
     assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 256)
     assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(16, 192)
+    assert fi_utils.resolve_sm120_dsv4_topk(192, 32) == 192
 
     fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
+    fi_utils.resolve_sm120_dsv4_topk.cache_clear()
 
 
 def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
@@ -92,3 +95,24 @@ def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
 
     assert _required_sm120_sparse_topk(causal, 128) == 128
     assert _required_sm120_sparse_topk(dspark, 128) == 192
+
+
+def test_resolve_sm120_dsv4_topk_snaps_missing_dspark_width(monkeypatch) -> None:
+    """0.6.17 ships 128/512/1024, not DSpark's aligned width 192."""
+    fake_module = SimpleNamespace(
+        _DECODE_DSV4_DISPATCH=frozenset({(32, 128), (32, 512), (32, 1024)})
+    )
+    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: True)
+    monkeypatch.setattr(fi_utils, "_get_submodule", lambda _name: fake_module)
+    fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
+    fi_utils.resolve_sm120_dsv4_topk.cache_clear()
+
+    assert fi_utils.resolve_sm120_dsv4_topk(128, 32) == 128
+    assert fi_utils.resolve_sm120_dsv4_topk(192, 32) == 512
+    assert fi_utils.resolve_sm120_dsv4_topk(192, 20) == 512
+    assert fi_utils.resolve_sm120_dsv4_topk(2048, 32) is None
+    assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 192)
+    assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 512)
+
+    fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
+    fi_utils.resolve_sm120_dsv4_topk.cache_clear()

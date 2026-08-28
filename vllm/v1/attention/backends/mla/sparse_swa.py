@@ -6,6 +6,7 @@ from typing import ClassVar, cast
 import torch
 
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.warmup.jit_warmup import (
     VllmJitKernel,
@@ -14,6 +15,7 @@ from vllm.model_executor.warmup.jit_warmup import (
 from vllm.model_executor.warmup.jit_warmup_triton_helper import TritonWarmupTensor
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.flashinfer import resolve_sm120_dsv4_topk
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -33,6 +35,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     get_kv_quant_mode,
 )
+
+logger = init_logger(__name__)
 
 # DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
 # (topk, extra_topk, extra_page_block_size) config, so they cannot share a
@@ -484,6 +488,26 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             if self.is_dspark
             else 0
         )
+        # FlashInfer 0.6.x SM12x cubins skip some top_k widths (e.g. 192).
+        # Pad the decode index tensor so the kernel sees a supported config.
+        if (
+            self.noncausal_index_width > 0
+            and current_platform.is_device_capability_family(120)
+        ):
+            num_q_heads = self.vllm_config.model_config.get_num_attention_heads(
+                self.vllm_config.parallel_config
+            )
+            padded_width = resolve_sm120_dsv4_topk(
+                self.noncausal_index_width, num_q_heads
+            )
+            if padded_width is not None and padded_width != self.noncausal_index_width:
+                logger.info_once(
+                    "SM12x FlashInfer DSv4 decode: padding noncausal "
+                    "index width from %s to %s to match a compiled cubin.",
+                    self.noncausal_index_width,
+                    padded_width,
+                )
+                self.noncausal_index_width = padded_width
         self.decode_swa_indices_noncausal: torch.Tensor | None = None
         self._max_tokens = max_tokens
 
