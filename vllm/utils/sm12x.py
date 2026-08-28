@@ -27,6 +27,10 @@ SM12X_SAFE_MIN_TOKENS = 16
 SM12X_SAFE_DECODE_Q_LENS = (1, 4, 6, 8, 16, 24, 32, 36)
 SM12X_SAFE_PREFILL_DECODE_Q_LENS = (1, 6, 8, 16, 24, 32, 36)
 SM12X_UNSAFE_PER_REQUEST_Q_LENS = (2, 3)
+# DSpark FULL dummies after aligning q_len 5→6. 36=6×6 and 24=4×6
+# already went green in main capture. 6=1×6 MHC-pads to 16. Drop
+# 18=3×6 and 12=2×6 (main capture never ran those token counts).
+SM12X_DSPARK_SAFE_CAPTURE_TOKENS = (6, 24, 36)
 
 
 def sm12x_align_tokens(num_tokens: int, min_tokens: int = SM12X_SAFE_MIN_TOKENS) -> int:
@@ -62,6 +66,27 @@ def sm12x_mixed_warmup_prefill_len(requested_prefill: int) -> int:
     if current_platform.is_device_capability_family(120):
         return sm12x_mixed_warmup_decode_prompt_len()
     return requested_prefill
+
+
+def sm12x_dspark_capture_sizes(
+    capture_sizes: list[int] | None,
+    decode_query_len: int,
+) -> list[int]:
+    """Restrict SM12x DSpark FULL capture to proven token counts.
+
+    Off SM12x, or when no safe size is divisible by ``decode_query_len``,
+    return the original list.
+    """
+    sizes = list(capture_sizes or [])
+    if not sizes or not current_platform.is_device_capability_family(120):
+        return sizes
+    max_cg = max(sizes)
+    allow = [
+        n
+        for n in SM12X_DSPARK_SAFE_CAPTURE_TOKENS
+        if n <= max_cg and n % decode_query_len == 0
+    ]
+    return allow or sizes
 
 
 def sm12x_align_decode_q_len(q_len: int) -> int:

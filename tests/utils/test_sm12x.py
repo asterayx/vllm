@@ -15,6 +15,7 @@ from vllm.utils.sm12x import (
     sm12x_align_prefill_q_len,
     sm12x_align_tokens,
     sm12x_disable_attn_aux_streams,
+    sm12x_dspark_capture_sizes,
     sm12x_mixed_warmup_decode_prompt_len,
     sm12x_mixed_warmup_prefill_len,
     sm12x_pad_token_rows,
@@ -115,6 +116,11 @@ def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
     aligned = sm12x_align_decode_q_len(5)
     assert _dspark_full_decode_capture_sizes(aligned) == [36, 24, 18, 12, 6]
     assert 25 not in _dspark_full_decode_capture_sizes(aligned)
+    sizes = [1, 2, 4, 8, 16, 24, 32, 36]
+    assert sm12x_dspark_capture_sizes(sizes, aligned) == [6, 24, 36]
+    assert 18 not in sm12x_dspark_capture_sizes(sizes, aligned)
+    assert 12 not in sm12x_dspark_capture_sizes(sizes, aligned)
+    assert 25 not in sm12x_dspark_capture_sizes(sizes, aligned)
 
 
 def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
@@ -131,6 +137,8 @@ def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
     assert sm12x_align_prefill_q_len(2) == 2
     assert sm12x_treat_short_extends_as_decodes() is True
     assert sm12x_disable_attn_aux_streams() is False
+    sizes = [1, 2, 4, 8, 16, 24, 32, 36]
+    assert sm12x_dspark_capture_sizes(sizes, 6) == sizes
 
 
 def test_sm12x_pad_token_rows(monkeypatch):
