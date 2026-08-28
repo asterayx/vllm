@@ -26,6 +26,8 @@ from vllm.utils.sm12x import (
     sm12x_align_prefill_q_len,
     sm12x_extend_prefill_slots,
     sm12x_pad_prefill_token_rows,
+    sm12x_should_fill_prefill_slots,
+    sm12x_treat_short_extends_as_decodes,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -118,9 +120,13 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             self.token_to_req_indices
         )
         num_decode_tokens = None
-        if _prefer_two_stage_compressor():
+        if _prefer_two_stage_compressor() or (
+            current_platform.is_device_capability_family(120)
+        ):
             _, _, num_decode_tokens, _ = split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=1
+                common_attn_metadata,
+                decode_threshold=1,
+                treat_short_extends_as_decodes=sm12x_treat_short_extends_as_decodes(),
             )
         return CompressorMetadata(
             block_table=common_attn_metadata.block_table_tensor.clamp_(min=0),
@@ -343,8 +349,11 @@ class DeepseekCompressor(nn.Module):
         block_size = state_metadata.block_size
         # Match FlashInfer [1, 6] first-prefill so C4A writes a compressed
         # page (2 tokens / ratio 4 writes none; 6 / 4 writes one).
+        # Skip CUDA-graph dummies (Spark 18:13 host-synced mid-capture).
         if (
-            num_actual in (2, 4, 5)
+            sm12x_should_fill_prefill_slots(
+                num_actual, state_metadata.num_decode_tokens
+            )
             and kv.shape[0] == num_actual
             and positions.shape[0] == num_actual
         ):

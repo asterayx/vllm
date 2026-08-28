@@ -56,6 +56,7 @@ from vllm.utils.sm12x import (
     sm12x_align_prefill_q_len,
     sm12x_extend_prefill_slots,
     sm12x_pad_prefill_token_rows,
+    sm12x_should_fill_prefill_slots,
 )
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
@@ -636,11 +637,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         slot_mapping = swa_metadata.slot_mapping
         # Spark 17:58: first-prefill insert wrote 2 KV rows, then
         # FlashInfer launched [1, 6] and IMA'd. Fill the pad slots.
+        # Spark 18:13: do not host-sync this during CUDA-graph capture.
         if (
-            orig_tokens in (2, 4, 5)
-            and orig_tokens == slot_mapping.shape[0]
-            and swa_metadata.num_decodes == 0
+            orig_tokens == slot_mapping.shape[0]
             and swa_metadata.num_prefills > 0
+            and sm12x_should_fill_prefill_slots(
+                orig_tokens,
+                0 if swa_metadata.num_decodes == 0 else orig_tokens,
+            )
         ):
             launch_len = sm12x_align_prefill_q_len(orig_tokens)
             if launch_len != orig_tokens:

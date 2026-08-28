@@ -21,6 +21,7 @@ from vllm.utils.sm12x import (
     sm12x_mixed_warmup_decode_prompt_len,
     sm12x_mixed_warmup_prefill_len,
     sm12x_pad_token_rows,
+    sm12x_should_fill_prefill_slots,
     sm12x_treat_short_extends_as_decodes,
 )
 
@@ -92,6 +93,25 @@ def test_sm12x_extend_prefill_slots_stays_in_block():
     assert padded.shape == (6, 3)
     assert torch.equal(padded[:2], rows)
     assert torch.equal(padded[2:], rows[-1:].expand(4, -1))
+
+
+def test_sm12x_fill_slots_skips_capture_and_decode_dummies(monkeypatch):
+    """Spark 18:13: tokens=4 decode dummy must not fill during capture."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    monkeypatch.setattr(sm12x_utils, "sm12x_is_capturing", lambda: False)
+    assert sm12x_should_fill_prefill_slots(2, 0) is True
+    assert sm12x_should_fill_prefill_slots(4, 0) is True
+    assert sm12x_should_fill_prefill_slots(4, 4) is False
+    assert sm12x_should_fill_prefill_slots(16, 0) is False
+    monkeypatch.setattr(sm12x_utils, "sm12x_is_capturing", lambda: True)
+    assert sm12x_should_fill_prefill_slots(2, 0) is False
+    assert sm12x_should_fill_prefill_slots(4, 0) is False
 
 
 def _dspark_full_decode_capture_sizes(

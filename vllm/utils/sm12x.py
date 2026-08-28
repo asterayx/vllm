@@ -159,6 +159,30 @@ def sm12x_align_prefill_q_len(q_len: int) -> int:
     return q_len
 
 
+def sm12x_is_capturing() -> bool:
+    """Host query: current CUDA stream is capturing a graph."""
+    is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+    return bool(is_capturing and is_capturing())
+
+
+def sm12x_should_fill_prefill_slots(
+    num_tokens: int, num_decode_tokens: int | None = 0
+) -> bool:
+    """Whether to write extra first-prefill KV/C4A slots for a [1, 6] pad.
+
+    Eager all-prefill only. Spark 18:13: compressor ran this on a
+    tokens=4 decode dummy during PIECEWISE capture; ``bool(torch.all)``
+    then host-synced and aborted the graph.
+    """
+    if num_tokens not in (2, 4, 5):
+        return False
+    if num_decode_tokens:
+        return False
+    if sm12x_align_prefill_q_len(num_tokens) == num_tokens:
+        return False
+    return not sm12x_is_capturing()
+
+
 def sm12x_extend_prefill_slots(
     slot_mapping: torch.Tensor, target: int, block_size: int
 ) -> torch.Tensor:
@@ -167,6 +191,8 @@ def sm12x_extend_prefill_slots(
     Spark 17:58: pad q_len=2 -> [1, 6] then IMA. The decode kernel
     indexes ``q_len`` KV rows, but insert only wrote 2. Extra slots stay
     in the same block; if that would cross a block, reuse the last slot.
+
+    Capture-safe: no ``.item()`` / ``bool(tensor)`` host sync.
     """
     n = slot_mapping.shape[0]
     if n <= 0 or n >= target or block_size <= 0:
@@ -177,12 +203,9 @@ def sm12x_extend_prefill_slots(
         n, target, device=slot_mapping.device, dtype=slot_mapping.dtype
     )
     same_block = (ext // block_size) == (base // block_size)
-    if bool(torch.all(same_block)):
-        return torch.cat((slot_mapping, ext), dim=0)
-    return torch.cat(
-        (slot_mapping, slot_mapping[-1:].expand(extra)),
-        dim=0,
-    )
+    reuse = slot_mapping[-1].expand(extra)
+    extra_slots = torch.where(same_block, ext, reuse)
+    return torch.cat((slot_mapping, extra_slots), dim=0)
 
 
 def sm12x_pad_prefill_token_rows(
