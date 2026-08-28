@@ -1062,9 +1062,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         skip_c4a = sm12x_skip_padded_prefill_c4a(prefill_q_lens)
         if skip_c4a:
             logger.info_once(
-                "SM12x FlashInfer: skip C4A metadata for padded prefill "
-                "q_lens=%s",
-                prefill_q_lens,
+                "SM12x FlashInfer: skip C4A metadata for padded prefill"
             )
 
         local_topk_indices: torch.Tensor | None
