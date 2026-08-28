@@ -80,6 +80,24 @@ def _pad_to_supported_q_heads(num_heads: int) -> int:
     )
 
 
+def spec_decode_uniform_next_n(
+    num_decode_tokens: int, num_decodes: int
+) -> int | None:
+    """Return tokens-per-request when the decode batch is uniform and >1.
+
+    ``None`` means keep a flat ``[tokens, heads, dim]`` query (pure 1-token
+    decode) or launch one ``[1, q_len, ...]`` call per request (ragged dummy
+    CUDA-graph capture, e.g. 32 tokens over 6 requests). Do not assert: capture
+    sizes that are not multiples of DSpark ``next_n`` are still valid mixed
+    PIECEWISE graphs.
+    """
+    if num_decodes <= 0 or num_decode_tokens <= num_decodes:
+        return None
+    if num_decode_tokens % num_decodes != 0:
+        return None
+    return num_decode_tokens // num_decodes
+
+
 def _required_sm120_sparse_topk(vllm_config: VllmConfig, window_size: int) -> int:
     """Return the SM120 DSV4 SWA specialization needed by this model."""
     if not vllm_config.attention_config.use_non_causal:
@@ -783,15 +801,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         # is ambiguous: FlashInfer's normalizer misroutes it to the varlen
         # prefill kernel, whose SM120 build asserts num_tokens > 64
         # ("Decode ... must go through sparse_mla_sm120_decode_dsv4").
-        out_arg = output
-        if num_decodes > 0 and num_decode_tokens > num_decodes:
-            assert num_decode_tokens % num_decodes == 0, (
-                f"ragged spec decode batch: {num_decode_tokens} tokens over "
-                f"{num_decodes} requests"
-            )
-            next_n = num_decode_tokens // num_decodes
+        next_n = spec_decode_uniform_next_n(num_decode_tokens, num_decodes)
+        if next_n is not None:
             q = q.view(num_decodes, next_n, *q.shape[1:])
-            out_arg = output.view(num_decodes, next_n, *output.shape[1:])
+            output = output.view(num_decodes, next_n, *output.shape[1:])
             swa_indices = swa_indices.reshape(num_decodes, next_n, -1)
             swa_lens = swa_lens.reshape(num_decodes, next_n)
             if extra_sparse_indices is not None:
@@ -800,13 +813,55 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 )
             if extra_sparse_lengths is not None:
                 extra_sparse_lengths = extra_sparse_lengths.reshape(num_decodes, next_n)
+        elif num_decodes > 0 and num_decode_tokens > num_decodes:
+            # Ragged decode (dummy capture of a non-multiple size, or a real
+            # mixed next_n batch). SM12x has no varlen decode path; launch one
+            # uniform [1, q_len, ...] call per request, matching the <=64
+            # prefill fallback.
+            query_start_loc_cpu = swa_metadata.query_start_loc_cpu
+            if query_start_loc_cpu is None:
+                raise RuntimeError(
+                    f"ragged spec decode batch: {num_decode_tokens} tokens over "
+                    f"{num_decodes} requests (missing query_start_loc)"
+                )
+            for i in range(num_decodes):
+                rs = int(query_start_loc_cpu[i])
+                re_ = int(query_start_loc_cpu[i + 1])
+                if re_ <= rs:
+                    continue
+                ql = re_ - rs
+                esi = (
+                    extra_sparse_indices[rs:re_].reshape(1, ql, -1)
+                    if extra_sparse_indices is not None
+                    else None
+                )
+                esl = (
+                    extra_sparse_lengths[rs:re_].reshape(1, ql)
+                    if extra_sparse_lengths is not None
+                    else None
+                )
+                flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                    query=q[rs:re_].reshape(1, ql, *q.shape[1:]),
+                    swa_kv_cache=swa_cache,
+                    workspace_buffer=self._get_workspace(q.device),
+                    sparse_indices=swa_indices[rs:re_].reshape(1, ql, -1),
+                    compressed_kv_cache=extra_cache,
+                    out=output[rs:re_].reshape(1, ql, *output.shape[1:]),
+                    bmm1_scale=self.scale,
+                    sinks=self.attn_sink,
+                    kv_layout="NHD",
+                    swa_topk_lens=swa_lens[rs:re_].reshape(1, ql),
+                    extra_sparse_indices=esi,
+                    extra_sparse_topk_lens=esl,
+                )
+            return
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=q,
             swa_kv_cache=swa_cache,
             workspace_buffer=self._get_workspace(q.device),
             sparse_indices=swa_indices,
             compressed_kv_cache=extra_cache,
-            out=out_arg,
+            out=output,
             bmm1_scale=self.scale,
             sinks=self.attn_sink,
             kv_layout="NHD",

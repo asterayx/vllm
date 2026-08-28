@@ -9,6 +9,7 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     _required_sm120_sparse_topk,
+    spec_decode_uniform_next_n,
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils import flashinfer as fi_utils
@@ -116,3 +117,18 @@ def test_resolve_sm120_dsv4_topk_snaps_missing_dspark_width(monkeypatch) -> None
 
     fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
     fi_utils.resolve_sm120_dsv4_topk.cache_clear()
+
+
+def test_spec_decode_uniform_next_n_accepts_dspark_and_skips_ragged_dummy():
+    """DSpark k=5 is next_n=6. Capture size 32 over max_num_seqs=6 is ragged.
+
+    The dummy CUDA-graph batch used to assert in _forward_decode; the helper
+    must return None so the kernel falls back to per-request decode-form.
+    """
+    assert spec_decode_uniform_next_n(36, 6) == 6
+    assert spec_decode_uniform_next_n(24, 6) == 4
+    assert spec_decode_uniform_next_n(6, 6) is None
+    assert spec_decode_uniform_next_n(32, 6) is None
+    assert spec_decode_uniform_next_n(16, 6) is None
+    assert spec_decode_uniform_next_n(8, 6) is None
+    assert spec_decode_uniform_next_n(0, 0) is None

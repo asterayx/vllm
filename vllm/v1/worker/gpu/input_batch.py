@@ -38,6 +38,25 @@ class InputBuffers:
         )
 
 
+def uniform_dummy_num_reqs(num_tokens: int, max_num_reqs: int) -> int:
+    """Largest request count ≤ max_num_reqs that divides num_tokens.
+
+    PIECEWISE capture descriptors leave ``num_reqs`` unset and previously used
+    ``min(num_tokens, max_num_seqs)``, dumping any remainder across requests
+    (32 tokens over 6 seqs). SM12x DSpark decode treats those short queries as
+    a spec-decode batch and requires ``num_decode_tokens % num_decodes == 0``.
+    A uniform dummy (e.g. 4×8 for size 32) keeps capture valid without
+    dropping non-multiple capture sizes from the CLI.
+    """
+    if num_tokens <= 0:
+        return 1
+    limit = min(num_tokens, max(max_num_reqs, 1))
+    for num_reqs in range(limit, 0, -1):
+        if num_tokens % num_reqs == 0:
+            return num_reqs
+    return 1
+
+
 @dataclass
 class InputBatch:
     # batch_idx -> req_id
