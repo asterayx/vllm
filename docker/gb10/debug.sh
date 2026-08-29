@@ -10,7 +10,9 @@
 # After IMA, dumps land on the host (container death does not delete them):
 #   ls -lt "${CUDA_DUMP_DIR:-$HOME/cuda-dumps}"
 #   docker logs "${NAME:-dspark-tp2-rank${NODE_RANK:-0}}" 2>&1 | grep -A30 coredump
-#   cuda-gdb -ex "target cudacore ${CUDA_DUMP_DIR:-$HOME/cuda-dumps}/<file>"
+# cuda-gdb is /usr/local/cuda/bin/cuda-gdb in the image, not on the host:
+#   ./docker/gb10/gdb-dump.sh
+#   ./docker/gb10/gdb-dump.sh ~/cuda-dumps/cuda_coredump_<host>.<pid>.<t>
 #
 # Optional: CUDA_LAUNCH_BLOCKING=1 ./docker/gb10/debug.sh
 # Optional: COMPUTE_SANITIZER=1 ./docker/gb10/debug.sh
