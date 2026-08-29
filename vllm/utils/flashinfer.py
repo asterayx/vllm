@@ -179,6 +179,8 @@ def flashinfer_trtllm_batch_decode_sparse_mla_dsv4(*args: Any, **kwargs: Any):
             kwargs["extra_sparse_indices"]
         )
     return _flashinfer_trtllm_batch_decode_sparse_mla_dsv4_impl(*args, **kwargs)
+
+
 flashinfer_xqa_batch_decode_with_kv_cache = _lazy_import_wrapper(
     "flashinfer.decode",
     "xqa_batch_decode_with_kv_cache",

@@ -340,7 +340,9 @@ def test_launch_per_request_prefill_pads_q_len_2_once(monkeypatch):
         lambda fam: fam == 120,
     )
     launches = _launch_per_request(monkeypatch, 2, is_prefill=True)
-    assert [launch["query"].shape for launch in launches] == [torch.Size([1, 6, 8, 512])]
+    assert [launch["query"].shape for launch in launches] == [
+        torch.Size([1, 6, 8, 512])
+    ]
     query = launches[0]["query"]
     indices = launches[0]["sparse_indices"]
     lens = launches[0]["swa_topk_lens"]
@@ -445,8 +447,8 @@ def test_forward_decode_q_len_2_is_one_padded_launch(monkeypatch):
         _as_sparse_cache=DeepseekV4FlashInferSM120Attention._as_sparse_cache,
         swa_cache_layer=SimpleNamespace(kv_cache=torch.zeros(2, 1, 1, 512)),
     )
-    dummy._prepare_query = (
-        DeepseekV4FlashInferSM120Attention._prepare_query.__get__(dummy)
+    dummy._prepare_query = DeepseekV4FlashInferSM120Attention._prepare_query.__get__(
+        dummy
     )
     dummy._launch_per_request_decode = (
         DeepseekV4FlashInferSM120Attention._launch_per_request_decode.__get__(dummy)
@@ -498,13 +500,11 @@ def test_forward_prefill_q_len_2_is_one_padded_launch(monkeypatch):
         _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
         _as_sparse_cache=DeepseekV4FlashInferSM120Attention._as_sparse_cache,
     )
-    dummy._prepare_query = (
-        DeepseekV4FlashInferSM120Attention._prepare_query.__get__(dummy)
+    dummy._prepare_query = DeepseekV4FlashInferSM120Attention._prepare_query.__get__(
+        dummy
     )
     dummy._launch_per_request_decode = (
-        DeepseekV4FlashInferSM120Attention._launch_per_request_decode.__get__(
-            dummy
-        )
+        DeepseekV4FlashInferSM120Attention._launch_per_request_decode.__get__(dummy)
     )
     swa = SimpleNamespace(
         num_prefills=1,
@@ -632,13 +632,11 @@ def test_forward_prefill_c4a_q_len_2_is_one_padded_launch(monkeypatch):
         _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
         _as_sparse_cache=DeepseekV4FlashInferSM120Attention._as_sparse_cache,
     )
-    dummy._prepare_query = (
-        DeepseekV4FlashInferSM120Attention._prepare_query.__get__(dummy)
+    dummy._prepare_query = DeepseekV4FlashInferSM120Attention._prepare_query.__get__(
+        dummy
     )
     dummy._launch_per_request_decode = (
-        DeepseekV4FlashInferSM120Attention._launch_per_request_decode.__get__(
-            dummy
-        )
+        DeepseekV4FlashInferSM120Attention._launch_per_request_decode.__get__(dummy)
     )
     swa = SimpleNamespace(
         num_prefills=1,

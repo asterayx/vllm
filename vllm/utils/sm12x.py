@@ -231,9 +231,7 @@ def sm12x_replace_swa_index_sentinels(
     pos = torch.arange(width, device=rows.device)
     last_pos = torch.where(valid, pos, pos.new_zeros(())).amax(dim=-1)
     last_slot = rows.gather(-1, last_pos.unsqueeze(-1)).squeeze(-1)
-    last_slot = torch.where(
-        valid.any(dim=-1), last_slot, last_slot.new_zeros(())
-    )
+    last_slot = torch.where(valid.any(dim=-1), last_slot, last_slot.new_zeros(()))
     filled = torch.where(valid, rows, last_slot.unsqueeze(-1))
     return filled.reshape(indices.shape)
 
@@ -263,9 +261,7 @@ def sm12x_extend_prefill_slots(
     return torch.cat((slot_mapping, extra_slots), dim=0)
 
 
-def sm12x_pad_prefill_token_rows(
-    t: torch.Tensor, target: int
-) -> torch.Tensor:
+def sm12x_pad_prefill_token_rows(t: torch.Tensor, target: int) -> torch.Tensor:
     """Repeat the last real row so KV insert matches a [1, 6] launch."""
     n = t.shape[0]
     if n <= 0 or n >= target:

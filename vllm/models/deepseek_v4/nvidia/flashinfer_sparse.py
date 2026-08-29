@@ -845,9 +845,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         pads such as DSpark ``5→6`` keep C4A — those captured clean.
         """
         q_len = token_end - token_start
-        align = (
-            sm12x_align_prefill_q_len if is_prefill else sm12x_align_decode_q_len
-        )
+        align = sm12x_align_prefill_q_len if is_prefill else sm12x_align_decode_q_len
         launch_len = align(q_len)
         # Spark 22:57: insert filled 6 SWA slots and FlashInfer launched
         # [1, 6], then IMA'd on the C4A extra path (2-token topk padded
@@ -895,9 +893,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         else:
             out = _batch_token_span(output, token_start, token_end, launch_len)
         req_sparse = sm12x_replace_swa_index_sentinels(
-            _batch_token_span(
-                swa_indices, token_start, token_end, launch_len
-            ).reshape(1, launch_len, -1)
+            _batch_token_span(swa_indices, token_start, token_end, launch_len).reshape(
+                1, launch_len, -1
+            )
         )
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=query,
@@ -1067,9 +1065,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         ]
         skip_c4a = sm12x_skip_padded_prefill_c4a(prefill_q_lens)
         if skip_c4a:
-            logger.info_once(
-                "SM12x FlashInfer: skip C4A metadata for padded prefill"
-            )
+            logger.info_once("SM12x FlashInfer: skip C4A metadata for padded prefill")
 
         local_topk_indices: torch.Tensor | None
         if swa_only or skip_c4a:
