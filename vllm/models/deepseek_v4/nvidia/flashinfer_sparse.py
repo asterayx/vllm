@@ -31,6 +31,7 @@ from vllm.utils.sm12x import (
     reject_sm12x_unsafe_decode_query,
     sm12x_align_decode_q_len,
     sm12x_align_prefill_q_len,
+    sm12x_replace_swa_index_sentinels,
     sm12x_skip_padded_prefill_c4a,
 )
 from vllm.v1.attention.backend import MultipleOf
@@ -893,13 +894,16 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             out = output[token_start:token_end].reshape(1, q_len, *output.shape[1:])
         else:
             out = _batch_token_span(output, token_start, token_end, launch_len)
+        req_sparse = sm12x_replace_swa_index_sentinels(
+            _batch_token_span(
+                swa_indices, token_start, token_end, launch_len
+            ).reshape(1, launch_len, -1)
+        )
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=query,
             swa_kv_cache=swa_cache,
             workspace_buffer=self._get_workspace(q.device),
-            sparse_indices=_batch_token_span(
-                swa_indices, token_start, token_end, launch_len
-            ).reshape(1, launch_len, -1),
+            sparse_indices=req_sparse,
             compressed_kv_cache=extra_cache,
             out=out,
             bmm1_scale=self.scale,
@@ -908,7 +912,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             swa_topk_lens=_batch_token_span(
                 swa_lens, token_start, token_end, launch_len
             ),
-            extra_sparse_indices=esi,
+            extra_sparse_indices=sm12x_replace_swa_index_sentinels(esi),
             extra_sparse_topk_lens=esl,
         )
         if launch_len != q_len:
@@ -1022,14 +1026,16 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             query=q,
             swa_kv_cache=swa_cache,
             workspace_buffer=self._get_workspace(q.device),
-            sparse_indices=swa_indices,
+            sparse_indices=sm12x_replace_swa_index_sentinels(swa_indices),
             compressed_kv_cache=extra_cache,
             out=output,
             bmm1_scale=self.scale,
             sinks=self.attn_sink,
             kv_layout="NHD",
             swa_topk_lens=swa_lens,
-            extra_sparse_indices=extra_sparse_indices,
+            extra_sparse_indices=sm12x_replace_swa_index_sentinels(
+                extra_sparse_indices
+            ),
             extra_sparse_topk_lens=extra_sparse_lengths,
         )
 
@@ -1183,13 +1189,15 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 query=q_chunk,
                 swa_kv_cache=swa_kv_paged,
                 workspace_buffer=self._get_workspace(q.device),
-                sparse_indices=swa_indices_chunk,
+                sparse_indices=sm12x_replace_swa_index_sentinels(swa_indices_chunk),
                 compressed_kv_cache=extra_kv_paged,
                 out=output[query_start:query_end],
                 bmm1_scale=self.scale,
                 sinks=self.attn_sink,
                 kv_layout="NHD",
                 swa_topk_lens=swa_lens_chunk,
-                extra_sparse_indices=extra_sparse_indices_chunk,
+                extra_sparse_indices=sm12x_replace_swa_index_sentinels(
+                    extra_sparse_indices_chunk
+                ),
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
             )

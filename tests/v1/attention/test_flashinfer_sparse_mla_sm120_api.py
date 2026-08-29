@@ -353,6 +353,64 @@ def test_launch_per_request_prefill_pads_q_len_2_once(monkeypatch):
     ]
 
 
+def test_launch_per_request_replaces_swa_minus_one_sentinels(monkeypatch):
+    """Real SWA rows already contain ``-1`` tails; pad-repeat is not enough."""
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    launches: list[dict] = []
+
+    def _fake_launch(**kwargs):
+        launches.append(kwargs)
+
+    monkeypatch.setattr(
+        fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
+    )
+    dummy = SimpleNamespace(
+        scale=1.0,
+        attn_sink=None,
+        _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
+    )
+    q_len = 2
+    width = 128
+    swa_indices = torch.full((q_len, width), -1, dtype=torch.int32)
+    swa_indices[0, 0] = 7
+    swa_indices[1, 0] = 7
+    swa_indices[1, 1] = 8
+    DeepseekV4FlashInferSM120Attention._launch_per_request_decode(
+        dummy,
+        torch.zeros(q_len, 8, 512),
+        torch.zeros(q_len, 8, 512),
+        torch.zeros(1),
+        None,
+        swa_indices,
+        torch.tensor([1, 2], dtype=torch.int32),
+        None,
+        None,
+        0,
+        q_len,
+        is_prefill=True,
+    )
+    assert len(launches) == 1
+    indices = launches[0]["sparse_indices"]
+    assert indices.shape == (1, 6, width)
+    assert not torch.any(indices == -1)
+    assert torch.equal(indices[0, 0], torch.full((width,), 7, dtype=torch.int32))
+    expect1 = torch.full((width,), 8, dtype=torch.int32)
+    expect1[0] = 7
+    assert torch.equal(indices[0, 1], expect1)
+    assert torch.equal(indices[0, 2:], expect1.unsqueeze(0).expand(4, -1))
+    assert torch.equal(
+        launches[0]["swa_topk_lens"][0, :2],
+        torch.tensor([1, 2], dtype=torch.int32),
+    )
+
+
 def test_forward_decode_q_len_2_is_one_padded_launch(monkeypatch):
     """A 2-token seed labeled decode must still be one [1, 6], not [1, 2]."""
     from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse

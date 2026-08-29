@@ -21,6 +21,7 @@ from vllm.utils.sm12x import (
     sm12x_mixed_warmup_decode_prompt_len,
     sm12x_mixed_warmup_prefill_len,
     sm12x_pad_token_rows,
+    sm12x_replace_swa_index_sentinels,
     sm12x_should_fill_compressed_prefill_slots,
     sm12x_should_fill_prefill_slots,
     sm12x_skip_padded_prefill_c4a,
@@ -138,6 +139,57 @@ def test_sm12x_does_not_fill_compressed_prefill_slots(monkeypatch):
         lambda fam: False,
     )
     assert sm12x_skip_padded_prefill_c4a([2]) is False
+
+
+def test_sm12x_replace_swa_index_sentinels_repeats_last_valid(monkeypatch):
+    """A 2-token first-prefill leaves 126–127 ``-1``s in each 128-wide row."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    rows = torch.full((2, 128), -1, dtype=torch.int32)
+    rows[0, 0] = 7
+    rows[1, 0] = 7
+    rows[1, 1] = 8
+    filled = sm12x_replace_swa_index_sentinels(rows)
+    assert filled is not None
+    assert filled.shape == (2, 128)
+    assert torch.all(filled >= 0)
+    assert torch.equal(filled[0], torch.full((128,), 7, dtype=torch.int32))
+    expect1 = torch.full((128,), 8, dtype=torch.int32)
+    expect1[0] = 7
+    assert torch.equal(filled[1], expect1)
+
+    batched = rows.unsqueeze(1)
+    filled3 = sm12x_replace_swa_index_sentinels(batched)
+    assert filled3 is not None
+    assert filled3.shape == (2, 1, 128)
+    assert torch.all(filled3 >= 0)
+    assert torch.equal(filled3[:, 0], filled)
+
+    empty_row = torch.full((1, 128), -1, dtype=torch.int32)
+    zeros = sm12x_replace_swa_index_sentinels(empty_row)
+    assert zeros is not None
+    assert torch.equal(zeros, torch.zeros((1, 128), dtype=torch.int32))
+
+    clean = torch.arange(8, dtype=torch.int32).view(2, 4)
+    assert torch.equal(sm12x_replace_swa_index_sentinels(clean), clean)
+    assert sm12x_replace_swa_index_sentinels(None) is None
+
+
+def test_sm12x_replace_swa_index_sentinels_noop_off_sm12x(monkeypatch):
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
+    rows = torch.tensor([[10, -1, -1], [11, 12, -1]], dtype=torch.int32)
+    assert torch.equal(sm12x_replace_swa_index_sentinels(rows), rows)
 
 
 def test_sm12x_o_proj_pads_small_batches(monkeypatch):

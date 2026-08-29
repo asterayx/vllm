@@ -208,6 +208,36 @@ def sm12x_skip_padded_prefill_c4a(query_lens: list[int]) -> bool:
     return True
 
 
+def sm12x_replace_swa_index_sentinels(
+    indices: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Replace SWA ``-1`` gather sentinels with the last valid slot per row.
+
+    FlashInfer SM120 decode cubins gather the full top-k width first.
+    A 2-token first-prefill has ``swa_len`` 1–2, so most of a 128-wide
+    row is ``-1``. Those addresses IMA. Repeat the last non-negative
+    slot; ``swa_topk_lens`` still masks softmax. Capture-safe: no
+    ``.item()`` / ``bool(tensor)``.
+    """
+    if indices is None or indices.numel() == 0:
+        return indices
+    if not current_platform.is_device_capability_family(120):
+        return indices
+    width = indices.shape[-1]
+    if width == 0:
+        return indices
+    rows = indices.reshape(-1, width)
+    valid = rows >= 0
+    pos = torch.arange(width, device=rows.device)
+    last_pos = torch.where(valid, pos, pos.new_zeros(())).amax(dim=-1)
+    last_slot = rows.gather(-1, last_pos.unsqueeze(-1)).squeeze(-1)
+    last_slot = torch.where(
+        valid.any(dim=-1), last_slot, last_slot.new_zeros(())
+    )
+    filled = torch.where(valid, rows, last_slot.unsqueeze(-1))
+    return filled.reshape(indices.shape)
+
+
 def sm12x_extend_prefill_slots(
     slot_mapping: torch.Tensor, target: int, block_size: int
 ) -> torch.Tensor:
