@@ -299,6 +299,26 @@ def sm12x_pad_token_rows(
     return pad_token_rows(t, target), orig
 
 
+def sm12x_replace_moe_topk_sentinels(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Replace router ``-1`` pad experts before the b12x SiLU kernel.
+
+    ``VLLM_MOE_SKIP_PADDING`` writes ``topk_ids=-1`` on SM12x alignment
+    rows. FlashInfer SWA can mask those; b12x ``MoEDynamicKernelSilu``
+    gathers the expert id and IMA'd (Spark 01:12 coredump, SM 10 warp
+    0). Capture dummies mark every row padding, so all ids are ``-1``
+    and the kernel no-ops. Mixed-warmup has 2 real rows plus 14
+    ``-1``s. Map sentinels to expert 0 and zero their weights.
+    Capture-safe: no ``.item()`` / ``bool(tensor)``.
+    """
+    if not current_platform.is_device_capability_family(120):
+        return topk_ids, topk_weights
+    invalid = topk_ids < 0
+    return topk_ids.clamp(min=0), topk_weights.masked_fill(invalid, 0)
+
+
 def extend_padding_mask(
     is_padding: torch.Tensor | None, num_tokens: int
 ) -> torch.Tensor | None:

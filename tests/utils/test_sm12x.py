@@ -21,6 +21,7 @@ from vllm.utils.sm12x import (
     sm12x_mixed_warmup_prefill_len,
     sm12x_pad_prefill_token_rows,
     sm12x_pad_token_rows,
+    sm12x_replace_moe_topk_sentinels,
     sm12x_replace_swa_index_sentinels,
     sm12x_should_fill_compressed_prefill_slots,
     sm12x_should_fill_prefill_slots,
@@ -139,6 +140,39 @@ def test_sm12x_does_not_fill_compressed_prefill_slots(monkeypatch):
         lambda fam: False,
     )
     assert sm12x_skip_padded_prefill_c4a([2]) is False
+
+
+def test_sm12x_replace_moe_topk_sentinels_zeros_pad_experts(monkeypatch):
+    """VLLM_MOE_SKIP_PADDING writes -1; b12x SiLU gathers that id."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    ids = torch.tensor([[3, 5, -1], [-1, -1, -1]], dtype=torch.int32)
+    weights = torch.tensor([[0.5, 0.5, 0.2], [0.1, 0.2, 0.3]], dtype=torch.float32)
+    out_ids, out_w = sm12x_replace_moe_topk_sentinels(ids, weights)
+    assert torch.equal(out_ids, torch.tensor([[3, 5, 0], [0, 0, 0]], dtype=torch.int32))
+    assert torch.equal(
+        out_w, torch.tensor([[0.5, 0.5, 0.0], [0.0, 0.0, 0.0]], dtype=torch.float32)
+    )
+
+
+def test_sm12x_replace_moe_topk_sentinels_noop_off_sm12x(monkeypatch):
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
+    ids = torch.tensor([[1, -1]], dtype=torch.int32)
+    weights = torch.ones(1, 2)
+    out_ids, out_w = sm12x_replace_moe_topk_sentinels(ids, weights)
+    assert torch.equal(out_ids, ids)
+    assert torch.equal(out_w, weights)
 
 
 def test_sm12x_replace_swa_index_sentinels_repeats_last_valid(monkeypatch):

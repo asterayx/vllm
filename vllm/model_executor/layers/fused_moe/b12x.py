@@ -31,7 +31,11 @@ from vllm.utils.b12x import (
     get_b12x_fused_moe,
     reuse_packed_weight_storage,
 )
-from vllm.utils.sm12x import sm12x_align_tokens, sm12x_pad_token_rows
+from vllm.utils.sm12x import (
+    sm12x_align_tokens,
+    sm12x_pad_token_rows,
+    sm12x_replace_moe_topk_sentinels,
+)
 
 logger = init_logger(__name__)
 
@@ -750,6 +754,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         prepared = self._prepared()
         topk_ids = _normalize_topk_ids(topk_ids)
         topk_weights = _normalize_topk_weights(topk_weights)
+        topk_ids, topk_weights = sm12x_replace_moe_topk_sentinels(
+            topk_ids, topk_weights
+        )
         hidden_states, orig_tokens = sm12x_pad_token_rows(
             hidden_states, what="b12x MoE"
         )
