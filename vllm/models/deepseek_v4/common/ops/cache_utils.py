@@ -27,9 +27,9 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonPointerInputVariant,
     TritonWarmupTensor,
 )
+from vllm.models.deepseek_v4.common.cutedsl import use_dsv4_cutedsl
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.models.deepseek_v4.common.cutedsl import use_dsv4_cutedsl
 from vllm.utils.math_utils import next_power_of_2
 
 

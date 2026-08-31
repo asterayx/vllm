@@ -12,11 +12,11 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.models.deepseek_v4.common.cutedsl import use_dsv4_cutedsl
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
     compress_norm_rope_store_two_stage_triton,
 )
-from vllm.models.deepseek_v4.common.cutedsl import use_dsv4_cutedsl
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
