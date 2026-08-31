@@ -131,7 +131,7 @@ def test_sm12x_mhc_pads_small_token_dim(monkeypatch):
     assert orig == 8
     assert padded[0].shape == (16, 4)
     assert torch.equal(padded[0][:8], x)
-    assert torch.count_nonzero(padded[0][8:]) == 0
+    assert torch.equal(padded[0][8:], x[-1:].expand(8, -1))
     assert _pad_token_rows(x, 8).shape == (8, 4)
 
 

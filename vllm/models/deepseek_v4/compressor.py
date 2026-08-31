@@ -12,11 +12,11 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.models.deepseek_v4.common.cutedsl import use_dsv4_cutedsl
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
     compress_norm_rope_store_two_stage_triton,
 )
-from vllm.models.deepseek_v4.common.cutedsl import use_dsv4_cutedsl
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
@@ -341,9 +341,9 @@ class DeepseekCompressor(nn.Module):
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
-        # Spark 23:42: do not pad C4A writes to 6. FlashInfer already
-        # launches padded first-prefills SWA-only; a 6-token C4A Triton
-        # write IMA'd (reported at compute_global_topk).
+        # Do not pad C4A writes to 6. FlashInfer already launches padded
+        # first-prefills SWA-only; a 6-token C4A Triton write IMA'd
+        # (reported at compute_global_topk).
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache

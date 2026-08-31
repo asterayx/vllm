@@ -519,7 +519,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 num_tokens, self.max_num_reqs, self.decode_query_len
             )
             if current_platform.is_device_capability_family(120):
-                logger.info(
+                logger.info_once(
                     "SM12x CUDA-graph dummy: tokens=%d reqs=%d q_len=%d",
                     num_tokens,
                     num_reqs,

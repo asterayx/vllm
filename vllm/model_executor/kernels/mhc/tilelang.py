@@ -4,6 +4,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.sm12x import sm12x_pad_prefill_token_rows
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -21,10 +22,7 @@ def sm12x_mhc_min_tokens() -> int:
 
 
 def _pad_token_rows(t: torch.Tensor, target: int) -> torch.Tensor:
-    n = t.shape[0]
-    if n >= target:
-        return t
-    return torch.cat((t, t.new_zeros((target - n, *t.shape[1:]))), dim=0)
+    return sm12x_pad_prefill_token_rows(t, target)
 
 
 def _sm12x_pad_token_tensors(

@@ -138,7 +138,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # only token counts main capture already ran (36, 24, 6).
         capture_query_len = sm12x_align_decode_q_len(self.num_query_per_req)
         if capture_query_len != self.num_query_per_req:
-            logger.info(
+            logger.info_once(
                 "SM12x %s capture: decode_query_len %d -> %d",
                 self._speculator_name,
                 self.num_query_per_req,
@@ -151,10 +151,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
         orig_sizes = list(vllm_config.compilation_config.cudagraph_capture_sizes or [])
         if capture_sizes != orig_sizes:
-            logger.info(
+            logger.info_once(
                 "SM12x %s capture sizes: %s",
                 self._speculator_name,
-                capture_sizes,
+                tuple(capture_sizes),
             )
             compilation_config = copy.copy(vllm_config.compilation_config)
             compilation_config.cudagraph_capture_sizes = capture_sizes
@@ -176,7 +176,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         assert self.query_cudagraph_manager is not None
         if current_platform.is_device_capability_family(120):
             torch.cuda.synchronize()
-            logger.info(
+            logger.info_once(
                 "SM12x %s capture: pre-dummy CUDA synchronize ok",
                 self._speculator_name,
             )

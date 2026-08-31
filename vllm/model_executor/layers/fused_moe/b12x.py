@@ -763,6 +763,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         if hidden_states.shape[0] != orig_tokens:
             topk_ids = sm12x_pad_token_rows(topk_ids)[0]
             topk_weights = sm12x_pad_token_rows(topk_weights)[0]
+            topk_weights[orig_tokens:] = 0
         plan_tokens = int(hidden_states.shape[0])
         plan = self._plan(
             tokens=plan_tokens,

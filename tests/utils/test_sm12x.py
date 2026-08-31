@@ -22,6 +22,7 @@ from vllm.utils.sm12x import (
     sm12x_pad_prefill_token_rows,
     sm12x_pad_token_rows,
     sm12x_replace_moe_topk_sentinels,
+    sm12x_replace_negative_indices,
     sm12x_replace_swa_index_sentinels,
     sm12x_should_fill_compressed_prefill_slots,
     sm12x_should_fill_prefill_slots,
@@ -83,10 +84,11 @@ def test_sm12x_align_decode_q_len_snaps_to_safe_widths(monkeypatch):
     assert sm12x_disable_attn_aux_streams() is True
 
 
-def test_sm12x_extend_prefill_slots_stays_in_block():
+def test_sm12x_extend_prefill_slots_reuses_last_slot():
+    """Extra KV slots reuse the last real slot, matching repeat-last query."""
     slots = torch.tensor([10, 11], dtype=torch.int64)
     ext = sm12x_extend_prefill_slots(slots, 6, block_size=256)
-    assert torch.equal(ext, torch.tensor([10, 11, 12, 13, 14, 15], dtype=torch.int64))
+    assert torch.equal(ext, torch.tensor([10, 11, 11, 11, 11, 11], dtype=torch.int64))
     edge = torch.tensor([254, 255], dtype=torch.int64)
     reused = sm12x_extend_prefill_slots(edge, 6, block_size=256)
     assert torch.equal(
@@ -100,7 +102,7 @@ def test_sm12x_extend_prefill_slots_stays_in_block():
 
 
 def test_sm12x_fill_slots_skips_capture_and_decode_dummies(monkeypatch):
-    """Spark 18:13: tokens=4 decode dummy must not fill during capture."""
+    """tokens=4 decode dummy must not fill SWA slots during capture."""
     from vllm.utils import sm12x as sm12x_utils
 
     monkeypatch.setattr(
@@ -119,7 +121,7 @@ def test_sm12x_fill_slots_skips_capture_and_decode_dummies(monkeypatch):
 
 
 def test_sm12x_does_not_fill_compressed_prefill_slots(monkeypatch):
-    """23:42: 6-token C4A write IMA'd after SWA-only [1, 6]."""
+    """6-token C4A write IMA'd after SWA-only [1, 6]."""
     from vllm.utils import sm12x as sm12x_utils
 
     monkeypatch.setattr(
@@ -158,6 +160,9 @@ def test_sm12x_replace_moe_topk_sentinels_zeros_pad_experts(monkeypatch):
     assert torch.equal(
         out_w, torch.tensor([[0.5, 0.5, 0.0], [0.0, 0.0, 0.0]], dtype=torch.float32)
     )
+    filled = sm12x_replace_negative_indices(ids, mode="fill0")
+    assert filled is not None
+    assert torch.equal(filled, out_ids)
 
 
 def test_sm12x_replace_moe_topk_sentinels_noop_off_sm12x(monkeypatch):
@@ -173,6 +178,46 @@ def test_sm12x_replace_moe_topk_sentinels_noop_off_sm12x(monkeypatch):
     out_ids, out_w = sm12x_replace_moe_topk_sentinels(ids, weights)
     assert torch.equal(out_ids, ids)
     assert torch.equal(out_w, weights)
+
+
+def test_sm12x_replace_negative_indices_modes(monkeypatch):
+    """One helper: SWA repeats last valid; MoE fills expert 0."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    rows = torch.tensor([[3, 5, -1], [-1, -1, -1]], dtype=torch.int32)
+    filled0 = sm12x_replace_negative_indices(rows, mode="fill0")
+    assert filled0 is not None
+    assert torch.equal(filled0, torch.tensor([[3, 5, 0], [0, 0, 0]], dtype=torch.int32))
+    last = sm12x_replace_negative_indices(rows, mode="repeat_last")
+    assert last is not None
+    assert torch.equal(last, torch.tensor([[3, 5, 5], [0, 0, 0]], dtype=torch.int32))
+
+
+def test_sm12x_moe_alignment_pad_zeros_extra_weights(monkeypatch):
+    """Alignment pad repeats last topk row, then caller zeros extra weights."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    ids = torch.tensor([[3, 5], [1, 2]], dtype=torch.int32)
+    weights = torch.tensor([[0.6, 0.4], [0.7, 0.3]], dtype=torch.float32)
+    padded_ids, _ = sm12x_pad_token_rows(ids)
+    padded_w, orig = sm12x_pad_token_rows(weights)
+    padded_w[orig:] = 0
+    assert orig == 2
+    assert padded_ids.shape[0] == 16
+    assert torch.equal(padded_ids[:2], ids)
+    assert torch.equal(padded_ids[2:], ids[-1:].expand(14, -1))
+    assert torch.equal(padded_w[:2], weights)
+    assert torch.count_nonzero(padded_w[2:]) == 0
 
 
 def test_sm12x_replace_swa_index_sentinels_repeats_last_valid(monkeypatch):
@@ -227,7 +272,7 @@ def test_sm12x_replace_swa_index_sentinels_noop_off_sm12x(monkeypatch):
 
 
 def test_sm12x_o_proj_pads_small_batches(monkeypatch):
-    """Spark 23:54: o_proj ran on 2 tokens after SWA-only [1, 6]."""
+    """o_proj ran on 2 tokens after SWA-only [1, 6]."""
     from vllm.models.deepseek_v4.nvidia.ops import o_proj as o_proj_mod
     from vllm.utils import sm12x as sm12x_utils
 
@@ -302,7 +347,7 @@ def _dspark_full_decode_capture_sizes(
 def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
     """DSpark sample_from_anchor is q_len=5; capture must use aligned 6.
 
-    q_len=5 first graph is 25=5×5 (16:26 IMA before FlashInfer pad).
+    q_len=5 first graph is 25=5×5 (IMA before FlashInfer pad).
     q_len=6 first graph is 36=6×6 (main capture already green).
     """
     from vllm.utils import sm12x as sm12x_utils
@@ -355,7 +400,7 @@ def test_sm12x_pad_token_rows(monkeypatch):
     assert orig == 8
     assert padded.shape == (16, 4)
     assert torch.equal(padded[:8], x)
-    assert torch.count_nonzero(padded[8:]) == 0
+    assert torch.equal(padded[8:], x[-1:].expand(8, -1))
     assert pad_token_rows(x, 8).shape == (8, 4)
 
 
@@ -402,7 +447,7 @@ def test_sm12x_keeps_q_len_2_seed_on_prefill_split(monkeypatch):
 
 def test_sm12x_dspark_capture_dummy_splits_as_all_decodes(monkeypatch):
     """DSpark capture dummies are q_len=6 decodes; missing is_prefilling
-    AssertionError'd at 0/5 (16:41). make_dummy zeros the flag."""
+    AssertionError'd at 0/5. make_dummy zeros the flag."""
     from vllm.utils import sm12x as sm12x_utils
     from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 
@@ -482,7 +527,7 @@ def test_sm12x_c128a_split_matches_swa_for_mixed_warmup(monkeypatch):
 
 
 def test_sm12x_dspark_dummy_syncs_only_on_eager_warmup(monkeypatch):
-    """Spark 16:53: synchronize inside torch.cuda.graph aborted DSpark 0/3."""
+    """synchronize inside torch.cuda.graph aborted DSpark 0/3."""
     from vllm.v1.worker.gpu.spec_decode.dflash import cudagraph as dflash_cg
 
     synced: list[bool] = []
