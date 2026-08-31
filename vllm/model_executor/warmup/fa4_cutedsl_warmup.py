@@ -49,5 +49,9 @@ def _warm_inkling_fa4_rel_attention(worker: Worker) -> None:
 
 
 def fa4_cutedsl_warmup(worker: Worker) -> None:
+    from vllm.utils.cutedsl import cutedsl_jit_supported
+
+    if not cutedsl_jit_supported():
+        return
     _warm_fa4_mla_prefill(worker)
     _warm_inkling_fa4_rel_attention(worker)

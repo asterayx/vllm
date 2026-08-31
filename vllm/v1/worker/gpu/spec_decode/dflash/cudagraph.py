@@ -5,6 +5,8 @@ from collections.abc import Callable, Mapping
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -19,6 +21,18 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
+
+
+def _sync_after_eager_dspark_dummy(warmup: bool) -> None:
+    """Flush pending IMA after eager DSpark warmup only.
+
+    ``torch.cuda.synchronize`` inside ``torch.cuda.graph`` raises
+    ``cudaErrorStreamCaptureUnsupported`` (Spark 16:53, progress 0/3).
+    """
+    if warmup and current_platform.is_device_capability_family(120):
+        torch.cuda.synchronize()
 
 
 def _prepare_dflash_inputs_to_capture(
@@ -68,6 +82,8 @@ def _prepare_dflash_inputs_to_capture(
             kv_cache_config=kv_cache_config,
             for_cudagraph_capture=True,
             causal=causal,
+            # Dummy drafts are decodes; SM12x split requires this flag.
+            is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
         )
     return AttentionState(attn_metadata, slot_mappings_by_layer)
 
@@ -93,6 +109,13 @@ class DFlashCudaGraphManager(CudaGraphManager):
         ) -> Callable[[CUDAGraphMode], None]:
             num_tokens = desc.num_tokens
             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+            if current_platform.is_device_capability_family(120):
+                logger.info(
+                    "SM12x DSpark CUDA-graph dummy: tokens=%d reqs=%d q_len=%d",
+                    num_tokens,
+                    num_reqs,
+                    num_tokens // num_reqs if num_reqs else 0,
+                )
             num_tokens_across_dp = (
                 torch.full((self.dp_size,), num_tokens, dtype=torch.int32, device="cpu")
                 if self.dp_size > 1
@@ -111,13 +134,17 @@ class DFlashCudaGraphManager(CudaGraphManager):
             )
             attn_metadata, slot_mappings = attn_state
 
-            return lambda cg_mode: forward_fn(
-                num_reqs,
-                num_tokens,
-                attn_metadata,
-                slot_mappings,
-                num_tokens_across_dp,
-                cg_mode,
-            )
+            def _run(cg_mode: CUDAGraphMode) -> None:
+                forward_fn(
+                    num_reqs,
+                    num_tokens,
+                    attn_metadata,
+                    slot_mappings,
+                    num_tokens_across_dp,
+                    cg_mode,
+                )
+                _sync_after_eager_dspark_dummy(warmup)
+
+            return _run
 
         super().capture(create_forward_fn, progress_bar_desc)

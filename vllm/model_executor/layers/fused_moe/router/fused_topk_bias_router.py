@@ -18,12 +18,12 @@ from vllm.model_executor.layers.fused_moe.router.dsv4_topk import (
     can_use_dsv4_topk,
     dsv4_topk,
 )
+from vllm.utils.sm12x import extend_padding_mask
 
 
 def _get_padding_mask(num_tokens: int) -> torch.Tensor | None:
     if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-        is_padding = get_forward_context().is_padding
-        return is_padding[:num_tokens] if is_padding is not None else None
+        return extend_padding_mask(get_forward_context().is_padding, num_tokens)
     return None
 
 

@@ -36,7 +36,11 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import (
+    InputBatch,
+    InputBuffers,
+    uniform_dummy_num_reqs,
+)
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -511,7 +515,16 @@ class ModelCudaGraphManager(CudaGraphManager):
             warmup: bool,
         ) -> Callable[[CUDAGraphMode], None]:
             num_tokens = desc.num_tokens
-            num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+            num_reqs = desc.num_reqs or uniform_dummy_num_reqs(
+                num_tokens, self.max_num_reqs, self.decode_query_len
+            )
+            if current_platform.is_device_capability_family(120):
+                logger.info(
+                    "SM12x CUDA-graph dummy: tokens=%d reqs=%d q_len=%d",
+                    num_tokens,
+                    num_reqs,
+                    num_tokens // num_reqs if num_reqs else 0,
+                )
 
             # Set LoRA state before capture so kernels see correct adapters.
             if lora_capture_hook is not None:

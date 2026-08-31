@@ -627,6 +627,11 @@ def choose_scaled_mm_linear_kernel(
 
     Returns:
         _KernelT: Chosen kernel.
+
+    If ``--linear-backend`` filters the list and none of those kernels can
+    implement the layer, selection falls back to the unfiltered platform
+    list so an explicit backend (e.g. b12x on SM121) does not fail startup
+    for a single unsupported scheme.
     """
 
     failure_reason_list = []
@@ -647,15 +652,35 @@ def choose_scaled_mm_linear_kernel(
     platform_kernels = possible_kernels.get(current_platform._enum, [])
 
     # Apply --linear-backend filtering when set.
-    platform_kernels = _resolve_backend_kernels(platform_kernels, "scaled-mm")
+    candidates = _resolve_backend_kernels(platform_kernels, "scaled-mm")
 
-    for kernel in platform_kernels:
-        is_supported_and_can_implement, failure_reason = (
-            is_supported_and_can_implement_kernel(kernel, config, compute_capability)
+    def _pick(kernels: list[type[_KernelT]]) -> type[_KernelT] | None:
+        for kernel in kernels:
+            is_supported_and_can_implement, failure_reason = (
+                is_supported_and_can_implement_kernel(
+                    kernel, config, compute_capability
+                )
+            )
+            if is_supported_and_can_implement:
+                return kernel
+            failure_reason_list.append(failure_reason)
+        return None
+
+    chosen = _pick(candidates)
+    if chosen is not None:
+        return chosen
+
+    if candidates is not platform_kernels:
+        logger.warning_once(
+            "--linear-backend=%s could not implement this scaled-mm "
+            "layer; falling back to normal kernel selection.",
+            _get_linear_backend(),
+            scope="global",
         )
-        if is_supported_and_can_implement:
-            return kernel
-        failure_reason_list.append(failure_reason)
+        leftover = [k for k in platform_kernels if k not in set(candidates)]
+        chosen = _pick(leftover)
+        if chosen is not None:
+            return chosen
 
     raise ValueError(
         "Failed to find a kernel that can implement the "

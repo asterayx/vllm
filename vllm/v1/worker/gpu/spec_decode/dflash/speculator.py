@@ -12,7 +12,9 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.sm12x import sm12x_align_decode_q_len, sm12x_dspark_capture_sizes
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -130,11 +132,39 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             cudagraph_mode = CUDAGraphMode.NONE
 
+        # DSpark sample_from_anchor uses q_len=5. Indexer next_n is k+1=6;
+        # a 5×5=25-token capture dummy IMA'd on SM12x before FlashInfer
+        # could pad. Capture at the decode-aligned width (5→6) and keep
+        # only token counts main capture already ran (36, 24, 6).
+        capture_query_len = sm12x_align_decode_q_len(self.num_query_per_req)
+        if capture_query_len != self.num_query_per_req:
+            logger.info(
+                "SM12x %s capture: decode_query_len %d -> %d",
+                self._speculator_name,
+                self.num_query_per_req,
+                capture_query_len,
+            )
+        vllm_config = self.vllm_config
+        capture_sizes = sm12x_dspark_capture_sizes(
+            vllm_config.compilation_config.cudagraph_capture_sizes,
+            capture_query_len,
+        )
+        orig_sizes = list(vllm_config.compilation_config.cudagraph_capture_sizes or [])
+        if capture_sizes != orig_sizes:
+            logger.info(
+                "SM12x %s capture sizes: %s",
+                self._speculator_name,
+                capture_sizes,
+            )
+            compilation_config = copy.copy(vllm_config.compilation_config)
+            compilation_config.cudagraph_capture_sizes = capture_sizes
+            vllm_config = copy.copy(vllm_config)
+            vllm_config.compilation_config = compilation_config
         self.query_cudagraph_manager = DFlashCudaGraphManager(
-            self.vllm_config,
+            vllm_config,
             self.device,
             cudagraph_mode,
-            decode_query_len=self.num_query_per_req,
+            decode_query_len=capture_query_len,
         )
 
     def capture(self) -> None:
@@ -144,6 +174,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_pos.zero_()
         self.sample_idx_mapping.fill_(-1)
         assert self.query_cudagraph_manager is not None
+        if current_platform.is_device_capability_family(120):
+            torch.cuda.synchronize()
+            logger.info(
+                "SM12x %s capture: pre-dummy CUDA synchronize ok",
+                self._speculator_name,
+            )
         self.query_cudagraph_manager.capture(
             self._generate_draft,
             self.input_buffers,

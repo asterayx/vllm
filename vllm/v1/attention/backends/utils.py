@@ -822,8 +822,12 @@ def split_decodes_and_prefills(
         is_prefill = query_lens > decode_threshold
 
     if not treat_short_extends_as_decodes:
-        assert common_attn_metadata.is_prefilling is not None
-        is_prefill |= common_attn_metadata.is_prefilling
+        # SM12x needs this flag to keep q_len=2 first prefills on the
+        # pad-to-[1, 6] path. Missing (DSpark capture 16:41) means no
+        # extra prefills; do not assert and kill the worker.
+        prefilling = common_attn_metadata.is_prefilling
+        if prefilling is not None:
+            is_prefill |= prefilling
 
     if not torch.any(is_prefill):
         return num_reqs, 0, num_tokens, 0

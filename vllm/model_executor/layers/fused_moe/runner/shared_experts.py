@@ -61,8 +61,14 @@ class SharedExperts(torch.nn.Module):
         # debug purposes.
         # TODO: Remove this after more extensive testings with TP/DP
         # and other execution modes
-        if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM:
-            logger.debug_once("Disabling MoE shared_experts cuda stream")
+        # SM12x: custom GEMMs IMA when shared experts run on aux_stream
+        # during PIECEWISE dummy capture.
+        disable_aux = envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM or (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        )
+        if disable_aux:
+            logger.info_once("Disabling MoE shared_experts cuda stream")
             self._stream = None
         else:
             # TODO(rob): enable shared expert overlap with non-cuda-alike.

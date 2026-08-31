@@ -29,7 +29,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.import_utils import has_cutedsl
+from vllm.models.deepseek_v4.common.cutedsl import use_dsv4_cutedsl
 from vllm.utils.math_utils import next_power_of_2
 
 
@@ -409,7 +409,7 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl():
+    if use_dsv4_cutedsl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,
@@ -459,6 +459,8 @@ def compute_global_topk_indices_and_lens(
         token_to_req_indices,
         block_table,
         block_table.stride(0),
+        block_table.shape[0],
+        block_table.shape[1],
         block_size,
         is_valid_token,
         TRITON_BLOCK_SIZE=1024,
@@ -477,6 +479,8 @@ def _compute_global_topk_indices_and_lens_kernel(
     token_to_req_indices_ptr,
     block_table_ptr,
     block_table_stride: tl.constexpr,
+    num_reqs,
+    num_blocks,
     block_size: tl.constexpr,
     is_valid_token_ptr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -484,6 +488,10 @@ def _compute_global_topk_indices_and_lens_kernel(
     token_idx = tl.program_id(0)
     is_valid_token = tl.load(is_valid_token_ptr + token_idx)
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    # SM12x pads first-prefill q_len=2 to one [1, 6] decode-form launch
+    # (Spark 17:03). Bound both block-table axes so padded/stale
+    # indexer rows cannot IMA past the table.
+    req_ok = (req_idx >= 0) & (req_idx < num_reqs)
 
     count = tl.zeros((), dtype=tl.int32)
     for i in range(0, topk, TRITON_BLOCK_SIZE):
@@ -495,9 +503,14 @@ def _compute_global_topk_indices_and_lens_kernel(
             mask=mask,
             other=-1,
         )
-        is_valid = local_idx >= 0
-
         block_indices = local_idx // block_size
+        is_valid = (
+            (local_idx >= 0)
+            & req_ok
+            & (block_indices >= 0)
+            & (block_indices < num_blocks)
+        )
+
         block_numbers = tl.load(
             block_table_ptr + req_idx * block_table_stride + block_indices,
             mask=mask & is_valid,

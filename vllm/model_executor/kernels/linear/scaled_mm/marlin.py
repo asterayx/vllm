@@ -38,6 +38,14 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     ) -> tuple[bool, str | None]:
         if not current_platform.is_cuda():
             return False, "requires CUDA."
+        if current_platform.is_device_capability_family(120):
+            return (
+                False,
+                (
+                    "Marlin weight-only FP8 is for GPUs without native FP8; "
+                    "SM12x should use Triton or B12X"
+                ),
+            )
         # Check if platform supports FP8 Marlin
         if not is_fp8_marlin_supported():
             return False, "FP8 Marlin requires compute capability 7.5 or higher"
@@ -72,6 +80,11 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
             # Update layer with new values
             replace_parameter(layer, "weight", weight.data)
             replace_parameter(layer, scale_name, weight_scale.data)
+        # DSv4 wo_a is consumed by fp8_einsum and must keep the checkpoint
+        # FP8 block layout. Marlin packing changes (N, K) into a workspace
+        # format and DeepGEMM then asserts m/n/k.
+        if getattr(layer, "is_bmm", False):
+            return
         # Non-block: callers must pass weight in (K, N) layout.
 
         layer.input_scale = None

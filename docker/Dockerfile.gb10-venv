@@ -1,0 +1,85 @@
+# Pack an already-built host venv + this repo. No vLLM compile, no torch download.
+#   VENV=/home/roccen/.venvs/vllm028 ./docker/gb10/pack-venv.sh
+#
+# Host ibverbs/mlx5 is collected by pack-venv.sh into the image.
+# To inject IB into an already-packed image without recopying the venv:
+#   ./docker/gb10/pack-ibverbs.sh
+# To inject official b12x==1.2.6 without recopying the venv:
+#   ./docker/gb10/pack-b12x.sh
+#
+# Optional FlashInfer 0814 overlay (wheel only):
+#   INSTALL_FLASHINFER_NIGHTLY=1 ./docker/gb10/pack-venv.sh
+# Optional official b12x extra (stock --moe-backend b12x, not flashinfer_b12x):
+#   INSTALL_B12X=1 ./docker/gb10/pack-venv.sh
+
+ARG CUDA_VERSION=13.0.1
+ARG UBUNTU_VERSION=24.04
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:${PATH} \
+    PYTHONPATH=/opt/vllm \
+    CUDA_HOME=/usr/local/cuda \
+    TORCH_CUDA_ARCH_LIST=12.1a \
+    FLASHINFER_CUDA_ARCH_LIST=12.1a \
+    VLLM_USE_DEEP_GEMM=0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 \
+        python3.12-venv \
+        python3.12-dev \
+        ca-certificates \
+        curl \
+        libibverbs1 \
+        ibverbs-providers \
+        ibverbs-utils \
+        libmlx5-1 \
+        librdmacm1 \
+        rdma-core \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python
+
+# Host mlx5/verbs overlay (collected by pack-venv.sh) so NCCL_NET=IB
+# matches the Spark driver instead of only Ubuntu's libibverbs1.
+COPY ibverbs /tmp/ibverbs
+COPY install-ibverbs.sh /tmp/install-ibverbs.sh
+RUN chmod +x /tmp/install-ibverbs.sh \
+    && /tmp/install-ibverbs.sh /tmp/ibverbs \
+    && rm -f /tmp/install-ibverbs.sh
+
+COPY venv /opt/venv
+COPY src /opt/vllm
+COPY relocate-venv.sh /tmp/relocate-venv.sh
+COPY install-b12x.sh /tmp/install-b12x.sh
+
+ARG OLD_VENV
+ARG OLD_SRC
+RUN chmod +x /tmp/relocate-venv.sh \
+    && /tmp/relocate-venv.sh /opt/venv /opt/vllm "${OLD_VENV}" "${OLD_SRC}" \
+    && rm /tmp/relocate-venv.sh
+
+ARG INSTALL_FLASHINFER_NIGHTLY=0
+RUN if [ "${INSTALL_FLASHINFER_NIGHTLY}" = "1" ]; then \
+      curl -LsSf https://astral.sh/uv/install.sh | sh \
+      && /root/.local/bin/uv pip install --python /opt/venv/bin/python \
+           -r /opt/vllm/requirements/flashinfer-sm12x-nightly.txt \
+      && /root/.local/bin/uv pip uninstall --python /opt/venv/bin/python \
+           flashinfer-jit-cache || true; \
+    fi
+
+ARG INSTALL_B12X=0
+RUN if [ "${INSTALL_B12X}" = "1" ]; then \
+      if [ ! -x /root/.local/bin/uv ]; then \
+        curl -LsSf https://astral.sh/uv/install.sh | sh; \
+      fi \
+      && export PATH="/root/.local/bin:${PATH}" \
+      && chmod +x /tmp/install-b12x.sh \
+      && /tmp/install-b12x.sh /opt/venv/bin/python; \
+    fi \
+    && rm -f /tmp/install-b12x.sh
+
+WORKDIR /opt/vllm
+ENTRYPOINT ["/opt/vllm/docker/gb10/entrypoint.sh"]
+CMD ["vllm", "--help"]

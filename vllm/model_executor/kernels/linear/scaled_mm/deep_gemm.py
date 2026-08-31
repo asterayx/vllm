@@ -30,6 +30,8 @@ from .BlockScaledMMLinearKernel import (
 
 
 class DeepGemmFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
+    keep_ue8m0_weight_scales = True
+
     def __init__(self, config: FP8ScaledMMLinearLayerConfig):
         super().__init__(config)
         self.use_deep_gemm_e8m0 = is_deep_gemm_e8m0_used()

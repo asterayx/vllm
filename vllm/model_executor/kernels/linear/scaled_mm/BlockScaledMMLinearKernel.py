@@ -10,6 +10,7 @@ from typing_extensions import Self
 
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _upcast_e8m0_to_fp32,
     process_fp8_weight_block_strategy,
 )
 from vllm.model_executor.utils import replace_parameter
@@ -39,12 +40,29 @@ class FP8BlockParams(FP8Params):
         )
 
 
+def upcast_ue8m0_weight_scale_if_needed(
+    layer: torch.nn.Module, scale_attr_name: str
+) -> None:
+    """Cutlass/Triton block FP8 expect float32 scales, not checkpoint UE8M0."""
+    scale = getattr(layer, scale_attr_name, None)
+    if scale is None:
+        return
+    if scale.dtype in (torch.float8_e8m0fnu, torch.uint8):
+        replace_parameter(
+            layer,
+            scale_attr_name,
+            _upcast_e8m0_to_fp32(scale).contiguous(),
+        )
+
+
 class Fp8BlockScaledMMLinearKernel(
     MMLinearKernel[FP8ScaledMMLinearLayerConfig, FP8BlockParams], ABC
 ):
     # Set to False in subclasses that accept BF16 input directly (e.g. FlashInfer)
     # and therefore do not need the input quantization step in apply_weights.
     apply_input_quant: ClassVar[bool] = True
+    # DeepGEMM consumes packed/E8M0 scales; Cutlass/Triton need float32.
+    keep_ue8m0_weight_scales: ClassVar[bool] = False
 
     def __init__(self, config: FP8ScaledMMLinearLayerConfig) -> None:
         super().__init__(config)
@@ -93,6 +111,8 @@ class Fp8BlockScaledMMLinearKernel(
 
         replace_parameter(layer, params.WEIGHT, new_weight.data)
         replace_parameter(layer, scale_attr_name, new_weight_scale.data)
+        if not type(self).keep_ue8m0_weight_scales:
+            upcast_ue8m0_weight_scale_if_needed(layer, scale_attr_name)
 
     def apply_weights(
         self,

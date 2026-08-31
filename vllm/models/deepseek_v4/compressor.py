@@ -16,11 +16,13 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
     compress_norm_rope_store_two_stage_triton,
 )
+from vllm.models.deepseek_v4.common.cutedsl import use_dsv4_cutedsl
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
 from vllm.platforms import current_platform
+from vllm.utils.sm12x import sm12x_treat_short_extends_as_decodes
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -112,9 +114,13 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             self.token_to_req_indices
         )
         num_decode_tokens = None
-        if _prefer_two_stage_compressor():
+        if _prefer_two_stage_compressor() or (
+            current_platform.is_device_capability_family(120)
+        ):
             _, _, num_decode_tokens, _ = split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=1
+                common_attn_metadata,
+                decode_threshold=1,
+                treat_short_extends_as_decodes=sm12x_treat_short_extends_as_decodes(),
             )
         return CompressorMetadata(
             block_table=common_attn_metadata.block_table_tensor.clamp_(min=0),
@@ -197,8 +203,9 @@ class DeepseekCompressor(nn.Module):
     prologue (kv/score split, save_partial_states launch). The
     compress → norm → RoPE → store step is dispatched to a triton kernel
     (``compress_norm_rope_store_triton``) by default, except for the NVIDIA
-    head_dim=128 indexer path which uses the cutedsl kernel
-    (``compress_norm_rope_store_cutedsl``) for better performance.
+    head_dim=512 path which uses CuteDSL
+    (``compress_norm_rope_store_cutedsl``) when ``use_dsv4_cutedsl()``
+    is true. SM12x stays on Triton (cute-to-nvvm ``enable-pyir`` ICE).
     """
 
     def __init__(
@@ -334,6 +341,9 @@ class DeepseekCompressor(nn.Module):
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
+        # Spark 23:42: do not pad C4A writes to 6. FlashInfer already
+        # launches padded first-prefills SWA-only; a 6-token C4A Triton
+        # write IMA'd (reported at compute_global_topk).
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache
@@ -396,17 +406,17 @@ class DeepseekCompressor(nn.Module):
             else None
         )
 
-        # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
-        # does not, so the two callables have different signatures.
+        # CuteDSL (head=512) accepts the full-cache flags; Triton (indexer,
+        # AMD, SM12x) does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        if current_platform.is_cuda() and self.head_dim == 512 and use_dsv4_cutedsl():
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )
 
-            # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
-            # layout and the plain full-cache layout. The full-cache flags
-            # are consumed only here.
+            # head=512 on CUDA uses CuteDSL when the installed cutlass-dsl
+            # compiler matches the Python frontend (Hopper / SM10x).
+            # SM12x cannot JIT cute-to-nvvm (enable-pyir ICE).
             compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
             extra_kwargs: dict[str, Any] = dict(
                 store_full_kv=store_full_kv,
@@ -423,7 +433,7 @@ class DeepseekCompressor(nn.Module):
                 "compress_scratch": self._compress_scratch,
             }
         else:
-            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
+            # Indexer (head=128), SM12x head=512, or non-CUDA (AMD, XPU).
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
 
