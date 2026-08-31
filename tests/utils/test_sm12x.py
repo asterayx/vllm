@@ -14,9 +14,12 @@ from vllm.utils.sm12x import (
     sm12x_align_decode_q_len,
     sm12x_align_prefill_q_len,
     sm12x_align_tokens,
+    sm12x_allow_full_decode_capture,
     sm12x_disable_attn_aux_streams,
     sm12x_dspark_capture_sizes,
     sm12x_extend_prefill_slots,
+    sm12x_flashinfer_decode_tune_sizes,
+    sm12x_kernel_warmup_prefill_len,
     sm12x_mixed_warmup_decode_prompt_len,
     sm12x_mixed_warmup_prefill_len,
     sm12x_pad_prefill_token_rows,
@@ -367,6 +370,45 @@ def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
     assert 18 not in sm12x_dspark_capture_sizes(sizes, aligned)
     assert 12 not in sm12x_dspark_capture_sizes(sizes, aligned)
     assert 25 not in sm12x_dspark_capture_sizes(sizes, aligned)
+    assert sm12x_allow_full_decode_capture(36, aligned) is True
+    assert sm12x_allow_full_decode_capture(24, aligned) is True
+    assert sm12x_allow_full_decode_capture(6, aligned) is True
+    assert sm12x_allow_full_decode_capture(18, aligned) is False
+    assert sm12x_allow_full_decode_capture(12, aligned) is False
+    assert sm12x_flashinfer_decode_tune_sizes(sizes, aligned) == [6, 24, 36]
+    assert sm12x_kernel_warmup_prefill_len(6) == 8
+    from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+    from vllm.v1.worker.gpu.warmup import warmup_kernels
+
+    assert "sm12x_allow_full_decode_capture" in (
+        CudaGraphManager._init_candidates.__code__.co_names
+    )
+    assert "sm12x_kernel_warmup_prefill_len" in (
+        warmup_kernels.__wrapped__.__code__.co_names
+    )
+    from vllm.model_executor.warmup import flashinfer_sparse_mla_warmup as fi_warmup
+
+    assert "_autotune_sm12x_decode_sizes" in (
+        fi_warmup._run_flashinfer_sparse_mla_decode_autotune.__code__.co_names
+    )
+    from contextlib import nullcontext
+
+    seen: list[tuple[int, bool]] = []
+
+    class _Runner:
+        vllm_config = SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                cudagraph_capture_sizes=[1, 2, 4, 8, 16, 24, 32, 36]
+            )
+        )
+        decode_query_len = 6
+
+        def _dummy_run(self, num_tokens: int, **kwargs: object) -> None:
+            seen.append((num_tokens, bool(kwargs.get("uniform_decode"))))
+
+    monkeypatch.setattr(fi_warmup, "flashinfer_autotune", lambda *a, **k: nullcontext())
+    fi_warmup._autotune_sm12x_decode_sizes(_Runner(), "/tmp/x", is_leader=True)
+    assert seen == [(6, True), (24, True), (36, True)]
 
 
 def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
@@ -385,6 +427,9 @@ def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
     assert sm12x_disable_attn_aux_streams() is False
     sizes = [1, 2, 4, 8, 16, 24, 32, 36]
     assert sm12x_dspark_capture_sizes(sizes, 6) == sizes
+    assert sm12x_allow_full_decode_capture(18, 6) is True
+    assert sm12x_flashinfer_decode_tune_sizes(sizes, 6) == []
+    assert sm12x_kernel_warmup_prefill_len(6) == 7
 
 
 def test_sm12x_pad_token_rows(monkeypatch):

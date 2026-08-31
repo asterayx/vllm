@@ -90,6 +90,49 @@ def sm12x_dspark_capture_sizes(
     return allow or sizes
 
 
+def sm12x_allow_full_decode_capture(num_tokens: int, decode_query_len: int) -> bool:
+    """Whether a rounded FULL-decode dummy may be captured on SM12x.
+
+    DSpark ``decode_query_len=6`` rounds 8→12 and 16→18. Those sizes
+    are not in the proven DSpark set. Off SM12x, or when
+    ``decode_query_len<=1``, keep every size.
+    """
+    if decode_query_len <= 1:
+        return True
+    if not current_platform.is_device_capability_family(120):
+        return True
+    return (
+        num_tokens in SM12X_DSPARK_SAFE_CAPTURE_TOKENS
+        and num_tokens % decode_query_len == 0
+    )
+
+
+def sm12x_flashinfer_decode_tune_sizes(
+    capture_sizes: list[int] | None,
+    decode_query_len: int,
+) -> list[int]:
+    """DSpark FULL token counts FlashInfer should autotune on SM12x."""
+    if decode_query_len <= 1:
+        return []
+    if not current_platform.is_device_capability_family(120):
+        return []
+    return sm12x_dspark_capture_sizes(capture_sizes, decode_query_len)
+
+
+def sm12x_kernel_warmup_prefill_len(decode_query_len: int) -> int:
+    """V2 kernel-warmup prefill length.
+
+    Stock uses ``decode_query_len + 1`` so the step is not classified
+    as uniform decode. On SM12x that is 7 for DSpark, which FlashInfer
+    pads to 8. Schedule 8 directly (still ``> decode_query_len``).
+    """
+    prompt_len = decode_query_len + 1
+    if not current_platform.is_device_capability_family(120):
+        return prompt_len
+    aligned = sm12x_align_prefill_q_len(prompt_len)
+    return aligned if aligned > decode_query_len else prompt_len
+
+
 def sm12x_align_decode_q_len(q_len: int) -> int:
     """Snap a FlashInfer *decode dummy* q_len to a GB10-safe width.
 

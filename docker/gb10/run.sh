@@ -85,7 +85,7 @@ docker run -d --name "${NAME}" \
   --max-model-len "${MAX_MODEL_LEN:-524288}" \
   --max-num-seqs "${MAX_NUM_SEQS:-6}" --max-num-batched-tokens 8192 \
   --max-cudagraph-capture-size "${MAX_CUGRAPH:-36}" \
-  --gpu-memory-utilization 0.86 \
+  --gpu-memory-utilization 0.87 \
   --tokenizer-mode deepseek_v4 \
   --tool-call-parser deepseek_v4 \
   --enable-auto-tool-choice \
