@@ -61,6 +61,7 @@ docker run -d --name "${NAME}" \
   -e TRANSFORMERS_OFFLINE=1 \
   -e PYTHONPATH=/opt/vllm \
   -e VLLM_HOST_IP="${VLLM_HOST_IP}" \
+  -e VLLM_LOGGING_COLOR=1 \
   -e VLLM_USE_DEEP_GEMM=0 \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
   -e TORCH_CUDA_ARCH_LIST=12.1a \
