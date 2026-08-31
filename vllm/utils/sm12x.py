@@ -4,6 +4,7 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import Literal
 
 import torch
 
@@ -170,10 +171,10 @@ def sm12x_should_fill_prefill_slots(
 ) -> bool:
     """Whether to write extra first-prefill SWA KV slots for a [1, 6] pad.
 
-    Eager all-prefill only. Spark 18:13: compressor ran this on a
+    Eager all-prefill only. The compressor must not run this on a
     tokens=4 decode dummy during PIECEWISE capture; ``bool(torch.all)``
-    then host-synced and aborted the graph. C4A writes stay at the
-    real token count — see ``sm12x_should_fill_compressed_prefill_slots``.
+    host-syncs and aborts the graph. C4A writes stay at the real token
+    count — see ``sm12x_should_fill_compressed_prefill_slots``.
     """
     if num_tokens not in (2, 4, 5):
         return False
@@ -189,15 +190,23 @@ def sm12x_should_fill_compressed_prefill_slots(
 ) -> bool:
     """Do not pad C4A writes to the SWA [1, 6] width.
 
-    Spark 17:03 / 23:42: a 6-token C4A Triton write, then unused
-    ``compute_global_topk`` on a 2-token indexer, IMA'd after the
-    FlashInfer launch already dropped extra cache. Keep SWA insert.
+    A 6-token C4A Triton write plus unused ``compute_global_topk`` on a
+    2-token indexer IMA'd after FlashInfer already dropped extra cache.
+    Keep SWA insert. C4A stays off only when ``is_prefill`` and
+    ``launch_len != q_len``; long prefills and DSpark decode ``5→6``
+    keep C4A.
     """
     return False
 
 
 def sm12x_skip_padded_prefill_c4a(query_lens: list[int]) -> bool:
-    """True when every prefill span will launch SWA-only [1, 6]."""
+    """True when every prefill span will launch SWA-only [1, 6].
+
+    C4A is dropped iff ``is_prefill and launch_len != q_len``. Do not
+    restore C4A on that padded first-prefill path (extra-sparse and
+    ``compute_global_topk`` IMA'd). Long prefills and DSpark decode
+    ``5→6`` keep C4A.
+    """
     if not query_lens or not current_platform.is_device_capability_family(120):
         return False
     for q_len in query_lens:
@@ -208,21 +217,29 @@ def sm12x_skip_padded_prefill_c4a(query_lens: list[int]) -> bool:
     return True
 
 
-def sm12x_replace_swa_index_sentinels(
+def sm12x_replace_negative_indices(
     indices: torch.Tensor | None,
+    *,
+    mode: Literal["repeat_last", "fill0"] = "repeat_last",
 ) -> torch.Tensor | None:
-    """Replace SWA ``-1`` gather sentinels with the last valid slot per row.
+    """Replace ``-1`` gather sentinels for SM12x kernels.
 
     FlashInfer SM120 decode cubins gather the full top-k width first.
     A 2-token first-prefill has ``swa_len`` 1–2, so most of a 128-wide
-    row is ``-1``. Those addresses IMA. Repeat the last non-negative
-    slot; ``swa_topk_lens`` still masks softmax. Capture-safe: no
-    ``.item()`` / ``bool(tensor)``.
+    SWA row is ``-1``. Those addresses IMA. ``VLLM_MOE_SKIP_PADDING``
+    writes the same sentinel on alignment rows; b12x SiLU gathers it.
+
+    ``repeat_last`` (SWA): last valid index per row; all-``-1`` rows
+    become 0. ``swa_topk_lens`` still masks softmax.
+    ``fill0`` (MoE): every ``-1`` becomes expert 0. Callers zero those
+    weights. Capture-safe: no ``.item()`` / ``bool(tensor)``.
     """
     if indices is None or indices.numel() == 0:
         return indices
     if not current_platform.is_device_capability_family(120):
         return indices
+    if mode == "fill0":
+        return indices.clamp(min=0)
     width = indices.shape[-1]
     if width == 0:
         return indices
@@ -236,29 +253,31 @@ def sm12x_replace_swa_index_sentinels(
     return filled.reshape(indices.shape)
 
 
+def sm12x_replace_swa_index_sentinels(
+    indices: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Replace SWA ``-1`` tails with the last valid slot per row."""
+    return sm12x_replace_negative_indices(indices, mode="repeat_last")
+
+
 def sm12x_extend_prefill_slots(
     slot_mapping: torch.Tensor, target: int, block_size: int
 ) -> torch.Tensor:
     """Grow first-prefill slots to the decode-form pad width.
 
-    Spark 17:58: pad q_len=2 -> [1, 6] then IMA. The decode kernel
-    indexes ``q_len`` KV rows, but insert only wrote 2. Extra slots stay
-    in the same block; if that would cross a block, reuse the last slot.
+    Extra query rows repeat the last real token. Extra KV slots reuse
+    that last slot so chunked prefill cannot occupy a later token's
+    address. ``block_size`` is unused but kept for callers.
 
     Capture-safe: no ``.item()`` / ``bool(tensor)`` host sync.
     """
+    del block_size
     n = slot_mapping.shape[0]
-    if n <= 0 or n >= target or block_size <= 0:
+    if n <= 0 or n >= target:
         return slot_mapping
     extra = target - n
-    base = slot_mapping[0]
-    ext = base + torch.arange(
-        n, target, device=slot_mapping.device, dtype=slot_mapping.dtype
-    )
-    same_block = (ext // block_size) == (base // block_size)
     reuse = slot_mapping[-1].expand(extra)
-    extra_slots = torch.where(same_block, ext, reuse)
-    return torch.cat((slot_mapping, extra_slots), dim=0)
+    return torch.cat((slot_mapping, reuse), dim=0)
 
 
 def sm12x_pad_prefill_token_rows(t: torch.Tensor, target: int) -> torch.Tensor:
@@ -296,7 +315,7 @@ def sm12x_pad_token_rows(
             orig,
             target,
         )
-    return pad_token_rows(t, target), orig
+    return sm12x_pad_prefill_token_rows(t, target), orig
 
 
 def sm12x_replace_moe_topk_sentinels(
@@ -307,16 +326,17 @@ def sm12x_replace_moe_topk_sentinels(
 
     ``VLLM_MOE_SKIP_PADDING`` writes ``topk_ids=-1`` on SM12x alignment
     rows. FlashInfer SWA can mask those; b12x ``MoEDynamicKernelSilu``
-    gathers the expert id and IMA'd (Spark 01:12 coredump, SM 10 warp
-    0). Capture dummies mark every row padding, so all ids are ``-1``
-    and the kernel no-ops. Mixed-warmup has 2 real rows plus 14
-    ``-1``s. Map sentinels to expert 0 and zero their weights.
-    Capture-safe: no ``.item()`` / ``bool(tensor)``.
+    gathers the expert id. Capture dummies mark every row padding, so
+    all ids are ``-1`` and the kernel no-ops. Mixed-warmup has 2 real
+    rows plus 14 ``-1``s. Map sentinels to expert 0 and zero their
+    weights. Capture-safe: no ``.item()`` / ``bool(tensor)``.
     """
     if not current_platform.is_device_capability_family(120):
         return topk_ids, topk_weights
     invalid = topk_ids < 0
-    return topk_ids.clamp(min=0), topk_weights.masked_fill(invalid, 0)
+    filled = sm12x_replace_negative_indices(topk_ids, mode="fill0")
+    assert filled is not None
+    return filled, topk_weights.masked_fill(invalid, 0)
 
 
 def extend_padding_mask(

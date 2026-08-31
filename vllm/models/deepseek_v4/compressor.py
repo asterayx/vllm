@@ -341,9 +341,9 @@ class DeepseekCompressor(nn.Module):
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
-        # Spark 23:42: do not pad C4A writes to 6. FlashInfer already
-        # launches padded first-prefills SWA-only; a 6-token C4A Triton
-        # write IMA'd (reported at compute_global_topk).
+        # Do not pad C4A writes to 6. FlashInfer already launches padded
+        # first-prefills SWA-only; a 6-token C4A Triton write IMA'd
+        # (reported at compute_global_topk).
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache

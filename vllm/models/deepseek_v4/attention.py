@@ -635,9 +635,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         cache_dtype = swa_kv_cache.dtype
         orig_tokens = q.shape[0]
         slot_mapping = swa_metadata.slot_mapping
-        # Spark 17:58: first-prefill insert wrote 2 KV rows, then
-        # FlashInfer launched [1, 6] and IMA'd. Fill the pad slots.
-        # Spark 18:13: do not host-sync this during CUDA-graph capture.
+        # First-prefill insert wrote 2 KV rows, then FlashInfer launched
+        # [1, 6] and IMA'd. Fill the pad slots by repeating the last
+        # real slot. Do not host-sync this during CUDA-graph capture.
         if (
             orig_tokens == slot_mapping.shape[0]
             and swa_metadata.num_prefills > 0

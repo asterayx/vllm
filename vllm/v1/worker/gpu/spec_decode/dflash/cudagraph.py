@@ -29,7 +29,7 @@ def _sync_after_eager_dspark_dummy(warmup: bool) -> None:
     """Flush pending IMA after eager DSpark warmup only.
 
     ``torch.cuda.synchronize`` inside ``torch.cuda.graph`` raises
-    ``cudaErrorStreamCaptureUnsupported`` (Spark 16:53, progress 0/3).
+    ``cudaErrorStreamCaptureUnsupported`` (DSpark progress 0/3).
     """
     if warmup and current_platform.is_device_capability_family(120):
         torch.cuda.synchronize()

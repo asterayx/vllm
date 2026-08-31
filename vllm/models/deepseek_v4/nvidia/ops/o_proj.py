@@ -61,9 +61,9 @@ def deep_gemm_fp8_o_proj(
     Shared by the FlashMLA and FlashInfer CUDA backends. ``einsum_recipe`` /
     ``tma_aligned_scales`` come from ``compute_fp8_einsum_recipe``.
 
-    Spark 23:54: mixed-warmup seed launched SWA-only ``[1, 6]`` then
-    IMA'd at ``wo_b`` all_reduce. MHC/MoE already pad ``<16`` tokens;
-    o_proj did not.
+    Mixed-warmup seed launched SWA-only ``[1, 6]`` then IMA'd at
+    ``wo_b`` all_reduce. MHC/MoE already pad ``<16`` tokens; o_proj
+    did not.
     """
     o, orig_tokens = sm12x_pad_token_rows(o, what="o_proj")
     if o.shape[0] != orig_tokens:

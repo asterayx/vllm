@@ -840,22 +840,22 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
         A padded first-prefill still has only ``q_len`` real indexer
         rows. Repeating those C4A extra-sparse slots into a live extra
-        cache IMA'd on Spark (22:57, reported at MoE all_reduce). Drop
-        C4A for that launch and keep the SWA ``[1, 6]`` pad. Decode
-        pads such as DSpark ``5→6`` keep C4A — those captured clean.
+        cache IMA'd (reported at MoE all_reduce). Drop C4A iff
+        ``is_prefill and launch_len != q_len`` and keep the SWA
+        ``[1, 6]`` pad. Long prefills and DSpark decode ``5→6`` keep
+        C4A.
         """
         q_len = token_end - token_start
         align = sm12x_align_prefill_q_len if is_prefill else sm12x_align_decode_q_len
         launch_len = align(q_len)
-        # Spark 22:57: insert filled 6 SWA slots and FlashInfer launched
-        # [1, 6], then IMA'd on the C4A extra path (2-token topk padded
-        # by repeating the last row). SWA-only for padded prefills.
+        # Insert filled 6 SWA slots and FlashInfer launched [1, 6], then
+        # IMA'd on the C4A extra path (2-token topk padded by repeating
+        # the last row). SWA-only for padded first-prefills.
         if is_prefill and launch_len != q_len:
             extra_cache = None
             extra_sparse_indices = None
             extra_sparse_lengths = None
-            log = logger.info if q_len == 2 else logger.info_once
-            log(
+            logger.info_once(
                 "SM12x FlashInfer: padded prefill launch is SWA-only "
                 "(drop C4A extra cache) q_len=%d -> %d",
                 q_len,
@@ -864,8 +864,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         query = _batch_token_span(q, token_start, token_end, launch_len)
         reject_sm12x_unsafe_decode_query(query)
         if launch_len != q_len:
-            log = logger.info if q_len == 2 else logger.info_once
-            log(
+            logger.info_once(
                 "SM12x FlashInfer: one decode-form launch padding %s "
                 "q_len=%d -> %d query.shape=%s",
                 "prefill" if is_prefill else "decode",
@@ -1158,7 +1157,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             if q_chunk.shape[0] <= 64:
                 # SM120's sparse prefill kernel asserts num_tokens > 64.
                 # Small segments use one padded decode-form [1, q_len, ...]
-                # call. Spark 17:03: padding prefill q_len=2 -> 6
+                # call. Pad prefill q_len=2 -> 6,
                 # query.shape=(1, 6, 32, 512). Do not snap 2→4.
                 for ri in range(chunk_start, chunk_end):
                     rs = int(query_start_loc_cpu[num_decodes + ri] - prefill_token_base)

@@ -469,7 +469,7 @@ def test_forward_decode_q_len_2_is_one_padded_launch(monkeypatch):
 
 
 def test_forward_prefill_q_len_2_is_one_padded_launch(monkeypatch):
-    """Spark 17:03: mixed-warmup seed is one [1, 6], never [1, 4] or 65."""
+    """Mixed-warmup seed is one [1, 6], never [1, 4] or 65."""
     from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
     from vllm.utils import sm12x as sm12x_utils
 
