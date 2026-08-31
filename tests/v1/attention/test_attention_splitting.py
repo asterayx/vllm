@@ -296,6 +296,39 @@ def test_split_decodes_and_prefills_uniform_mixed_batch_non_uniform_decodes():
     assert num_prefill_tokens == (sum(query_lens) - 2)  # rest of the tokens
 
 
+def test_split_decodes_and_prefills_padded_batch_unpadded_is_prefilling():
+    """FULL-CG pads 2 DSpark reqs to 4; is_prefilling stays [num_actual].
+
+    Reproduces the SM12x / DSpark crash:
+    ``The size of tensor a (4) must match the size of tensor b (2)``
+    at ``is_prefill |= prefilling``.
+    """
+    query_lens = [6, 6, 0, 0]
+    num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+        apply_split_decodes_and_prefills(
+            query_lens,
+            decode_threshold=6,
+            require_uniform=False,
+            is_prefilling=[False, True],
+            treat_short_extends_as_decodes=False,
+        )
+    )
+    assert num_decodes == 1
+    assert num_prefills == 3
+    assert num_decode_tokens == 6
+    assert num_prefill_tokens == 6
+
+
+def test_align_per_req_tensor_pads_and_slices():
+    from vllm.v1.attention.backends.utils import align_per_req_tensor
+
+    short = torch.tensor([True, False])
+    padded = align_per_req_tensor(short, 4)
+    assert padded.tolist() == [True, False, False, False]
+    assert align_per_req_tensor(padded, 2).tolist() == [True, False]
+    assert align_per_req_tensor(short, 2) is short
+
+
 def test_split_decodes_and_prefills_uniform_padded_batch_all_same():
     """uniform batch where all query lengths are identical with 0 length padded reqs."""
     # All query lengths are 2, with decode_threshold=3 (so 2 <= 3)
