@@ -1,7 +1,8 @@
-# Paste this rule ABOVE your existing /telemetry and / rules
-# in ~/.cloudflared/config.yml, then:
+# Paste this rule ABOVE the catch-all `/` rule in
+# ~/.cloudflared/config.yml, then:
 #   sudo systemctl restart cloudflared
 #   # or: cloudflared tunnel run
+# Remove any leftover /telemetry ingress — /dash replaces it.
 - hostname: token.asterayx.com
   path: /dash(/.*)?
   service: http://127.0.0.1:3000

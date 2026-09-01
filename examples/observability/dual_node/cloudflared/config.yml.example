@@ -2,7 +2,7 @@
 # /dash MUST be listed before the catch-all `/` rule.
 #
 # Fill TUNNEL_ID from: cloudflared tunnel list
-# Keep the existing service: URLs for /telemetry and / — only add /dash.
+# Grafana is the only observability path. Do not add /telemetry.
 #
 # Hostname is token.asterayx.com (you also wrote asteryax.com; it must
 # match the Cloudflare DNS CNAME for this tunnel).
@@ -20,11 +20,7 @@ ingress:
       httpHostHeader: token.asterayx.com
       disableChunkedEncoding: true
 
-  # Existing public routes — replace service: with whatever already works.
-  - hostname: token.asterayx.com
-    path: /telemetry(/.*)?
-    service: http://127.0.0.1:REPLACE_TELEMETRY_PORT
-
+  # Optional catch-all for whatever else you already publish on `/`.
   - hostname: token.asterayx.com
     service: http://127.0.0.1:REPLACE_ROOT_PORT
 

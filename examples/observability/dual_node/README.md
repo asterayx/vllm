@@ -73,8 +73,8 @@ Serving board instead (All by default).
 ## Cloudflare Tunnel (`/dash`)
 
 On the head (`192.168.100.10`), publish Grafana at
-`https://token.asterayx.com/dash` without touching the existing
-`/telemetry` and `/` routes.
+`https://token.asterayx.com/dash`. This is the only observability
+path; do not keep a `/telemetry` ingress.
 
 1. Add these lines to `config.env` (hostname must match DNS; if the
    live name is `token.asteryax.com`, use that everywhere):
@@ -91,8 +91,9 @@ On the head (`192.168.100.10`), publish Grafana at
    ./deploy.sh up
    ```
 
-3. Insert the `/dash` ingress rule **above** `/telemetry` and `/` in
-   `~/.cloudflared/config.yml`. Copy
+3. Insert the `/dash` ingress rule **above** the catch-all `/` in
+   `~/.cloudflared/config.yml`, and delete any leftover `/telemetry`
+   rule. Copy
    [`cloudflared/dash-ingress.yml`](cloudflared/dash-ingress.yml).
    A full template is
    [`cloudflared/config.yml.example`](cloudflared/config.yml.example).
