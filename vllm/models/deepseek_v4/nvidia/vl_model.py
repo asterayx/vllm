@@ -15,8 +15,9 @@ Thin multimodal wrapper around the text-only ``DeepseekV4ForCausalLM``:
   its hyper-connection stream expansion. Raw ``input_ids`` still flow into
   the model so the MoE router can apply ``bias_vl`` to image tokens
   (``requires_raw_input_tokens``).
-- Image sentinels are in-vocab reserved ids, so DSpark can stay enabled;
-  ``lm_head`` and ``get_mtp_target_hidden_states`` proxy the text backbone.
+- Image sentinels are in-vocab reserved ids, so DSpark can stay enabled.
+  ``SupportsEagle3``, ``lm_head``, and ``get_mtp_target_hidden_states``
+  proxy the text backbone (``get_language_model`` via ``_mark_language_model``).
 """
 
 from collections.abc import Iterable
@@ -26,6 +27,7 @@ from torch import nn
 
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsMultiModal,
     SupportsPP,
 )
@@ -84,7 +86,9 @@ def _make_deepseek_v4_vl_weights_mapper(
     info=DeepseekV4VLProcessingInfo,
     dummy_inputs=DeepseekV4VLDummyInputsBuilder,
 )
-class DeepseekV4ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
+class DeepseekV4ForConditionalGeneration(
+    nn.Module, SupportsMultiModal, SupportsPP, SupportsEagle3
+):
     """Multimodal entry point for DeepSeek-V4 checkpoints with a vision tower."""
 
     # The MoE router needs raw token ids to detect image sentinel tokens

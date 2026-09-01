@@ -3,9 +3,16 @@
 
 import pytest
 
+from vllm.model_executor.models.interfaces import SupportsEagle3
 from vllm.models.deepseek_v4.nvidia.vl_model import (
+    DeepseekV4ForConditionalGeneration,
     _make_deepseek_v4_vl_weights_mapper,
 )
+
+
+def test_vl_wrapper_supports_eagle3_for_dspark():
+    """DSpark calls set_eagle3_aux_hidden_state_layers on the target."""
+    assert issubclass(DeepseekV4ForConditionalGeneration, SupportsEagle3)
 
 
 @pytest.mark.parametrize("expert_dtype", ["fp4", "fp8"])
