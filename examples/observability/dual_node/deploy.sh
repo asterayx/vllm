@@ -275,7 +275,17 @@ EOF
     warn "Official dashboards not found at $OFFICIAL_DASHBOARDS"
   fi
   cp -f "$ROOT/grafana/roce.json" "$ROOT/generated/dashboards/roce.json"
-  log "Wrote generated/prometheus.yml and generated/dashboards/"
+  # Compose interpolates ${VAR} from .env / the shell, not from config.env.
+  cat >"$ROOT/.env" <<EOF
+GRAFANA_BIND=${GRAFANA_BIND}
+GRAFANA_PASSWORD=${GRAFANA_PASSWORD}
+GRAFANA_DOMAIN=${GRAFANA_DOMAIN}
+GRAFANA_ROOT_URL=${GRAFANA_ROOT_URL}
+GRAFANA_SERVE_FROM_SUB_PATH=${GRAFANA_SERVE_FROM_SUB_PATH}
+GRAFANA_COOKIE_SECURE=${GRAFANA_COOKIE_SECURE}
+PROMETHEUS_LISTEN=${PROMETHEUS_LISTEN}
+EOF
+  log "Wrote generated/prometheus.yml, generated/dashboards/, and .env"
 }
 
 cmd_up() {
@@ -294,6 +304,15 @@ cmd_up() {
     fi
     sleep 1
   done
+  if curl -fsS --max-time 3 "http://${GRAFANA_BIND}:3000/dash/api/health" 2>/dev/null \
+    | grep -q database; then
+    log "Grafana is serving /dash (health ok)"
+  else
+    warn "Grafana /dash/api/health is not JSON. Container env:"
+    docker inspect vllm-grafana --format '{{range .Config.Env}}{{println .}}{{end}}' \
+      | grep '^GF_SERVER_' || true
+    warn "If GF_SERVER_SERVE_FROM_SUB_PATH is missing, merge the latest dual_node compose file."
+  fi
   cmd_status
 }
 
