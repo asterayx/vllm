@@ -78,7 +78,7 @@ load_config() {
   : "${GRAFANA_ROOT_URL:=http://${GRAFANA_BIND}:3000/}"
   : "${GRAFANA_SERVE_FROM_SUB_PATH:=false}"
   : "${GRAFANA_COOKIE_SECURE:=true}"
-  : "${PROMETHEUS_LISTEN:=127.0.0.1:9090}"
+  : "${PROMETHEUS_LISTEN:=127.0.0.1:9091}"
   : "${VLLM_METRICS_TARGET:=127.0.0.1:30001}"
   : "${NODE_EXPORTER_LISTEN:=127.0.0.1:9100}"
   : "${SPARK1_LABEL:=spark-1}"
@@ -230,7 +230,7 @@ _check_node_exporter_metrics() {
 
 cmd_generate() {
   load_config
-  mkdir -p "$ROOT/generated/dashboards"
+  mkdir -p "$ROOT/generated/dashboards" "$ROOT/generated/datasources"
 
   local spark2_block=""
   if [[ -n "${SPARK2_NODE_EXPORTER}" ]]; then
@@ -274,6 +274,20 @@ EOF
   else
     warn "Official dashboards not found at $OFFICIAL_DASHBOARDS"
   fi
+  cat >"$ROOT/generated/datasources/datasource.yaml" <<EOF
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://${PROMETHEUS_LISTEN}
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 2s
+EOF
   cp -f "$ROOT/grafana/roce.json" "$ROOT/generated/dashboards/roce.json"
   # Compose interpolates ${VAR} from .env / the shell, not from config.env.
   cat >"$ROOT/.env" <<EOF
@@ -294,7 +308,7 @@ cmd_up() {
   export GRAFANA_BIND GRAFANA_PASSWORD GRAFANA_DOMAIN GRAFANA_ROOT_URL
   export GRAFANA_SERVE_FROM_SUB_PATH GRAFANA_COOKIE_SECURE PROMETHEUS_LISTEN
   log "Grafana root_url=${GRAFANA_ROOT_URL} sub_path=${GRAFANA_SERVE_FROM_SUB_PATH}"
-  compose up -d --force-recreate grafana
+  compose up -d --force-recreate prometheus grafana
   log "Waiting for Grafana..."
   local i
   for i in $(seq 1 30); do

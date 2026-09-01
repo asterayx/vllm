@@ -33,7 +33,8 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "false"
       GF_PATHS_PROVISIONING: /etc/grafana/provisioning
     volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./generated/datasources:/etc/grafana/provisioning/datasources:ro
       - ./generated/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
 
