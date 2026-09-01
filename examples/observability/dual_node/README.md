@@ -130,3 +130,7 @@ export NCCL_IB_DISABLE=0
   twin balance, not the time average.
 - Bind Grafana / `node_exporter` to Wi-Fi, not `0.0.0.0`, on a box that also
   has `tun0`.
+- `node_exporter` must run as root on Spark. `User=nobody` cannot read some
+  ConnectX sysfs counters, so `node_infiniband_*` stays empty. Re-run
+  `./deploy.sh install-node-exporter` or `sudo systemctl restart node_exporter`
+  after updating the unit.

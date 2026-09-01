@@ -149,6 +149,8 @@ cmd_install_node_exporter() {
     "$tmp/node_exporter-${NODE_EXPORTER_VERSION}.linux-${arch}/node_exporter" \
     /usr/local/bin/node_exporter
 
+  # Run as root: User=nobody cannot read some ConnectX /sys/class/infiniband
+  # counters on DGX Spark, so node_infiniband_* never appears.
   sudo tee /etc/systemd/system/node_exporter.service >/dev/null <<UNIT
 [Unit]
 Description=Prometheus Node Exporter
@@ -156,8 +158,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=nobody
-Group=nogroup
+Type=simple
 ExecStart=/usr/local/bin/node_exporter \\
   --web.listen-address=${NODE_EXPORTER_LISTEN} \\
   --collector.infiniband \\
@@ -171,14 +172,35 @@ UNIT
 
   sudo systemctl daemon-reload
   sudo systemctl enable --now node_exporter
-  sleep 1
-  if curl -fsS --max-time 2 "http://${NODE_EXPORTER_LISTEN}/metrics" | grep -q node_infiniband; then
-    log "node_exporter is up at ${NODE_EXPORTER_LISTEN} and exporting InfiniBand metrics"
-  elif curl -fsS --max-time 2 "http://${NODE_EXPORTER_LISTEN}/metrics" >/dev/null; then
-    warn "node_exporter is up but no node_infiniband_* metrics yet"
-  else
+  sudo systemctl restart node_exporter
+  sleep 2
+  _check_node_exporter_metrics
+}
+
+_check_node_exporter_metrics() {
+  local metrics
+  metrics="$(mktemp)"
+  # Do not pipe curl to grep -q: grep closes the pipe early, curl exits 23,
+  # and with pipefail the script reports a false "no InfiniBand metrics".
+  if ! curl -fsS --max-time 5 "http://${NODE_EXPORTER_LISTEN}/metrics" -o "$metrics"; then
+    rm -f "$metrics"
     die "node_exporter did not start on ${NODE_EXPORTER_LISTEN}"
   fi
+  if grep -q '^node_infiniband_' "$metrics"; then
+    log "node_exporter is up at ${NODE_EXPORTER_LISTEN} and exporting InfiniBand metrics"
+    grep -E '^node_infiniband_(info|port_data_transmitted_bytes_total|rate_bytes_per_second)' \
+      "$metrics" | head -n 8 || true
+    rm -f "$metrics"
+    return 0
+  fi
+  warn "node_exporter is up but no node_infiniband_* metrics yet"
+  if [[ ! -d /sys/class/infiniband ]]; then
+    warn "/sys/class/infiniband is missing (rdma-core / mlx5 not loaded?)"
+  else
+    log "host IB devices:"
+    ls -1 /sys/class/infiniband || true
+  fi
+  rm -f "$metrics"
 }
 
 cmd_generate() {
