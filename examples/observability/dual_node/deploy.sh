@@ -48,6 +48,18 @@ compose() {
   fi
 }
 
+# Chat UIs often paste [https://x](https://x). Grafana needs a raw URL.
+_strip_md_url() {
+  local v="$1"
+  if [[ "$v" =~ ^\[(https?://[^]]+)\]\([^)]+\)$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  elif [[ "$v" =~ ^\<(https?://[^>]+)\>$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  else
+    printf '%s' "$v"
+  fi
+}
+
 load_config() {
   if [[ ! -f "$ROOT/config.env" ]]; then
     die "config.env not found. Run: ./deploy.sh init"
@@ -70,6 +82,11 @@ load_config() {
   : "${SPARK2_LABEL:=spark-2}"
   : "${SPARK2_NODE_EXPORTER:=}"
   : "${ROCE_DEVICE_REGEX:=rocep1s0f1|roceP2p1s0f1}"
+  GRAFANA_ROOT_URL="$(_strip_md_url "$GRAFANA_ROOT_URL")"
+  GRAFANA_DOMAIN="$(_strip_md_url "$GRAFANA_DOMAIN")"
+  if [[ "${GRAFANA_ROOT_URL}" != http://* && "${GRAFANA_ROOT_URL}" != https://* ]]; then
+    die "GRAFANA_ROOT_URL must be a raw URL, got: ${GRAFANA_ROOT_URL}"
+  fi
 }
 
 cmd_init() {
@@ -262,6 +279,7 @@ cmd_up() {
   cmd_generate
   export GRAFANA_BIND GRAFANA_PASSWORD GRAFANA_DOMAIN GRAFANA_ROOT_URL
   export GRAFANA_SERVE_FROM_SUB_PATH GRAFANA_COOKIE_SECURE PROMETHEUS_LISTEN
+  log "Grafana root_url=${GRAFANA_ROOT_URL} sub_path=${GRAFANA_SERVE_FROM_SUB_PATH}"
   compose up -d --force-recreate grafana
   log "Waiting for Grafana..."
   local i
@@ -283,6 +301,9 @@ cmd_status() {
   load_config
   local prom_host="${PROMETHEUS_LISTEN}"
   log "Grafana:     http://${GRAFANA_BIND}:3000   (admin / ${GRAFANA_PASSWORD})"
+  if [[ -n "${GRAFANA_ROOT_URL}" ]]; then
+    log "Public URL:  ${GRAFANA_ROOT_URL}"
+  fi
   log "Prometheus:  http://${prom_host}"
   log "Dashboards:  folder 'vLLM' → Performance Statistics, Query Statistics, RoCE / Dual Spark"
   if curl -fsS --max-time 2 "http://${prom_host}/api/v1/targets" >/dev/null 2>&1; then
