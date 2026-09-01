@@ -1345,6 +1345,11 @@ class SpeculativeConfig:
                     self.draft_model_config.hf_config.architectures = [
                         "DSparkDraftModel"
                     ]
+                    # hf_config_override stamped n_predict from
+                    # num_nextn_predict_layers (0731=1, Vision-Exp=3). That
+                    # value is the MTP reuse stride, not DSpark k. Leaving
+                    # it set rejects the proven Spark k=5 (5 % 3 != 0).
+                    self.draft_model_config.hf_config.n_predict = None
                     self.draft_model_config.quantization = (
                         self.target_model_config.quantization
                     )
@@ -1385,10 +1390,12 @@ class SpeculativeConfig:
                         # Default to max value defined in draft model config.
                         self.num_speculative_tokens = n_predict
                     elif (
-                        self.num_speculative_tokens > n_predict
+                        self.method != "dspark"
+                        and self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0
                     ):
-                        # Ensure divisibility for MTP module reuse.
+                        # MTP can draft k>n_predict only in multiples of
+                        # n_predict. DSpark drafts k tokens in one pass.
                         raise ValueError(
                             f"num_speculative_tokens:{self.num_speculative_tokens}"
                             f" must be divisible by {n_predict=}"
