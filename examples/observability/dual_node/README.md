@@ -62,6 +62,40 @@ Or, after `config.env` is filled:
 Open `http://<GRAFANA_BIND>:3000` (default user/password `admin` / `admin`).
 Dashboards are in folder **vLLM**. Set refresh to 2s on the RoCE board.
 
+## Cloudflare Tunnel (`/dash`)
+
+On the head (`192.168.100.10`), publish Grafana at
+`https://token.asterayx.com/dash` without touching the existing
+`/telemetry` and `/` routes.
+
+1. Add these lines to `config.env` (hostname must match DNS; if the
+   live name is `token.asteryax.com`, use that everywhere):
+
+   ```bash
+   GRAFANA_DOMAIN=token.asterayx.com
+   GRAFANA_ROOT_URL=https://token.asterayx.com/dash/
+   GRAFANA_SERVE_FROM_SUB_PATH=true
+   ```
+
+2. Recreate Grafana so it serves under `/dash`:
+
+   ```bash
+   ./deploy.sh up
+   ```
+
+3. Insert the `/dash` ingress rule **above** `/telemetry` and `/` in
+   `~/.cloudflared/config.yml`. Copy
+   [`cloudflared/dash-ingress.yml`](cloudflared/dash-ingress.yml).
+   A full template is
+   [`cloudflared/config.yml.example`](cloudflared/config.yml.example).
+
+4. Restart the tunnel (`sudo systemctl restart cloudflared` or
+   `cloudflared tunnel run`).
+
+Grafana origin is `http://192.168.8.134:3000` (Wi-Fi bind). Login at
+`https://token.asterayx.com/dash` with `admin` / `admin`. Change that
+password; this URL is on the public internet.
+
 ## Spark-2 / worker
 
 Do **not** start Prometheus or Grafana on the worker. Only `node_exporter`:
