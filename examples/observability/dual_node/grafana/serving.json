@@ -1063,7 +1063,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Prompt (input) vs generation (output) tokens per second.",
+      "description": "Prompt on the left axis, generation on the right. Prefill bursts are much larger than decode tok/s.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1074,11 +1074,30 @@
             "fillOpacity": 12,
             "lineWidth": 1,
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": true,
+            "axisLabel": "prompt tok/s",
+            "axisPlacement": "left"
           },
           "unit": "ops"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "gen tok/s"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "gen tok/s"
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,

@@ -101,23 +101,29 @@ def timeseries(
     h: int,
     targets: list,
     unit: str,
+    overrides: list | None = None,
+    axis_label: str | None = None,
 ) -> dict:
+    custom: dict = {
+        "drawStyle": "line",
+        "fillOpacity": 12,
+        "lineWidth": 1,
+        "showPoints": "never",
+        "spanNulls": True,
+    }
+    if axis_label:
+        custom["axisLabel"] = axis_label
+        custom["axisPlacement"] = "left"
     return {
         "datasource": DS,
         "description": desc,
         "fieldConfig": {
             "defaults": {
                 "color": {"mode": "palette-classic"},
-                "custom": {
-                    "drawStyle": "line",
-                    "fillOpacity": 12,
-                    "lineWidth": 1,
-                    "showPoints": "never",
-                    "spanNulls": True,
-                },
+                "custom": custom,
                 "unit": unit,
             },
-            "overrides": [],
+            "overrides": overrides or [],
         },
         "gridPos": {"h": h, "w": w, "x": x, "y": y},
         "id": pid,
@@ -402,7 +408,8 @@ panels = [
     timeseries(
         17,
         "Token throughput",
-        "Prompt (input) vs generation (output) tokens per second.",
+        "Prompt on the left axis, generation on the right. "
+        "Prefill bursts are much larger than decode tok/s.",
         0,
         27,
         12,
@@ -412,6 +419,16 @@ panels = [
             target(rate_c("vllm:generation_tokens_total"), "gen tok/s", "B"),
         ],
         "ops",
+        axis_label="prompt tok/s",
+        overrides=[
+            {
+                "matcher": {"id": "byName", "options": "gen tok/s"},
+                "properties": [
+                    {"id": "custom.axisPlacement", "value": "right"},
+                    {"id": "custom.axisLabel", "value": "gen tok/s"},
+                ],
+            }
+        ],
     ),
     timeseries(
         18,
