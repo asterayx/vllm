@@ -51,11 +51,10 @@ def stat(
     expr: str,
     legend: str,
     unit: str,
-    w: int = 4,
-    h: int = 4,
-    decimals: int | None = None,
-    min_v: float | None = None,
-    max_v: float | None = None,
+    w: int = 6,
+    h: int = 5,
+    decimals: int | None = 1,
+    color: str | None = None,
     steps: list | None = None,
 ) -> dict:
     defaults: dict = {
@@ -63,17 +62,15 @@ def stat(
             "mode": "absolute",
             "steps": steps
             or [
-                {"color": "green", "value": None},
+                {"color": color or "green", "value": None},
             ],
         },
         "unit": unit,
     }
     if decimals is not None:
         defaults["decimals"] = decimals
-    if min_v is not None:
-        defaults["min"] = min_v
-    if max_v is not None:
-        defaults["max"] = max_v
+    if color:
+        defaults["color"] = {"mode": "fixed", "fixedColor": color}
     return {
         "datasource": DS,
         "description": desc,
@@ -84,6 +81,7 @@ def stat(
             "colorMode": "value",
             "graphMode": "area",
             "reduceOptions": {"calcs": ["lastNotNull"]},
+            "textMode": "value",
         },
         "targets": [target(expr, legend)],
         "title": title,
@@ -103,11 +101,12 @@ def timeseries(
     unit: str,
     overrides: list | None = None,
     axis_label: str | None = None,
+    legend_calcs: list | None = None,
 ) -> dict:
     custom: dict = {
         "drawStyle": "line",
-        "fillOpacity": 12,
-        "lineWidth": 1,
+        "fillOpacity": 10,
+        "lineWidth": 2,
         "showPoints": "never",
         "spanNulls": True,
     }
@@ -129,7 +128,8 @@ def timeseries(
         "id": pid,
         "options": {
             "legend": {
-                "displayMode": "list",
+                "calcs": legend_calcs or ["mean", "max"],
+                "displayMode": "table",
                 "placement": "bottom",
                 "showLegend": True,
             },
@@ -138,6 +138,16 @@ def timeseries(
         "targets": targets,
         "title": title,
         "type": "timeseries",
+    }
+
+
+def right_axis(name: str, label: str) -> dict:
+    return {
+        "matcher": {"id": "byName", "options": name},
+        "properties": [
+            {"id": "custom.axisPlacement", "value": "right"},
+            {"id": "custom.axisLabel", "value": label},
+        ],
     }
 
 
@@ -165,277 +175,235 @@ PREFIX_HIT = (
     f"clamp_min({rate_c('vllm:prefix_cache_queries_total')}, 1e-9)"
 )
 KV_PCT = f"avg(vllm:kv_cache_usage_perc{{{M}}})"
-DECODE_TPS = (
-    "1 / clamp_min("
-    + hq("vllm:inter_token_latency_seconds", 0.5)
-    + ", 1e-9)"
-)
-
-pct_steps = [
-    {"color": "green", "value": None},
-    {"color": "orange", "value": 0.7},
-    {"color": "red", "value": 0.9},
-]
-accept_steps = [
-    {"color": "red", "value": None},
-    {"color": "orange", "value": 0.4},
-    {"color": "green", "value": 0.7},
-]
+PREFILL_TPS = rate_c("vllm:prompt_tokens_total")
+DECODE_TPS = rate_c("vllm:generation_tokens_total")
 
 panels = [
-    row(100, "Overview", 0),
     stat(
         1,
-        "Running",
-        "Requests in RUNNING.",
+        "Decode throughput",
+        "rate(generation_tokens) — tokens emitted per second.",
         0,
-        1,
+        0,
+        DECODE_TPS,
+        "decode",
+        "ops",
+        color="green",
+    ),
+    stat(
+        2,
+        "Prefill throughput",
+        "rate(prompt_tokens) — prompt tokens consumed per second.",
+        6,
+        0,
+        PREFILL_TPS,
+        "prefill",
+        "ops",
+        color="blue",
+    ),
+    stat(
+        3,
+        "Requests running",
+        "Requests in RUNNING.",
+        12,
+        0,
         gauge("vllm:num_requests_running"),
         "running",
         "short",
         decimals=0,
+        color="purple",
     ),
     stat(
-        2,
-        "Waiting",
-        "Requests in WAITING.",
         4,
-        1,
+        "Requests waiting",
+        "Requests in WAITING.",
+        18,
+        0,
         gauge("vllm:num_requests_waiting"),
         "waiting",
         "short",
         decimals=0,
+        color="green",
         steps=[
             {"color": "green", "value": None},
             {"color": "orange", "value": 4},
             {"color": "red", "value": 16},
         ],
     ),
-    stat(
-        3,
-        "KV cache",
-        "Fraction of used KV blocks (0–1).",
-        8,
-        1,
-        KV_PCT,
-        "kv",
-        "percentunit",
-        decimals=2,
-        min_v=0,
-        max_v=1,
-        steps=pct_steps,
-    ),
-    stat(
-        4,
-        "Prompt tok/s",
-        "Prefill throughput: rate of prompt tokens.",
-        12,
-        1,
-        rate_c("vllm:prompt_tokens_total"),
-        "prompt",
-        "ops",
-        decimals=0,
-    ),
-    stat(
-        5,
-        "Gen tok/s",
-        "Decode throughput: rate of generated tokens.",
-        16,
-        1,
-        rate_c("vllm:generation_tokens_total"),
-        "gen",
-        "ops",
-        decimals=0,
-    ),
-    stat(
-        6,
-        "DSpark accept",
-        "accepted_tokens / draft_tokens (PromQL from spec_decode/metrics.py).",
-        20,
-        1,
-        ACCEPT,
-        "accept",
-        "percentunit",
-        decimals=2,
-        min_v=0,
-        max_v=1,
-        steps=accept_steps,
-    ),
-    stat(
-        7,
-        "TTFT p50",
-        "Time to first token (prefill-dominated).",
-        0,
-        5,
-        hq("vllm:time_to_first_token_seconds", 0.5),
-        "ttft p50",
-        "s",
-        decimals=3,
-    ),
-    stat(
-        8,
-        "ITL p50",
-        "Inter-token latency (decode).",
-        4,
-        5,
-        hq("vllm:inter_token_latency_seconds", 0.5),
-        "itl p50",
-        "s",
-        decimals=4,
-    ),
-    stat(
-        9,
-        "Decode tok/s p50",
-        "1 / ITL p50 — per-request decode speed.",
-        8,
-        5,
-        DECODE_TPS,
-        "decode tps",
-        "ops",
-        decimals=1,
-    ),
-    stat(
-        10,
-        "Prefill p50",
-        "Request prefill time p50.",
-        12,
-        5,
-        hq("vllm:request_prefill_time_seconds", 0.5),
-        "prefill p50",
-        "s",
-        decimals=3,
-    ),
-    stat(
-        11,
-        "Decode p50",
-        "Request decode time p50.",
-        16,
-        5,
-        hq("vllm:request_decode_time_seconds", 0.5),
-        "decode p50",
-        "s",
-        decimals=3,
-    ),
-    stat(
-        12,
-        "Accept length",
-        "1 + accepted_tokens / drafts (includes bonus token).",
-        20,
-        5,
-        MEAN_LEN,
-        "mean len",
-        "short",
-        decimals=2,
-        steps=[
-            {"color": "red", "value": None},
-            {"color": "orange", "value": 1.5},
-            {"color": "green", "value": 2.5},
-        ],
-    ),
-    row(101, "Prefill / decode", 9),
     timeseries(
-        13,
-        "TTFT (prefill)",
-        "Time to first token. p50 / p99 / average.",
+        5,
+        "Throughput (tokens/sec)",
+        "Prefill (left axis) vs decode (right axis). "
+        "Prefill bursts are much larger than decode tok/s.",
         0,
-        10,
+        5,
+        12,
+        9,
+        [
+            target(DECODE_TPS, "decode", "A"),
+            target(PREFILL_TPS, "prefill", "B"),
+        ],
+        "ops",
+        axis_label="prefill tok/s",
+        overrides=[right_axis("decode", "decode tok/s")],
+    ),
+    timeseries(
+        6,
+        "End-to-end request latency (wall time)",
+        "Finished-request e2e latency.",
+        12,
+        5,
+        12,
+        9,
+        [
+            target(hq("vllm:e2e_request_latency_seconds", 0.5), "p50", "A"),
+            target(hq("vllm:e2e_request_latency_seconds", 0.95), "p95", "B"),
+            target(hq("vllm:e2e_request_latency_seconds", 0.99), "p99", "C"),
+        ],
+        "s",
+    ),
+    timeseries(
+        7,
+        "Time to first token (TTFT)",
+        "Prefill-dominated time to first token.",
+        0,
+        14,
         12,
         8,
         [
             target(hq("vllm:time_to_first_token_seconds", 0.5), "p50", "A"),
-            target(hq("vllm:time_to_first_token_seconds", 0.99), "p99", "B"),
-            target(hist_avg("vllm:time_to_first_token_seconds"), "avg", "C"),
+            target(hq("vllm:time_to_first_token_seconds", 0.95), "p95", "B"),
+            target(hq("vllm:time_to_first_token_seconds", 0.99), "p99", "C"),
         ],
         "s",
     ),
     timeseries(
+        8,
+        "Inter-token latency (ITL)",
+        "Decode inter-token latency.",
+        12,
         14,
-        "ITL / TPOT (decode)",
-        "Inter-token latency and time-per-output-token.",
         12,
+        8,
+        [
+            target(hq("vllm:inter_token_latency_seconds", 0.5), "p50", "A"),
+            target(hq("vllm:inter_token_latency_seconds", 0.95), "p95", "B"),
+        ],
+        "s",
+    ),
+    timeseries(
+        9,
+        "Request phase wall time (avg)",
+        "Average queue / prefill / decode / e2e per finished request.",
+        0,
+        22,
+        12,
+        8,
+        [
+            target(hist_avg("vllm:request_queue_time_seconds"), "queue", "A"),
+            target(hist_avg("vllm:request_prefill_time_seconds"), "prefill", "B"),
+            target(hist_avg("vllm:request_decode_time_seconds"), "decode", "C"),
+            target(hist_avg("vllm:e2e_request_latency_seconds"), "e2e", "D"),
+        ],
+        "s",
+    ),
+    timeseries(
         10,
+        "DFlash2 speculative-decode acceptance",
+        "accept rate = accepted/draft tokens (left). "
+        "mean length = 1 + accepted/drafts (right, includes bonus token).",
+        12,
+        22,
         12,
         8,
         [
-            target(hq("vllm:inter_token_latency_seconds", 0.5), "ITL p50", "A"),
-            target(hq("vllm:inter_token_latency_seconds", 0.99), "ITL p99", "B"),
-            target(
-                hq("vllm:request_time_per_output_token_seconds", 0.5),
-                "TPOT p50",
-                "C",
-            ),
-            target(
-                hq("vllm:request_time_per_output_token_seconds", 0.99),
-                "TPOT p99",
-                "D",
-            ),
+            target(ACCEPT, "accept rate", "A"),
+            target(MEAN_LEN, "mean accept length", "B"),
         ],
-        "s",
-    ),
-    timeseries(
-        15,
-        "Request prefill vs decode time",
-        "Per-request prefill and decode duration.",
-        0,
-        18,
-        12,
-        8,
-        [
-            target(hq("vllm:request_prefill_time_seconds", 0.5), "prefill p50", "A"),
-            target(hq("vllm:request_prefill_time_seconds", 0.99), "prefill p99", "B"),
-            target(hq("vllm:request_decode_time_seconds", 0.5), "decode p50", "C"),
-            target(hq("vllm:request_decode_time_seconds", 0.99), "decode p99", "D"),
-        ],
-        "s",
-    ),
-    timeseries(
-        16,
-        "E2E + queue",
-        "End-to-end request latency and queue wait.",
-        12,
-        18,
-        12,
-        8,
-        [
-            target(hq("vllm:e2e_request_latency_seconds", 0.5), "e2e p50", "A"),
-            target(hq("vllm:e2e_request_latency_seconds", 0.99), "e2e p99", "B"),
-            target(hq("vllm:request_queue_time_seconds", 0.5), "queue p50", "C"),
-            target(hq("vllm:request_queue_time_seconds", 0.99), "queue p99", "D"),
-        ],
-        "s",
-    ),
-    row(102, "Tokens in / out", 26),
-    timeseries(
-        17,
-        "Token throughput",
-        "Prompt on the left axis, generation on the right. "
-        "Prefill bursts are much larger than decode tok/s.",
-        0,
-        27,
-        12,
-        8,
-        [
-            target(rate_c("vllm:prompt_tokens_total"), "prompt tok/s", "A"),
-            target(rate_c("vllm:generation_tokens_total"), "gen tok/s", "B"),
-        ],
-        "ops",
-        axis_label="prompt tok/s",
+        "short",
         overrides=[
             {
-                "matcher": {"id": "byName", "options": "gen tok/s"},
+                "matcher": {"id": "byName", "options": "accept rate"},
+                "properties": [
+                    {"id": "unit", "value": "percentunit"},
+                    {"id": "custom.axisPlacement", "value": "left"},
+                    {"id": "custom.axisLabel", "value": "accept rate"},
+                ],
+            },
+            right_axis("mean accept length", "mean length"),
+        ],
+    ),
+    row(100, "KV / tokens / draft positions", 30),
+    timeseries(
+        11,
+        "KV cache + queue",
+        "KV block usage (left) and running/waiting counts (right).",
+        0,
+        31,
+        12,
+        8,
+        [
+            target(KV_PCT, "KV usage", "A"),
+            target(gauge("vllm:num_requests_running"), "running", "B"),
+            target(gauge("vllm:num_requests_waiting"), "waiting", "C"),
+        ],
+        "short",
+        overrides=[
+            {
+                "matcher": {"id": "byName", "options": "KV usage"},
+                "properties": [
+                    {"id": "unit", "value": "percentunit"},
+                    {"id": "custom.axisPlacement", "value": "left"},
+                    {"id": "custom.axisLabel", "value": "KV"},
+                ],
+            },
+            {
+                "matcher": {"id": "byRegexp", "options": "running|waiting"},
                 "properties": [
                     {"id": "custom.axisPlacement", "value": "right"},
-                    {"id": "custom.axisLabel", "value": "gen tok/s"},
+                    {"id": "custom.axisLabel", "value": "requests"},
                 ],
-            }
+            },
         ],
     ),
     timeseries(
-        18,
+        12,
+        "Prefix cache",
+        "Hit rate (left) and query/hit rates (right).",
+        12,
+        31,
+        12,
+        8,
+        [
+            target(PREFIX_HIT, "hit rate", "A"),
+            target(rate_c("vllm:prefix_cache_queries_total"), "queries/s", "B"),
+            target(rate_c("vllm:prefix_cache_hits_total"), "hits/s", "C"),
+        ],
+        "short",
+        overrides=[
+            {
+                "matcher": {"id": "byName", "options": "hit rate"},
+                "properties": [
+                    {"id": "unit", "value": "percentunit"},
+                    {"id": "custom.axisPlacement", "value": "left"},
+                    {"id": "custom.axisLabel", "value": "hit rate"},
+                ],
+            },
+            {
+                "matcher": {"id": "byRegexp", "options": "queries/s|hits/s"},
+                "properties": [
+                    {"id": "custom.axisPlacement", "value": "right"},
+                    {"id": "custom.axisLabel", "value": "ops/s"},
+                ],
+            },
+        ],
+    ),
+    timeseries(
+        13,
         "Request token sizes",
         "Prompt and generation length per finished request.",
-        12,
-        27,
+        0,
+        39,
         12,
         8,
         [
@@ -446,58 +414,12 @@ panels = [
         ],
         "short",
     ),
-    row(103, "KV / cache", 35),
     timeseries(
-        19,
-        "KV usage + queue",
-        "KV cache fraction plus running/waiting request counts.",
-        0,
-        36,
-        12,
-        8,
-        [
-            target(KV_PCT, "KV usage", "A"),
-            target(gauge("vllm:num_requests_running"), "running", "B"),
-            target(gauge("vllm:num_requests_waiting"), "waiting", "C"),
-        ],
-        "short",
-    ),
-    timeseries(
-        20,
-        "Prefix cache",
-        "Prefix-cache hit rate and query/hit rates.",
-        12,
-        36,
-        12,
-        8,
-        [
-            target(PREFIX_HIT, "hit rate", "A"),
-            target(rate_c("vllm:prefix_cache_queries_total"), "queries/s", "B"),
-            target(rate_c("vllm:prefix_cache_hits_total"), "hits/s", "C"),
-        ],
-        "short",
-    ),
-    row(104, "DSpark / spec decode", 44),
-    timeseries(
-        21,
-        "Acceptance rate + mean length",
-        "accepted/draft tokens; mean length = 1 + accepted/drafts.",
-        0,
-        45,
-        12,
-        8,
-        [
-            target(ACCEPT, "accept rate", "A"),
-            target(MEAN_LEN, "mean accept length", "B"),
-        ],
-        "short",
-    ),
-    timeseries(
-        22,
+        14,
         "Draft / accepted tokens",
         "Spec-decode draft and accept counters as rates.",
         12,
-        45,
+        39,
         12,
         8,
         [
@@ -516,11 +438,11 @@ panels = [
         "ops",
     ),
     timeseries(
-        23,
+        15,
         "Acceptance by draft position",
         "accepted_tokens_per_pos / drafts. Position 0 is the first draft token.",
         0,
-        53,
+        47,
         24,
         8,
         [
@@ -539,33 +461,6 @@ panels = [
     ),
 ]
 
-# Override units on mixed KV panel: Grafana can't easily dual-axis in this
-# compact schema; keep KV as percentunit via override.
-panels[next(i for i, p in enumerate(panels) if p.get("id") == 19)][
-    "fieldConfig"
-]["overrides"] = [
-    {
-        "matcher": {"id": "byName", "options": "KV usage"},
-        "properties": [{"id": "unit", "value": "percentunit"}],
-    }
-]
-panels[next(i for i, p in enumerate(panels) if p.get("id") == 21)][
-    "fieldConfig"
-]["overrides"] = [
-    {
-        "matcher": {"id": "byName", "options": "accept rate"},
-        "properties": [{"id": "unit", "value": "percentunit"}],
-    }
-]
-panels[next(i for i, p in enumerate(panels) if p.get("id") == 20)][
-    "fieldConfig"
-]["overrides"] = [
-    {
-        "matcher": {"id": "byName", "options": "hit rate"},
-        "properties": [{"id": "unit", "value": "percentunit"}],
-    }
-]
-
 dashboard = {
     "annotations": {
         "list": [
@@ -581,8 +476,9 @@ dashboard = {
         ]
     },
     "description": (
-        "One-page vLLM serving view: prefill/decode, DSpark acceptance, "
-        "KV / prefix cache, and token in/out. Model defaults to All."
+        "Spark serving view: decode/prefill throughput (dual axis), "
+        "TTFT/ITL/e2e, DFlash2 acceptance, KV, and token sizes. "
+        "Model defaults to All."
     ),
     "editable": True,
     "fiscalYearStartMonth": 0,
@@ -592,7 +488,7 @@ dashboard = {
     "preload": False,
     "refresh": "5s",
     "schemaVersion": 40,
-    "tags": ["vllm", "serving", "dspark", "spec-decode"],
+    "tags": ["vllm", "serving", "dspark", "dflash2"],
     "templating": {
         "list": [
             {
@@ -626,9 +522,9 @@ dashboard = {
     "time": {"from": "now-15m", "to": "now"},
     "timepicker": {},
     "timezone": "browser",
-    "title": "vLLM Serving / DSpark / KV",
+    "title": "Spark vLLM — Serving Performance",
     "uid": "vllm-serving-dspark",
-    "version": 1,
+    "version": 2,
 }
 
 out = Path(__file__).with_name("serving.json")

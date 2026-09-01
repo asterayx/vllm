@@ -15,24 +15,127 @@
       }
     ]
   },
-  "description": "One-page vLLM serving view: prefill/decode, DSpark acceptance, KV / prefix cache, and token in/out. Model defaults to All.",
+  "description": "Spark serving view: decode/prefill throughput (dual axis), TTFT/ITL/e2e, DFlash2 acceptance, KV, and token sizes. Model defaults to All.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
   "links": [],
   "panels": [
     {
-      "collapsed": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "rate(generation_tokens) \u2014 tokens emitted per second.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops",
+          "decimals": 1,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
+        },
+        "overrides": []
+      },
       "gridPos": {
-        "h": 1,
-        "w": 24,
+        "h": 5,
+        "w": 6,
         "x": 0,
         "y": 0
       },
-      "id": 100,
-      "panels": [],
-      "title": "Overview",
-      "type": "row"
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(vllm:generation_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "decode",
+          "refId": "A"
+        }
+      ],
+      "title": "Decode throughput",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "rate(prompt_tokens) \u2014 prompt tokens consumed per second.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops",
+          "decimals": 1,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(vllm:prompt_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "prefill",
+          "refId": "A"
+        }
+      ],
+      "title": "Prefill throughput",
+      "type": "stat"
     },
     {
       "datasource": {
@@ -46,23 +149,27 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
+                "color": "purple",
                 "value": null
               }
             ]
           },
           "unit": "short",
-          "decimals": 0
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "purple"
+          }
         },
         "overrides": []
       },
       "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 0,
-        "y": 1
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 0
       },
-      "id": 1,
+      "id": 3,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
@@ -70,7 +177,8 @@
           "calcs": [
             "lastNotNull"
           ]
-        }
+        },
+        "textMode": "value"
       },
       "targets": [
         {
@@ -84,7 +192,7 @@
           "refId": "A"
         }
       ],
-      "title": "Running",
+      "title": "Requests running",
       "type": "stat"
     },
     {
@@ -113,17 +221,21 @@
             ]
           },
           "unit": "short",
-          "decimals": 0
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
         },
         "overrides": []
       },
       "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 4,
-        "y": 1
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 0
       },
-      "id": 2,
+      "id": 4,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
@@ -131,7 +243,8 @@
           "calcs": [
             "lastNotNull"
           ]
-        }
+        },
+        "textMode": "value"
       },
       "targets": [
         {
@@ -145,7 +258,7 @@
           "refId": "A"
         }
       ],
-      "title": "Waiting",
+      "title": "Requests waiting",
       "type": "stat"
     },
     {
@@ -153,153 +266,61 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Fraction of used KV blocks (0\u20131).",
+      "description": "Prefill (left axis) vs decode (right axis). Prefill bursts are much larger than decode tok/s.",
       "fieldConfig": {
         "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisLabel": "prefill tok/s",
+            "axisPlacement": "left"
+          },
+          "unit": "ops"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "decode"
+            },
+            "properties": [
               {
-                "color": "green",
-                "value": null
+                "id": "custom.axisPlacement",
+                "value": "right"
               },
               {
-                "color": "orange",
-                "value": 0.7
-              },
-              {
-                "color": "red",
-                "value": 0.9
+                "id": "custom.axisLabel",
+                "value": "decode tok/s"
               }
             ]
-          },
-          "unit": "percentunit",
-          "decimals": 2,
-          "min": 0,
-          "max": 1
-        },
-        "overrides": []
+          }
+        ]
       },
       "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 8,
-        "y": 1
-      },
-      "id": 3,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "avg(vllm:kv_cache_usage_perc{model_name=~\"$model\"})",
-          "legendFormat": "kv",
-          "refId": "A"
-        }
-      ],
-      "title": "KV cache",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "description": "Prefill throughput: rate of prompt tokens.",
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "ops",
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 12,
-        "y": 1
-      },
-      "id": 4,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(vllm:prompt_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "prompt",
-          "refId": "A"
-        }
-      ],
-      "title": "Prompt tok/s",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "description": "Decode throughput: rate of generated tokens.",
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "ops",
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 16,
-        "y": 1
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 5
       },
       "id": 5,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "reduceOptions": {
+        "legend": {
           "calcs": [
-            "lastNotNull"
-          ]
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
         }
       },
       "targets": [
@@ -310,421 +331,29 @@
           },
           "editorMode": "code",
           "expr": "sum(rate(vllm:generation_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "gen",
+          "legendFormat": "decode",
           "refId": "A"
-        }
-      ],
-      "title": "Gen tok/s",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "description": "accepted_tokens / draft_tokens (PromQL from spec_decode/metrics.py).",
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 0.4
-              },
-              {
-                "color": "green",
-                "value": 0.7
-              }
-            ]
-          },
-          "unit": "percentunit",
-          "decimals": 2,
-          "min": 0,
-          "max": 1
         },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 20,
-        "y": 1
-      },
-      "id": 6,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        }
-      },
-      "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(vllm:spec_decode_num_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(vllm:spec_decode_num_draft_tokens_total{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
-          "legendFormat": "accept",
-          "refId": "A"
+          "expr": "sum(rate(vllm:prompt_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "prefill",
+          "refId": "B"
         }
       ],
-      "title": "DSpark accept",
-      "type": "stat"
+      "title": "Throughput (tokens/sec)",
+      "type": "timeseries"
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Time to first token (prefill-dominated).",
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "s",
-          "decimals": 3
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 0,
-        "y": 5
-      },
-      "id": 7,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "ttft p50",
-          "refId": "A"
-        }
-      ],
-      "title": "TTFT p50",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "description": "Inter-token latency (decode).",
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "s",
-          "decimals": 4
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 4,
-        "y": 5
-      },
-      "id": 8,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:inter_token_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "itl p50",
-          "refId": "A"
-        }
-      ],
-      "title": "ITL p50",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "description": "1 / ITL p50 \u2014 per-request decode speed.",
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "ops",
-          "decimals": 1
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 8,
-        "y": 5
-      },
-      "id": 9,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "1 / clamp_min(histogram_quantile(0.5, sum by (le) (rate(vllm:inter_token_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval]))), 1e-9)",
-          "legendFormat": "decode tps",
-          "refId": "A"
-        }
-      ],
-      "title": "Decode tok/s p50",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "description": "Request prefill time p50.",
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "s",
-          "decimals": 3
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 12,
-        "y": 5
-      },
-      "id": 10,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:request_prefill_time_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "prefill p50",
-          "refId": "A"
-        }
-      ],
-      "title": "Prefill p50",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "description": "Request decode time p50.",
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "s",
-          "decimals": 3
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 16,
-        "y": 5
-      },
-      "id": 11,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:request_decode_time_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "decode p50",
-          "refId": "A"
-        }
-      ],
-      "title": "Decode p50",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "description": "1 + accepted_tokens / drafts (includes bonus token).",
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 1.5
-              },
-              {
-                "color": "green",
-                "value": 2.5
-              }
-            ]
-          },
-          "unit": "short",
-          "decimals": 2
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 20,
-        "y": 5
-      },
-      "id": 12,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "1 + sum(rate(vllm:spec_decode_num_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(vllm:spec_decode_num_drafts_total{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
-          "legendFormat": "mean len",
-          "refId": "A"
-        }
-      ],
-      "title": "Accept length",
-      "type": "stat"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 9
-      },
-      "id": 101,
-      "panels": [],
-      "title": "Prefill / decode",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "description": "Time to first token. p50 / p99 / average.",
+      "description": "Finished-request e2e latency.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -732,8 +361,86 @@
           },
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 12,
-            "lineWidth": 1,
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "title": "End-to-end request latency (wall time)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Prefill-dominated time to first token.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
             "showPoints": "never",
             "spanNulls": true
           },
@@ -745,12 +452,16 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 10
+        "y": 14
       },
-      "id": 13,
+      "id": 7,
       "options": {
         "legend": {
-          "displayMode": "list",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
         },
@@ -775,8 +486,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "p99",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p95",
           "refId": "B"
         },
         {
@@ -785,12 +496,12 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(vllm:time_to_first_token_seconds_sum{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(vllm:time_to_first_token_seconds_count{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
-          "legendFormat": "avg",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p99",
           "refId": "C"
         }
       ],
-      "title": "TTFT (prefill)",
+      "title": "Time to first token (TTFT)",
       "type": "timeseries"
     },
     {
@@ -798,7 +509,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Inter-token latency and time-per-output-token.",
+      "description": "Decode inter-token latency.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -806,8 +517,8 @@
           },
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 12,
-            "lineWidth": 1,
+            "fillOpacity": 10,
+            "lineWidth": 2,
             "showPoints": "never",
             "spanNulls": true
           },
@@ -819,12 +530,16 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 10
+        "y": 14
       },
-      "id": 14,
+      "id": 8,
       "options": {
         "legend": {
-          "displayMode": "list",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
         },
@@ -840,7 +555,7 @@
           },
           "editorMode": "code",
           "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:inter_token_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "ITL p50",
+          "legendFormat": "p50",
           "refId": "A"
         },
         {
@@ -849,32 +564,12 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:inter_token_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "ITL p99",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:inter_token_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p95",
           "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:request_time_per_output_token_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "TPOT p50",
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:request_time_per_output_token_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "TPOT p99",
-          "refId": "D"
         }
       ],
-      "title": "ITL / TPOT (decode)",
+      "title": "Inter-token latency (ITL)",
       "type": "timeseries"
     },
     {
@@ -882,7 +577,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Per-request prefill and decode duration.",
+      "description": "Average queue / prefill / decode / e2e per finished request.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -890,8 +585,8 @@
           },
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 12,
-            "lineWidth": 1,
+            "fillOpacity": 10,
+            "lineWidth": 2,
             "showPoints": "never",
             "spanNulls": true
           },
@@ -903,12 +598,16 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 18
+        "y": 22
       },
-      "id": 15,
+      "id": 9,
       "options": {
         "legend": {
-          "displayMode": "list",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
         },
@@ -923,8 +622,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:request_prefill_time_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "prefill p50",
+          "expr": "sum(rate(vllm:request_queue_time_seconds_sum{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(vllm:request_queue_time_seconds_count{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "queue",
           "refId": "A"
         },
         {
@@ -933,8 +632,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:request_prefill_time_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "prefill p99",
+          "expr": "sum(rate(vllm:request_prefill_time_seconds_sum{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(vllm:request_prefill_time_seconds_count{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "prefill",
           "refId": "B"
         },
         {
@@ -943,8 +642,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:request_decode_time_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "decode p50",
+          "expr": "sum(rate(vllm:request_decode_time_seconds_sum{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(vllm:request_decode_time_seconds_count{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "decode",
           "refId": "C"
         },
         {
@@ -953,12 +652,12 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:request_decode_time_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "decode p99",
+          "expr": "sum(rate(vllm:e2e_request_latency_seconds_sum{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(vllm:e2e_request_latency_seconds_count{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "e2e",
           "refId": "D"
         }
       ],
-      "title": "Request prefill vs decode time",
+      "title": "Request phase wall time (avg)",
       "type": "timeseries"
     },
     {
@@ -966,7 +665,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "End-to-end request latency and queue wait.",
+      "description": "accept rate = accepted/draft tokens (left). mean length = 1 + accepted/drafts (right, includes bonus token).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -974,117 +673,38 @@
           },
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 12,
-            "lineWidth": 1,
+            "fillOpacity": 10,
+            "lineWidth": 2,
             "showPoints": "never",
             "spanNulls": true
           },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 18
-      },
-      "id": 16,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "e2e p50",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "e2e p99",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(vllm:request_queue_time_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "queue p50",
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:request_queue_time_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "queue p99",
-          "refId": "D"
-        }
-      ],
-      "title": "E2E + queue",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 26
-      },
-      "id": 102,
-      "panels": [],
-      "title": "Tokens in / out",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "description": "Prompt on the left axis, generation on the right. Prefill bursts are much larger than decode tok/s.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 12,
-            "lineWidth": 1,
-            "showPoints": "never",
-            "spanNulls": true,
-            "axisLabel": "prompt tok/s",
-            "axisPlacement": "left"
-          },
-          "unit": "ops"
+          "unit": "short"
         },
         "overrides": [
           {
             "matcher": {
               "id": "byName",
-              "options": "gen tok/s"
+              "options": "accept rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "left"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "accept rate"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "mean accept length"
             },
             "properties": [
               {
@@ -1093,7 +713,125 @@
               },
               {
                 "id": "custom.axisLabel",
-                "value": "gen tok/s"
+                "value": "mean length"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(vllm:spec_decode_num_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(vllm:spec_decode_num_draft_tokens_total{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "accept rate",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "1 + sum(rate(vllm:spec_decode_num_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(vllm:spec_decode_num_drafts_total{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "mean accept length",
+          "refId": "B"
+        }
+      ],
+      "title": "DFlash2 speculative-decode acceptance",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      },
+      "id": 100,
+      "panels": [],
+      "title": "KV / tokens / draft positions",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "KV block usage (left) and running/waiting counts (right).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "KV usage"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "left"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "KV"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "running|waiting"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "requests"
               }
             ]
           }
@@ -1103,12 +841,16 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 27
+        "y": 31
       },
-      "id": 17,
+      "id": 11,
       "options": {
         "legend": {
-          "displayMode": "list",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
         },
@@ -1123,8 +865,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(vllm:prompt_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "prompt tok/s",
+          "expr": "avg(vllm:kv_cache_usage_perc{model_name=~\"$model\"})",
+          "legendFormat": "KV usage",
           "refId": "A"
         },
         {
@@ -1133,12 +875,137 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(vllm:generation_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "gen tok/s",
+          "expr": "sum(vllm:num_requests_running{model_name=~\"$model\"})",
+          "legendFormat": "running",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(vllm:num_requests_waiting{model_name=~\"$model\"})",
+          "legendFormat": "waiting",
+          "refId": "C"
         }
       ],
-      "title": "Token throughput",
+      "title": "KV cache + queue",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Hit rate (left) and query/hit rates (right).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "hit rate"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "left"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "hit rate"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "queries/s|hits/s"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "ops/s"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 31
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(vllm:prefix_cache_hits_total{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(vllm:prefix_cache_queries_total{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "hit rate",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(vllm:prefix_cache_queries_total{model_name=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "queries/s",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(vllm:prefix_cache_hits_total{model_name=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "hits/s",
+          "refId": "C"
+        }
+      ],
+      "title": "Prefix cache",
       "type": "timeseries"
     },
     {
@@ -1154,8 +1021,8 @@
           },
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 12,
-            "lineWidth": 1,
+            "fillOpacity": 10,
+            "lineWidth": 2,
             "showPoints": "never",
             "spanNulls": true
           },
@@ -1166,13 +1033,17 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 27
+        "x": 0,
+        "y": 39
       },
-      "id": 18,
+      "id": 13,
       "options": {
         "legend": {
-          "displayMode": "list",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
         },
@@ -1226,283 +1097,6 @@
       "type": "timeseries"
     },
     {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 35
-      },
-      "id": 103,
-      "panels": [],
-      "title": "KV / cache",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "description": "KV cache fraction plus running/waiting request counts.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 12,
-            "lineWidth": 1,
-            "showPoints": "never",
-            "spanNulls": true
-          },
-          "unit": "short"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "KV usage"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "percentunit"
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 36
-      },
-      "id": 19,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "avg(vllm:kv_cache_usage_perc{model_name=~\"$model\"})",
-          "legendFormat": "KV usage",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(vllm:num_requests_running{model_name=~\"$model\"})",
-          "legendFormat": "running",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(vllm:num_requests_waiting{model_name=~\"$model\"})",
-          "legendFormat": "waiting",
-          "refId": "C"
-        }
-      ],
-      "title": "KV usage + queue",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "description": "Prefix-cache hit rate and query/hit rates.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 12,
-            "lineWidth": 1,
-            "showPoints": "never",
-            "spanNulls": true
-          },
-          "unit": "short"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "hit rate"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "percentunit"
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 36
-      },
-      "id": 20,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(vllm:prefix_cache_hits_total{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(vllm:prefix_cache_queries_total{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
-          "legendFormat": "hit rate",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(vllm:prefix_cache_queries_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "queries/s",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(vllm:prefix_cache_hits_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "hits/s",
-          "refId": "C"
-        }
-      ],
-      "title": "Prefix cache",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 44
-      },
-      "id": 104,
-      "panels": [],
-      "title": "DSpark / spec decode",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "description": "accepted/draft tokens; mean length = 1 + accepted/drafts.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 12,
-            "lineWidth": 1,
-            "showPoints": "never",
-            "spanNulls": true
-          },
-          "unit": "short"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "accept rate"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "percentunit"
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 45
-      },
-      "id": 21,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(vllm:spec_decode_num_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(vllm:spec_decode_num_draft_tokens_total{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
-          "legendFormat": "accept rate",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "1 + sum(rate(vllm:spec_decode_num_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(vllm:spec_decode_num_drafts_total{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
-          "legendFormat": "mean accept length",
-          "refId": "B"
-        }
-      ],
-      "title": "Acceptance rate + mean length",
-      "type": "timeseries"
-    },
-    {
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -1515,8 +1109,8 @@
           },
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 12,
-            "lineWidth": 1,
+            "fillOpacity": 10,
+            "lineWidth": 2,
             "showPoints": "never",
             "spanNulls": true
           },
@@ -1528,12 +1122,16 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 45
+        "y": 39
       },
-      "id": 22,
+      "id": 14,
       "options": {
         "legend": {
-          "displayMode": "list",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
         },
@@ -1589,8 +1187,8 @@
           },
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 12,
-            "lineWidth": 1,
+            "fillOpacity": 10,
+            "lineWidth": 2,
             "showPoints": "never",
             "spanNulls": true
           },
@@ -1602,12 +1200,16 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 53
+        "y": 47
       },
-      "id": 23,
+      "id": 15,
       "options": {
         "legend": {
-          "displayMode": "list",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
         },
@@ -1638,7 +1240,7 @@
     "vllm",
     "serving",
     "dspark",
-    "spec-decode"
+    "dflash2"
   ],
   "templating": {
     "list": [
@@ -1681,7 +1283,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "vLLM Serving / DSpark / KV",
+  "title": "Spark vLLM \u2014 Serving Performance",
   "uid": "vllm-serving-dspark",
-  "version": 1
+  "version": 2
 }

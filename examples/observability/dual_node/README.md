@@ -5,8 +5,9 @@ Prometheus and Grafana on the head node, scrapes vLLM `/metrics` plus
 `node_exporter` InfiniBand/RoCE counters on both machines, and auto-loads:
 
 - Official **Performance Statistics** and **Query Statistics** dashboards
-- **vLLM Serving / DSpark / KV** — one page for prefill/decode, DSpark
-  acceptance, KV / prefix cache, and token in/out (model defaults to All)
+- **Spark vLLM — Serving Performance** — decode/prefill throughput (dual
+  Y-axis), TTFT/ITL/e2e, DFlash2 acceptance, KV, token sizes (model
+  defaults to All)
 - A **RoCE / Dual Spark** dashboard for the two ConnectX-7 twins on the
   plugged QSFP (`rocep1s0f1` + `roceP2p1s0f1`)
 
@@ -62,8 +63,9 @@ Or, after `config.env` is filled:
 ```
 
 Open `http://<GRAFANA_BIND>:3000` (default user/password `admin` / `admin`).
-Dashboards are in folder **vLLM**. Use **vLLM Serving / DSpark / KV** for
-prefill, decode, DSpark accept rate, KV, and tokens. Set refresh to 2s on
+Dashboards are in folder **vLLM**. Use **Spark vLLM — Serving Performance**
+for decode/prefill, DFlash2 accept rate, KV, and tokens. Throughput puts
+prefill on the left axis and decode on the right. Set refresh to 2s on
 the RoCE board. The official Performance Statistics board defaults to
 `granite-33-2b-instruct` — pick **All** or your served model, or use the
 Serving board instead (All by default).
