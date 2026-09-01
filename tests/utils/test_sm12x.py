@@ -12,11 +12,15 @@ from vllm.utils.sm12x import (
     pad_token_rows,
     reject_sm12x_unsafe_decode_query,
     sm12x_align_decode_q_len,
+    sm12x_align_flashinfer_dual_prefill,
     sm12x_align_prefill_q_len,
     sm12x_align_tokens,
+    sm12x_allow_full_decode_capture,
     sm12x_disable_attn_aux_streams,
     sm12x_dspark_capture_sizes,
     sm12x_extend_prefill_slots,
+    sm12x_flashinfer_decode_tune_sizes,
+    sm12x_kernel_warmup_prefill_len,
     sm12x_mixed_warmup_decode_prompt_len,
     sm12x_mixed_warmup_prefill_len,
     sm12x_pad_prefill_token_rows,
@@ -142,6 +146,57 @@ def test_sm12x_does_not_fill_compressed_prefill_slots(monkeypatch):
         lambda fam: False,
     )
     assert sm12x_skip_padded_prefill_c4a([2]) is False
+
+
+def test_sm12x_align_flashinfer_dual_prefill_vision_width(monkeypatch):
+    """Vision SWA is window+384 wide; dual-cache prefill cubin is topk=128."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    swa = torch.arange(2 * 512, dtype=torch.int32).view(2, 512)
+    lens = torch.tensor([128, 80], dtype=torch.int32)
+    extra = torch.zeros(1, 64, 1, 8)
+    extra_i = torch.zeros(2, 512, dtype=torch.int32)
+    extra_l = torch.tensor([512, 512], dtype=torch.int32)
+
+    sliced, slens, e_kv, _, _ = sm12x_align_flashinfer_dual_prefill(
+        swa, lens, extra, extra_i, extra_l, has_image=False
+    )
+    assert sliced.shape[-1] == 128
+    assert torch.equal(sliced, swa[..., :128])
+    assert int(slens.max()) <= 128
+    assert e_kv is extra
+
+    wide, wlens, no_kv, no_i, no_l = sm12x_align_flashinfer_dual_prefill(
+        swa, lens, extra, extra_i, extra_l, has_image=True
+    )
+    assert wide.shape[-1] == 512
+    assert no_kv is None
+    assert no_i is None
+    assert no_l is None
+    assert wlens is lens
+
+    already = torch.zeros(2, 128, dtype=torch.int32)
+    out, _, keep, _, _ = sm12x_align_flashinfer_dual_prefill(
+        already, lens, extra, extra_i, extra_l, has_image=False
+    )
+    assert out is already
+    assert keep is extra
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
+    raw, _, keep_extra, _, _ = sm12x_align_flashinfer_dual_prefill(
+        swa, lens, extra, extra_i, extra_l, has_image=False
+    )
+    assert raw is swa
+    assert keep_extra is extra
 
 
 def test_sm12x_replace_moe_topk_sentinels_zeros_pad_experts(monkeypatch):
@@ -363,10 +418,64 @@ def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
     assert _dspark_full_decode_capture_sizes(aligned) == [36, 24, 18, 12, 6]
     assert 25 not in _dspark_full_decode_capture_sizes(aligned)
     sizes = [1, 2, 4, 8, 16, 24, 32, 36]
-    assert sm12x_dspark_capture_sizes(sizes, aligned) == [6, 24, 36]
-    assert 18 not in sm12x_dspark_capture_sizes(sizes, aligned)
-    assert 12 not in sm12x_dspark_capture_sizes(sizes, aligned)
+    assert sm12x_dspark_capture_sizes(sizes, aligned) == [6, 12, 18, 24, 36]
     assert 25 not in sm12x_dspark_capture_sizes(sizes, aligned)
+    # Vision-Exp k=3 is native q_len=4; 0731 k=5 set must stay 6/12/18/24/36.
+    vision_sizes = [1, 2, 4, 8, 12, 16, 24]
+    assert sm12x_align_decode_q_len(4) == 4
+    assert sm12x_dspark_capture_sizes(vision_sizes, 4) == [4, 8, 12, 16, 24]
+    assert sm12x_dspark_capture_sizes(sizes, 6) == [6, 12, 18, 24, 36]
+    assert sm12x_allow_full_decode_capture(36, aligned) is True
+    assert sm12x_allow_full_decode_capture(24, aligned) is True
+    assert sm12x_allow_full_decode_capture(18, aligned) is True
+    assert sm12x_allow_full_decode_capture(12, aligned) is True
+    assert sm12x_allow_full_decode_capture(6, aligned) is True
+    assert sm12x_flashinfer_decode_tune_sizes(sizes, aligned) == [
+        6,
+        12,
+        18,
+        24,
+        36,
+    ]
+    assert sm12x_kernel_warmup_prefill_len(6) == 8
+    from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+    from vllm.v1.worker.gpu.warmup import warmup_kernels
+
+    assert "sm12x_allow_full_decode_capture" in (
+        CudaGraphManager._init_candidates.__code__.co_names
+    )
+    assert "sm12x_kernel_warmup_prefill_len" in (
+        warmup_kernels.__wrapped__.__code__.co_names
+    )
+    from vllm.model_executor.warmup import flashinfer_sparse_mla_warmup as fi_warmup
+
+    assert "_autotune_sm12x_decode_sizes" in (
+        fi_warmup._run_flashinfer_sparse_mla_decode_autotune.__code__.co_names
+    )
+    from contextlib import nullcontext
+
+    seen: list[tuple[int, bool]] = []
+
+    class _Runner:
+        vllm_config = SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                cudagraph_capture_sizes=[1, 2, 4, 8, 16, 24, 32, 36]
+            )
+        )
+        decode_query_len = 6
+
+        def _dummy_run(self, num_tokens: int, **kwargs: object) -> None:
+            seen.append((num_tokens, bool(kwargs.get("uniform_decode"))))
+
+    monkeypatch.setattr(fi_warmup, "flashinfer_autotune", lambda *a, **k: nullcontext())
+    fi_warmup._autotune_sm12x_decode_sizes(_Runner(), "/tmp/x", is_leader=True)
+    assert seen == [
+        (6, True),
+        (12, True),
+        (18, True),
+        (24, True),
+        (36, True),
+    ]
 
 
 def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
@@ -385,6 +494,9 @@ def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
     assert sm12x_disable_attn_aux_streams() is False
     sizes = [1, 2, 4, 8, 16, 24, 32, 36]
     assert sm12x_dspark_capture_sizes(sizes, 6) == sizes
+    assert sm12x_allow_full_decode_capture(18, 6) is True
+    assert sm12x_flashinfer_decode_tune_sizes(sizes, 6) == []
+    assert sm12x_kernel_warmup_prefill_len(6) == 7
 
 
 def test_sm12x_pad_token_rows(monkeypatch):
@@ -474,6 +586,43 @@ def test_sm12x_dspark_capture_dummy_splits_as_all_decodes(monkeypatch):
         decode_threshold=6,
         treat_short_extends_as_decodes=False,
     ) == (6, 0, 36, 0)
+
+
+def test_sm12x_full_cg_pad_aligns_unpadded_is_prefilling(monkeypatch):
+    """FULL-CG pads 2 DSpark decodes to 4 slots; is_prefilling stays [2].
+
+    Live query_start_loc is ``[0, 6, 12, 12, 12]`` (extra slots q_len=0).
+    ``is_prefill |= prefilling`` then crashed:
+    ``The size of tensor a (4) must match the size of tensor b (2)``.
+    """
+    from vllm.utils import sm12x as sm12x_utils
+    from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    cam = SimpleNamespace(
+        max_query_len=6,
+        num_reqs=4,
+        num_actual_tokens=24,
+        query_start_loc_cpu=torch.tensor([0, 6, 12, 12, 12], dtype=torch.int32),
+        is_prefilling=torch.tensor([False, False]),
+    )
+    assert split_decodes_and_prefills(
+        cam,
+        decode_threshold=6,
+        treat_short_extends_as_decodes=sm12x_treat_short_extends_as_decodes(),
+    ) == (4, 0, 24, 0)
+    cam_mixed = SimpleNamespace(
+        **{**cam.__dict__, "is_prefilling": torch.tensor([False, True])}
+    )
+    assert split_decodes_and_prefills(
+        cam_mixed,
+        decode_threshold=6,
+        treat_short_extends_as_decodes=False,
+    ) == (1, 3, 6, 18)
 
 
 def test_sm12x_c128a_split_matches_swa_for_mixed_warmup(monkeypatch):

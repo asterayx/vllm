@@ -24,7 +24,14 @@ mkdir -p "${VLLM_CACHE}" "${HF_CACHE}/flashinfer" "${B12X_CACHE}"
 docker rm -f "${NAME}" 2>/dev/null || true
 
 # 6 seqs * (1 + DSpark k=5) = 36; include 36 so capture is not truncated to 32.
-CUGRAPH_CFG='{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,4,8,16,24,32,36]}'
+# Vision-Exp (run-vision.sh) overrides these for k=3 / next_n=4.
+# JSON defaults cannot live in ${VAR:-...} (bash cuts at the first `}`).
+if [ -z "${CUGRAPH_CFG+x}" ]; then
+  CUGRAPH_CFG='{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,4,8,16,24,32,36]}'
+fi
+if [ -z "${SPECULATIVE_CONFIG+x}" ]; then
+  SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
+fi
 
 docker run -d --name "${NAME}" \
   --gpus all --ipc=host --network host --privileged \
@@ -42,6 +49,7 @@ docker run -d --name "${NAME}" \
   -e TRANSFORMERS_OFFLINE=1 \
   -e PYTHONPATH=/opt/vllm \
   -e VLLM_HOST_IP="${VLLM_HOST_IP}" \
+  -e VLLM_LOGGING_COLOR=1 \
   -e VLLM_USE_DEEP_GEMM=0 \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
   -e TORCH_CUDA_ARCH_LIST=12.1a \
@@ -74,7 +82,7 @@ docker run -d --name "${NAME}" \
        exec vllm "$@"' \
   vllm \
   serve "${MODEL_PATH}" \
-  --served-model-name deepseek-v4-flash-0731 \
+  --served-model-name "${SERVED_MODEL_NAME:-deepseek-v4-flash-0731}" \
   --host 0.0.0.0 --port "${VLLM_PORT:-30001}" \
   --trust-remote-code \
   --tensor-parallel-size 2 --pipeline-parallel-size 1 \
@@ -85,17 +93,18 @@ docker run -d --name "${NAME}" \
   --max-model-len "${MAX_MODEL_LEN:-524288}" \
   --max-num-seqs "${MAX_NUM_SEQS:-6}" --max-num-batched-tokens 8192 \
   --max-cudagraph-capture-size "${MAX_CUGRAPH:-36}" \
-  --gpu-memory-utilization 0.86 \
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.87}" \
   --tokenizer-mode deepseek_v4 \
   --tool-call-parser deepseek_v4 \
   --enable-auto-tool-choice \
   --reasoning-parser deepseek_v4 \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' \
+  --speculative-config "${SPECULATIVE_CONFIG}" \
   --enable-prefix-caching --async-scheduling --enable-chunked-prefill \
   --enable-flashinfer-autotune \
   --linear-backend "${LINEAR_BACKEND}" \
   --moe-backend "${MOE_BACKEND}" \
   --compilation-config "${CUGRAPH_CFG}" \
+  ${EXTRA_VLLM_ARGS:-} \
   ${HEADLESS}
 
 echo "started ${NAME}; logs: docker logs -f ${NAME}"

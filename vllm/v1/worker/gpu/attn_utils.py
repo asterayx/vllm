@@ -14,6 +14,7 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.utils import align_per_req_tensor
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -288,6 +289,8 @@ def build_attn_metadata(
         group_is_prefilling = common_attn_metadata_extra_kwargs.pop(
             "is_prefilling", is_prefilling
         )
+        if group_is_prefilling is not None:
+            group_is_prefilling = align_per_req_tensor(group_is_prefilling, num_reqs)
         common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,

@@ -28,10 +28,12 @@ SM12X_SAFE_MIN_TOKENS = 16
 SM12X_SAFE_DECODE_Q_LENS = (1, 4, 6, 8, 16, 24, 32, 36)
 SM12X_SAFE_PREFILL_DECODE_Q_LENS = (1, 6, 8, 16, 24, 32, 36)
 SM12X_UNSAFE_PER_REQUEST_Q_LENS = (2, 3)
-# DSpark FULL dummies after aligning q_len 5→6. 36=6×6 and 24=4×6
-# already went green in main capture. 6=1×6 MHC-pads to 16. Drop
-# 18=3×6 and 12=2×6 (main capture never ran those token counts).
-SM12X_DSPARK_SAFE_CAPTURE_TOKENS = (6, 24, 36)
+# DSpark FULL dummies. k=5 aligns q_len 5→6 (6/12/18/24/36). k=3 is
+# native q_len=4 (4/8/12/16/24). Keep 12 and 18 so a 2- or 3-req
+# DSpark batch does not pad to 4/6 slots. Dropping them forced 12→24
+# and crashed: is_prefilling length 2 vs query_lens 4. Extra 4/8/16
+# are ignored for q_len=6 (not divisible).
+SM12X_DSPARK_SAFE_CAPTURE_TOKENS = (4, 6, 8, 12, 16, 18, 24, 36)
 
 
 def sm12x_align_tokens(num_tokens: int, min_tokens: int = SM12X_SAFE_MIN_TOKENS) -> int:
@@ -88,6 +90,49 @@ def sm12x_dspark_capture_sizes(
         if n <= max_cg and n % decode_query_len == 0
     ]
     return allow or sizes
+
+
+def sm12x_allow_full_decode_capture(num_tokens: int, decode_query_len: int) -> bool:
+    """Whether a rounded FULL-decode dummy may be captured on SM12x.
+
+    DSpark ``decode_query_len=6`` rounds capture sizes to multiples of
+    6. Keep the proven set ``6, 12, 18, 24, 36``. Off SM12x, or when
+    ``decode_query_len<=1``, keep every size.
+    """
+    if decode_query_len <= 1:
+        return True
+    if not current_platform.is_device_capability_family(120):
+        return True
+    return (
+        num_tokens in SM12X_DSPARK_SAFE_CAPTURE_TOKENS
+        and num_tokens % decode_query_len == 0
+    )
+
+
+def sm12x_flashinfer_decode_tune_sizes(
+    capture_sizes: list[int] | None,
+    decode_query_len: int,
+) -> list[int]:
+    """DSpark FULL token counts FlashInfer should autotune on SM12x."""
+    if decode_query_len <= 1:
+        return []
+    if not current_platform.is_device_capability_family(120):
+        return []
+    return sm12x_dspark_capture_sizes(capture_sizes, decode_query_len)
+
+
+def sm12x_kernel_warmup_prefill_len(decode_query_len: int) -> int:
+    """V2 kernel-warmup prefill length.
+
+    Stock uses ``decode_query_len + 1`` so the step is not classified
+    as uniform decode. On SM12x that is 7 for DSpark, which FlashInfer
+    pads to 8. Schedule 8 directly (still ``> decode_query_len``).
+    """
+    prompt_len = decode_query_len + 1
+    if not current_platform.is_device_capability_family(120):
+        return prompt_len
+    aligned = sm12x_align_prefill_q_len(prompt_len)
+    return aligned if aligned > decode_query_len else prompt_len
 
 
 def sm12x_align_decode_q_len(q_len: int) -> int:
@@ -197,6 +242,54 @@ def sm12x_should_fill_compressed_prefill_slots(
     keep C4A.
     """
     return False
+
+
+# FlashInfer SM120 DSV4 dual-cache prefill (C4A extra KV) is only
+# instantiated for SWA topk=128. Vision-Exp allocates
+# window + vision_max_n_token (128+384=512) even on text dummy rows.
+FLASHINFER_SM120_DSV4_DUAL_PREFILL_SWA_TOPK = 128
+
+
+def sm12x_align_flashinfer_dual_prefill(
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    extra_kv: torch.Tensor | None,
+    extra_indices: torch.Tensor | None,
+    extra_lens: torch.Tensor | None,
+    *,
+    has_image: bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Make a >64-token FlashInfer prefill hit a compiled cubin.
+
+    Dual-cache prefill accepts SWA topk=128 only. Vision-Exp widens the
+    allocated SWA row to ``window + vision_max_n_token``. Text dummy
+    rows still have that 512-wide buffer, which FlashInfer reads as
+    ``topk=512`` and rejects (``Unsupported sparse-MLA prefill
+    configuration``). Slice text rows to 128 and keep C4A. Image rows
+    need the widened SWA, so drop C4A and use the single-cache 512
+    cubin. 0731 (width 128) is unchanged.
+    """
+    if extra_kv is None or not current_platform.is_device_capability_family(120):
+        return swa_indices, swa_lens, extra_kv, extra_indices, extra_lens
+    topk = int(swa_indices.shape[-1])
+    want = FLASHINFER_SM120_DSV4_DUAL_PREFILL_SWA_TOPK
+    if topk == want:
+        return swa_indices, swa_lens, extra_kv, extra_indices, extra_lens
+    if has_image:
+        return swa_indices, swa_lens, None, None, None
+    return (
+        swa_indices[..., :want],
+        swa_lens.clamp(max=want),
+        extra_kv,
+        extra_indices,
+        extra_lens,
+    )
 
 
 def sm12x_skip_padded_prefill_c4a(query_lens: list[int]) -> bool:

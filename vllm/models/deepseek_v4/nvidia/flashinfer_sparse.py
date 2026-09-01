@@ -30,6 +30,7 @@ from vllm.utils.sm12x import (
     SM12X_SAFE_PREFILL_DECODE_Q_LENS,
     reject_sm12x_unsafe_decode_query,
     sm12x_align_decode_q_len,
+    sm12x_align_flashinfer_dual_prefill,
     sm12x_align_prefill_q_len,
     sm12x_replace_swa_index_sentinels,
     sm12x_skip_padded_prefill_c4a,
@@ -494,6 +495,10 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                 decode_is_valid_token=decode_is_valid_token,
                 swa_block_span=swa_block_span,
                 compressed_block_span=compressed_block_span,
+                prefill_left_visible=swa_metadata.prefill_left_visible,
+                prefill_right_visible=swa_metadata.prefill_right_visible,
+                # getattr for tests that bypass __init__ via object.__new__.
+                max_image_tokens=getattr(self, "max_image_tokens", 0),
             )
             if cache_key != "c4a":
                 swa_metadata.flashinfer_sparse_index_cache[cache_key] = (
@@ -1150,10 +1155,42 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 continue
             swa_indices_chunk = swa_metadata.prefill_swa_indices[query_start:query_end]
             swa_lens_chunk = swa_metadata.prefill_swa_lens[query_start:query_end]
-            if extra_kv_paged is not None and extra_sparse_indices_chunk is None:
+            extra_kv_chunk = extra_kv_paged
+            if extra_kv_chunk is not None and extra_sparse_indices_chunk is None:
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."
                 )
+            if q_chunk.shape[0] > 64:
+                (
+                    swa_indices_chunk,
+                    swa_lens_chunk,
+                    extra_kv_chunk,
+                    extra_sparse_indices_chunk,
+                    extra_sparse_lengths_chunk,
+                ) = sm12x_align_flashinfer_dual_prefill(
+                    swa_indices_chunk,
+                    swa_lens_chunk,
+                    extra_kv_chunk,
+                    extra_sparse_indices_chunk,
+                    extra_sparse_lengths_chunk,
+                    has_image=swa_metadata.prefill_left_visible is not None,
+                )
+                if extra_kv_chunk is None and extra_kv_paged is not None:
+                    logger.info_once(
+                        "SM12x FlashInfer: image-widened SWA prefill is "
+                        "SWA-only (dual-cache cubin is SWA topk=128)"
+                    )
+                elif (
+                    extra_kv_chunk is not None
+                    and swa_indices_chunk.shape[-1]
+                    != swa_metadata.prefill_swa_indices.shape[-1]
+                ):
+                    logger.info_once(
+                        "SM12x FlashInfer: slice Vision SWA prefill %d -> %d "
+                        "to keep C4A dual-cache",
+                        swa_metadata.prefill_swa_indices.shape[-1],
+                        swa_indices_chunk.shape[-1],
+                    )
             if q_chunk.shape[0] <= 64:
                 # SM120's sparse prefill kernel asserts num_tokens > 64.
                 # Small segments use one padded decode-form [1, q_len, ...]
@@ -1185,7 +1222,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 swa_kv_cache=swa_kv_paged,
                 workspace_buffer=self._get_workspace(q.device),
                 sparse_indices=sm12x_replace_swa_index_sentinels(swa_indices_chunk),
-                compressed_kv_cache=extra_kv_paged,
+                compressed_kv_cache=extra_kv_chunk,
                 out=output[query_start:query_end],
                 bmm1_scale=self.scale,
                 sinks=self.attn_sink,

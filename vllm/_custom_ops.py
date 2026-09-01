@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 from enum import IntEnum
 from typing import TYPE_CHECKING, Literal
 
@@ -2441,6 +2442,53 @@ def topk_sigmoid(
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _topk_softplus_sqrt_supports_bias_vl() -> bool:
+    """GB10 images may ship a 10-arg precompiled kernel without bias_vl."""
+    try:
+        schema = torch.ops._moe_C.topk_softplus_sqrt.default._schema
+        return any(arg.name == "bias_vl" for arg in schema.arguments)
+    except Exception:
+        return False
+
+
+def _overwrite_image_rows_with_bias_vl(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    input_tokens: torch.Tensor,
+    bias_vl: torch.Tensor,
+    image_sentinel_lo: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    is_padding: torch.Tensor | None,
+) -> None:
+    """Fix image-token rows after a 10-arg hash kernel (no bias_vl)."""
+    image_mask = (input_tokens >= image_sentinel_lo) & (
+        input_tokens < image_sentinel_lo + 5
+    )
+    if is_padding is not None:
+        image_mask = image_mask & ~is_padding.to(dtype=torch.bool)
+    # No .any() / host sync: this runs inside CUDA-graph capture.
+    scores = torch.sqrt(
+        torch.nn.functional.softplus(gating_output.to(torch.float32))
+    )
+    scores = torch.nan_to_num(scores, nan=0.0)
+    vl_w, vl_i = torch.topk(scores + bias_vl, k=topk_indices.shape[1], dim=-1)
+    vl_w = scores.gather(1, vl_i)
+    if renormalize:
+        vl_w = vl_w / vl_w.sum(dim=-1, keepdim=True)
+    if routed_scaling_factor != 1.0:
+        vl_w = vl_w * routed_scaling_factor
+    row = image_mask.unsqueeze(-1)
+    topk_indices.copy_(
+        torch.where(row, vl_i.to(topk_indices.dtype), topk_indices)
+    )
+    topk_weights.copy_(
+        torch.where(row, vl_w.to(topk_weights.dtype), topk_weights)
+    )
+
+
 def topk_hash_softplus_sqrt(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -2452,7 +2500,27 @@ def topk_hash_softplus_sqrt(
     input_tokens: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     is_padding: torch.Tensor | None = None,
+    bias_vl: torch.Tensor | None = None,
+    image_sentinel_lo: int = 0,
 ) -> None:
+    if _topk_softplus_sqrt_supports_bias_vl():
+        torch.ops._moe_C.topk_softplus_sqrt(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+            routed_scaling_factor,
+            e_score_correction_bias,
+            input_tokens,
+            hash_indices_table,
+            is_padding,
+            bias_vl,
+            image_sentinel_lo,
+        )
+        return
+    # Precompiled GB10 kernel: 10 args only. Text/hash path is unchanged;
+    # image sentinel rows are rewritten below when bias_vl is present.
     torch.ops._moe_C.topk_softplus_sqrt(
         topk_weights,
         topk_indices,
@@ -2465,6 +2533,22 @@ def topk_hash_softplus_sqrt(
         hash_indices_table,
         is_padding,
     )
+    if (
+        bias_vl is not None
+        and image_sentinel_lo > 0
+        and input_tokens is not None
+    ):
+        _overwrite_image_rows_with_bias_vl(
+            topk_weights,
+            topk_indices,
+            gating_output,
+            input_tokens,
+            bias_vl,
+            image_sentinel_lo,
+            renormalize,
+            routed_scaling_factor,
+            is_padding,
+        )
 
 
 def grouped_topk(
