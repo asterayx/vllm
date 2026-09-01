@@ -27,10 +27,17 @@ export MODEL_HOST="${MODEL_HOST:-${HOME}/models/DeepSeek-V4-Flash-Vision-Exp}"
 export MODEL_PATH="${MODEL_PATH:-/models/DeepSeek-V4-Flash-Vision-Exp}"
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-v4-flash-vision-exp}"
 export NAME="${NAME:-dspark-vision-tp2-rank${NODE_RANK:-0}}"
-# Vision tower + aligner need a bit more weight memory than text-only 0731.
-export EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:---limit-mm-per-prompt {\"image\":4}}"
-export SPECULATIVE_CONFIG="${SPECULATIVE_CONFIG:-{\"method\":\"dspark\",\"num_speculative_tokens\":3,\"draft_sample_method\":\"probabilistic\"}}"
+# Do not put JSON inside ${VAR:-...}: bash ends the expansion at the
+# first `}` and produced `...probabilistic"}}`.
+if [ -z "${EXTRA_VLLM_ARGS+x}" ]; then
+  export EXTRA_VLLM_ARGS='--limit-mm-per-prompt {"image":4}'
+fi
+if [ -z "${SPECULATIVE_CONFIG+x}" ]; then
+  export SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}'
+fi
 export MAX_CUGRAPH="${MAX_CUGRAPH:-24}"
-export CUGRAPH_CFG="${CUGRAPH_CFG:-{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,4,8,12,16,24]}}"
+if [ -z "${CUGRAPH_CFG+x}" ]; then
+  export CUGRAPH_CFG='{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,4,8,12,16,24]}'
+fi
 
 exec "$(cd "$(dirname "$0")" && pwd)/run.sh"

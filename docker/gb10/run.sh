@@ -25,8 +25,13 @@ docker rm -f "${NAME}" 2>/dev/null || true
 
 # 6 seqs * (1 + DSpark k=5) = 36; include 36 so capture is not truncated to 32.
 # Vision-Exp (run-vision.sh) overrides these for k=3 / next_n=4.
-CUGRAPH_CFG="${CUGRAPH_CFG:-{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,4,8,16,24,32,36]}}"
-SPECULATIVE_CONFIG="${SPECULATIVE_CONFIG:-{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample_method\":\"probabilistic\"}}"
+# JSON defaults cannot live in ${VAR:-...} (bash cuts at the first `}`).
+if [ -z "${CUGRAPH_CFG+x}" ]; then
+  CUGRAPH_CFG='{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,4,8,16,24,32,36]}'
+fi
+if [ -z "${SPECULATIVE_CONFIG+x}" ]; then
+  SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
+fi
 
 docker run -d --name "${NAME}" \
   --gpus all --ipc=host --network host --privileged \
