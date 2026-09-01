@@ -51,13 +51,17 @@ compose() {
 # Chat UIs often paste [https://x](https://x). Grafana needs a raw URL.
 _strip_md_url() {
   local v="$1"
-  if [[ "$v" =~ ^\[(https?://[^]]+)\]\([^)]+\)$ ]]; then
-    printf '%s' "${BASH_REMATCH[1]}"
-  elif [[ "$v" =~ ^\<(https?://[^>]+)\>$ ]]; then
-    printf '%s' "${BASH_REMATCH[1]}"
-  else
-    printf '%s' "$v"
-  fi
+  case "$v" in
+    \[http://*\]\(*\) | \[https://*\]\(*\))
+      v="${v#\[}"
+      v="${v%%\]*}"
+      ;;
+    \<http://*\> | \<https://*\>)
+      v="${v#\<}"
+      v="${v%\>}"
+      ;;
+  esac
+  printf '%s' "$v"
 }
 
 load_config() {
