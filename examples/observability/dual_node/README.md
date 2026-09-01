@@ -41,7 +41,9 @@ Edit `config.env` (quote `ROCE_DEVICE_REGEX` — it contains `|`):
    to this machine's Wi-Fi IP (`ip -br addr`).
 2. Set `SPARK2_NODE_EXPORTER=<spark2-wifi>:9100` after Spark-2 has
    `node_exporter`. Leave it empty to bring the stack up on Spark-1 only.
-3. Keep `VLLM_METRICS_TARGET=127.0.0.1:8000` if `vllm serve` is on this host.
+3. Keep `VLLM_METRICS_TARGET=127.0.0.1:30001` when using
+   `docker/gb10/run.sh` or `docker/gb10/run-vision.sh` (their default
+   `VLLM_PORT`). Override if you set `VLLM_PORT`.
 
 ```bash
 ./deploy.sh check
@@ -81,14 +83,31 @@ Then on Spark-1 put that address in `SPARK2_NODE_EXPORTER` and run
 
 ## vLLM / NCCL (both nodes)
 
+This example is meant to sit on top of the post-#6 Spark serve scripts.
+Those already set `NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1`, host networking,
+and `/metrics` on the API process (rank 0 only):
+
+```bash
+# Text 0731
+NODE_RANK=0 ./docker/gb10/run.sh
+# or Vision-Exp (PR #6)
+NODE_RANK=0 ./docker/gb10/run-vision.sh
+
+# Worker
+NODE_RANK=1 VLLM_HOST_IP=192.168.100.11 HEADLESS=--headless \
+  ./docker/gb10/run.sh          # or run-vision.sh
+```
+
+Then scrape `http://127.0.0.1:30001/metrics` on the head. Do not point
+`VLLM_HOST_IP` at Wi-Fi or `tun0`. If you serve outside those scripts,
+keep:
+
 ```bash
 export VLLM_HOST_IP=192.168.100.10   # .11 on Spark-2
 export NCCL_SOCKET_IFNAME=enp1s0f1np1
 export NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1
 export NCCL_IB_DISABLE=0
 ```
-
-Do not point `VLLM_HOST_IP` at Wi-Fi or `tun0`.
 
 ## Commands
 

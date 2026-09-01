@@ -59,7 +59,7 @@ load_config() {
   : "${GRAFANA_BIND:=127.0.0.1}"
   : "${GRAFANA_PASSWORD:=admin}"
   : "${PROMETHEUS_LISTEN:=127.0.0.1:9090}"
-  : "${VLLM_METRICS_TARGET:=127.0.0.1:8000}"
+  : "${VLLM_METRICS_TARGET:=127.0.0.1:30001}"
   : "${NODE_EXPORTER_LISTEN:=127.0.0.1:9100}"
   : "${SPARK1_LABEL:=spark-1}"
   : "${SPARK1_NODE_EXPORTER:=127.0.0.1:9100}"
@@ -291,7 +291,8 @@ On Spark-2 (worker), install only node_exporter:
        ./deploy.sh generate && ./deploy.sh up
 
 Do not start Prometheus/Grafana on Spark-2.
-NCCL on both nodes should use:
+Prefer docker/gb10/run.sh or run-vision.sh (metrics on head :30001).
+If you set NCCL yourself:
   export VLLM_HOST_IP=192.168.100.x          # QSFP .100 address
   export NCCL_SOCKET_IFNAME=enp1s0f1np1
   export NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1
