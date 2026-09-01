@@ -12,6 +12,7 @@ from vllm.utils.sm12x import (
     pad_token_rows,
     reject_sm12x_unsafe_decode_query,
     sm12x_align_decode_q_len,
+    sm12x_align_flashinfer_dual_prefill,
     sm12x_align_prefill_q_len,
     sm12x_align_tokens,
     sm12x_allow_full_decode_capture,
@@ -145,6 +146,57 @@ def test_sm12x_does_not_fill_compressed_prefill_slots(monkeypatch):
         lambda fam: False,
     )
     assert sm12x_skip_padded_prefill_c4a([2]) is False
+
+
+def test_sm12x_align_flashinfer_dual_prefill_vision_width(monkeypatch):
+    """Vision SWA is window+384 wide; dual-cache prefill cubin is topk=128."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    swa = torch.arange(2 * 512, dtype=torch.int32).view(2, 512)
+    lens = torch.tensor([128, 80], dtype=torch.int32)
+    extra = torch.zeros(1, 64, 1, 8)
+    extra_i = torch.zeros(2, 512, dtype=torch.int32)
+    extra_l = torch.tensor([512, 512], dtype=torch.int32)
+
+    sliced, slens, e_kv, _, _ = sm12x_align_flashinfer_dual_prefill(
+        swa, lens, extra, extra_i, extra_l, has_image=False
+    )
+    assert sliced.shape[-1] == 128
+    assert torch.equal(sliced, swa[..., :128])
+    assert int(slens.max()) <= 128
+    assert e_kv is extra
+
+    wide, wlens, no_kv, no_i, no_l = sm12x_align_flashinfer_dual_prefill(
+        swa, lens, extra, extra_i, extra_l, has_image=True
+    )
+    assert wide.shape[-1] == 512
+    assert no_kv is None
+    assert no_i is None
+    assert no_l is None
+    assert wlens is lens
+
+    already = torch.zeros(2, 128, dtype=torch.int32)
+    out, _, keep, _, _ = sm12x_align_flashinfer_dual_prefill(
+        already, lens, extra, extra_i, extra_l, has_image=False
+    )
+    assert out is already
+    assert keep is extra
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
+    raw, _, keep_extra, _, _ = sm12x_align_flashinfer_dual_prefill(
+        swa, lens, extra, extra_i, extra_l, has_image=False
+    )
+    assert raw is swa
+    assert keep_extra is extra
 
 
 def test_sm12x_replace_moe_topk_sentinels_zeros_pad_experts(monkeypatch):
@@ -368,6 +420,11 @@ def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
     sizes = [1, 2, 4, 8, 16, 24, 32, 36]
     assert sm12x_dspark_capture_sizes(sizes, aligned) == [6, 12, 18, 24, 36]
     assert 25 not in sm12x_dspark_capture_sizes(sizes, aligned)
+    # Vision-Exp k=3 is native q_len=4; 0731 k=5 set must stay 6/12/18/24/36.
+    vision_sizes = [1, 2, 4, 8, 12, 16, 24]
+    assert sm12x_align_decode_q_len(4) == 4
+    assert sm12x_dspark_capture_sizes(vision_sizes, 4) == [4, 8, 12, 16, 24]
+    assert sm12x_dspark_capture_sizes(sizes, 6) == [6, 12, 18, 24, 36]
     assert sm12x_allow_full_decode_capture(36, aligned) is True
     assert sm12x_allow_full_decode_capture(24, aligned) is True
     assert sm12x_allow_full_decode_capture(18, aligned) is True

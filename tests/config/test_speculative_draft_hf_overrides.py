@@ -12,10 +12,12 @@ when the target itself is shrunk — which is what kept spec-decode archs like
 """
 
 import functools
+from unittest.mock import MagicMock, patch
 
 import pytest
 from transformers import PretrainedConfig
 
+from vllm.config.parallel import ParallelConfig
 from vllm.config.speculative import SpeculativeConfig
 
 
@@ -118,6 +120,75 @@ def test_inkling_override_exposes_all_mtp_depths():
 def _module_level_shrink(hf_config: PretrainedConfig) -> PretrainedConfig:
     hf_config.num_hidden_layers = 1
     return hf_config
+
+
+@pytest.mark.cpu_test
+def test_deepseek_v4_vision_keeps_speculative_decode():
+    """Image sentinels are in-vocab reserved ids, so DSpark is allowed.
+
+    Vision-Exp ships ``num_nextn_predict_layers=3``; the MTP override
+    still stamps that onto ``n_predict``. DSpark must not treat it as k.
+    """
+    config = _make_hf_config(
+        architectures=["DeepseekV4ForCausalLM"],
+        model_type="deepseek_v4",
+        vision_n_layers=32,
+        num_nextn_predict_layers=3,
+    )
+    out = SpeculativeConfig.hf_config_override(config)
+    assert out.model_type == "deepseek_mtp"
+    assert out.architectures == ["DeepSeekV4MTPModel"]
+    assert out.n_predict == 3
+
+
+@pytest.mark.cpu_test
+@patch.object(SpeculativeConfig, "update_arch_", lambda self: None)
+@patch("vllm.config.speculative.ModelConfig")
+def test_dspark_k5_allowed_when_vision_n_predict_is_3(mock_model_config_cls):
+    """Vision-Exp n_predict=3 must not reject the Spark DSpark k=5."""
+    mock_draft = MagicMock()
+    mock_draft.architectures = ["DeepSeekV4MTPModel"]
+    mock_draft.hf_config.model_type = "deepseek_mtp"
+    mock_draft.hf_config.n_predict = 3
+    mock_draft.hf_config.dspark_draft_topk = None
+    mock_draft.max_model_len = 4096
+    mock_model_config_cls.return_value = mock_draft
+
+    target_config = MagicMock()
+    target_config.model = "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
+    target_config.model_weights = target_config.model
+    target_config.tokenizer = target_config.model
+    target_config.tokenizer_mode = "deepseek_v4"
+    target_config.trust_remote_code = True
+    target_config.allowed_local_media_path = ""
+    target_config.allowed_media_domains = None
+    target_config.dtype = "auto"
+    target_config.seed = 0
+    target_config.tokenizer_revision = None
+    target_config.max_model_len = 4096
+    target_config.quantization = None
+    target_config.enforce_eager = False
+    target_config.max_logprobs = 20
+    target_config.hf_overrides = None
+    target_config.config_format = None
+    target_config.architectures = ["DeepseekV4ForConditionalGeneration"]
+    target_config.hf_config.model_type = "deepseek_v4"
+    target_config.hf_config.architectures = [
+        "DeepseekV4ForConditionalGeneration"
+    ]
+    target_config.hf_text_config.model_type = "deepseek_v4"
+
+    spec = SpeculativeConfig(
+        method="dspark",
+        num_speculative_tokens=5,
+        draft_sample_method="probabilistic",
+        target_model_config=target_config,
+        target_parallel_config=ParallelConfig(),
+    )
+    assert spec.num_speculative_tokens == 5
+    assert spec.method == "dspark"
+    assert spec.draft_model_config.hf_config.n_predict is None
+    assert spec.draft_model_config.hf_config.architectures == ["DSparkDraftModel"]
 
 
 @pytest.mark.cpu_test
