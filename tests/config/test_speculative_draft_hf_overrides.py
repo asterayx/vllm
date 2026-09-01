@@ -150,6 +150,7 @@ def test_dspark_k5_allowed_when_vision_n_predict_is_3(mock_model_config_cls):
     mock_draft.architectures = ["DeepSeekV4MTPModel"]
     mock_draft.hf_config.model_type = "deepseek_mtp"
     mock_draft.hf_config.n_predict = 3
+    mock_draft.hf_config.dspark_draft_topk = None
     mock_draft.max_model_len = 4096
     mock_model_config_cls.return_value = mock_draft
 
