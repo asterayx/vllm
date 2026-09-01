@@ -511,7 +511,7 @@ panels = [
                 (
                     "sum by (position) "
                     f"(rate(vllm:spec_decode_num_accepted_tokens_per_pos_total{{{M}}}"
-                    "[$__rate_interval])) / "
+                    "[$__rate_interval])) / on() group_left() "
                     f"clamp_min({rate_c('vllm:spec_decode_num_drafts_total')}, 1e-9)"
                 ),
                 "pos {{position}}",

@@ -1603,7 +1603,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (position) (rate(vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(vllm:spec_decode_num_drafts_total{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
+          "expr": "sum by (position) (rate(vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name=~\"$model\"}[$__rate_interval])) / on() group_left() clamp_min(sum(rate(vllm:spec_decode_num_drafts_total{model_name=~\"$model\"}[$__rate_interval])), 1e-9)",
           "legendFormat": "pos {{position}}",
           "refId": "A"
         }
