@@ -600,3 +600,43 @@ def test_dsv4_fast_topk_bias_vl():
     assert topk_ids.dtype == torch.int64
     torch.testing.assert_close(topk_ids_ref.to(torch.int64), topk_ids, atol=0, rtol=0)
     torch.testing.assert_close(topk_weights_ref, topk_weights, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.cpu_test
+def test_legacy_kernel_overwrites_image_rows_with_bias_vl():
+    """GB10 precompiled topk_softplus_sqrt has no bias_vl args."""
+    num_tokens, num_experts, topk = 4, 8, 2
+    lo = 129257
+    gating = torch.randn(num_tokens, num_experts, dtype=torch.float32)
+    input_ids = torch.tensor([1, lo, lo + 2, 7], dtype=torch.int64)
+    bias_vl = torch.arange(num_experts, dtype=torch.float32)
+    topk_weights = torch.zeros(num_tokens, topk, dtype=torch.float32)
+    topk_indices = torch.zeros(num_tokens, topk, dtype=torch.int32)
+    # Pretend the 10-arg hash kernel wrote zeros for every row.
+    ops._overwrite_image_rows_with_bias_vl(
+        topk_weights,
+        topk_indices,
+        gating,
+        input_ids,
+        bias_vl,
+        lo,
+        renormalize=False,
+        routed_scaling_factor=1.0,
+        is_padding=None,
+    )
+    ref_w, ref_i = _torch_topk_softplus_sqrt(
+        gating_output=gating,
+        topk=topk,
+        renormalize=False,
+        routed_scaling_factor=1.0,
+        input_ids=input_ids,
+        hash_indices_table=torch.zeros(
+            lo + 8, topk, dtype=torch.int32
+        ),
+        bias_vl=bias_vl,
+        image_sentinel_lo=lo,
+    )
+    image = (input_ids >= lo) & (input_ids < lo + 5)
+    torch.testing.assert_close(topk_indices[image].to(torch.int64), ref_i[image].long())
+    torch.testing.assert_close(topk_weights[image], ref_w[image], atol=2e-5, rtol=2e-5)
+    assert torch.count_nonzero(topk_indices[~image]) == 0
