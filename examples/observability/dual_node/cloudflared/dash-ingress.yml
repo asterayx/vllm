@@ -1,0 +1,10 @@
+# Paste this rule ABOVE your existing /telemetry and / rules
+# in ~/.cloudflared/config.yml, then:
+#   sudo systemctl restart cloudflared
+#   # or: cloudflared tunnel run
+- hostname: token.asterayx.com
+  path: /dash(/.*)?
+  service: http://192.168.8.134:3000
+  originRequest:
+    httpHostHeader: token.asterayx.com
+    disableChunkedEncoding: true

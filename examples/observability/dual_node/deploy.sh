@@ -58,6 +58,10 @@ load_config() {
   set +a
   : "${GRAFANA_BIND:=127.0.0.1}"
   : "${GRAFANA_PASSWORD:=admin}"
+  : "${GRAFANA_DOMAIN:=}"
+  : "${GRAFANA_ROOT_URL:=http://${GRAFANA_BIND}:3000/}"
+  : "${GRAFANA_SERVE_FROM_SUB_PATH:=false}"
+  : "${GRAFANA_COOKIE_SECURE:=true}"
   : "${PROMETHEUS_LISTEN:=127.0.0.1:9090}"
   : "${VLLM_METRICS_TARGET:=127.0.0.1:30001}"
   : "${NODE_EXPORTER_LISTEN:=127.0.0.1:9100}"
@@ -256,12 +260,14 @@ EOF
 cmd_up() {
   load_config
   cmd_generate
-  export GRAFANA_BIND GRAFANA_PASSWORD PROMETHEUS_LISTEN
-  compose up -d
+  export GRAFANA_BIND GRAFANA_PASSWORD GRAFANA_DOMAIN GRAFANA_ROOT_URL
+  export GRAFANA_SERVE_FROM_SUB_PATH GRAFANA_COOKIE_SECURE PROMETHEUS_LISTEN
+  compose up -d --force-recreate grafana
   log "Waiting for Grafana..."
   local i
   for i in $(seq 1 30); do
-    if curl -fsS --max-time 2 "http://${GRAFANA_BIND}:3000/api/health" >/dev/null 2>&1; then
+    if curl -fsS --max-time 2 "http://${GRAFANA_BIND}:3000/dash/api/health" >/dev/null 2>&1 \
+      || curl -fsS --max-time 2 "http://${GRAFANA_BIND}:3000/api/health" >/dev/null 2>&1; then
       break
     fi
     sleep 1
