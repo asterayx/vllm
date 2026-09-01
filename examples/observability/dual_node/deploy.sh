@@ -289,6 +289,7 @@ datasources:
       timeInterval: 2s
 EOF
   cp -f "$ROOT/grafana/roce.json" "$ROOT/generated/dashboards/roce.json"
+  cp -f "$ROOT/grafana/serving.json" "$ROOT/generated/dashboards/serving.json"
   # Compose interpolates ${VAR} from .env / the shell, not from config.env.
   cat >"$ROOT/.env" <<EOF
 GRAFANA_BIND=${GRAFANA_BIND}
