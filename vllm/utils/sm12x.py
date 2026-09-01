@@ -243,6 +243,54 @@ def sm12x_should_fill_compressed_prefill_slots(
     return False
 
 
+# FlashInfer SM120 DSV4 dual-cache prefill (C4A extra KV) is only
+# instantiated for SWA topk=128. Vision-Exp allocates
+# window + vision_max_n_token (128+384=512) even on text dummy rows.
+FLASHINFER_SM120_DSV4_DUAL_PREFILL_SWA_TOPK = 128
+
+
+def sm12x_align_flashinfer_dual_prefill(
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    extra_kv: torch.Tensor | None,
+    extra_indices: torch.Tensor | None,
+    extra_lens: torch.Tensor | None,
+    *,
+    has_image: bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Make a >64-token FlashInfer prefill hit a compiled cubin.
+
+    Dual-cache prefill accepts SWA topk=128 only. Vision-Exp widens the
+    allocated SWA row to ``window + vision_max_n_token``. Text dummy
+    rows still have that 512-wide buffer, which FlashInfer reads as
+    ``topk=512`` and rejects (``Unsupported sparse-MLA prefill
+    configuration``). Slice text rows to 128 and keep C4A. Image rows
+    need the widened SWA, so drop C4A and use the single-cache 512
+    cubin. 0731 (width 128) is unchanged.
+    """
+    if extra_kv is None or not current_platform.is_device_capability_family(120):
+        return swa_indices, swa_lens, extra_kv, extra_indices, extra_lens
+    topk = int(swa_indices.shape[-1])
+    want = FLASHINFER_SM120_DSV4_DUAL_PREFILL_SWA_TOPK
+    if topk == want:
+        return swa_indices, swa_lens, extra_kv, extra_indices, extra_lens
+    if has_image:
+        return swa_indices, swa_lens, None, None, None
+    return (
+        swa_indices[..., :want],
+        swa_lens.clamp(max=want),
+        extra_kv,
+        extra_indices,
+        extra_lens,
+    )
+
+
 def sm12x_skip_padded_prefill_c4a(query_lens: list[int]) -> bool:
     """True when every prefill span will launch SWA-only [1, 6].
 
