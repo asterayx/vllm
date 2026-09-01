@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.utils.math_utils import cdiv
 from vllm.utils.sm12x import (
+    sm12x_kernel_warmup_prefill_len,
     sm12x_mixed_warmup_decode_prompt_len,
     sm12x_mixed_warmup_prefill_len,
 )
@@ -228,10 +229,10 @@ def warmup_kernels(
 
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
-    # Use decode_query_len + 1 tokens so the prefill batch's per-request query
-    # length exceeds decode_query_len, preventing it from being misclassified as
-    # a uniform decode batch.
-    prompt_len = decode_query_len + 1
+    # Prefill must be longer than decode_query_len so the step is not
+    # classified as uniform decode. On SM12x, snap 7 (DSpark 6+1) to 8
+    # so FlashInfer does not pad a 7-token first-prefill.
+    prompt_len = sm12x_kernel_warmup_prefill_len(decode_query_len)
     prompt_token_ids = list(range(prompt_len))
     # Upper bound on the decode steps built in `decode_steps` below.
     num_decode_steps = 1
@@ -306,7 +307,7 @@ def warmup_kernels(
     if model_runner.kv_block_zeroer is not None:
         model_runner.kv_block_zeroer.warmup(model_runner.kv_cache_config.num_blocks)
 
-    # Step 1: Prefill all requests with 1 + decode_query_len prompt tokens each.
+    # Step 1: Prefill all requests (SM12x uses a safe width > decode_query_len).
     new_reqs = [
         NewRequestData.from_request(
             Request(

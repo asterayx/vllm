@@ -42,6 +42,7 @@ docker run -d --name "${NAME}" \
   -e TRANSFORMERS_OFFLINE=1 \
   -e PYTHONPATH=/opt/vllm \
   -e VLLM_HOST_IP="${VLLM_HOST_IP}" \
+  -e VLLM_LOGGING_COLOR=1 \
   -e VLLM_USE_DEEP_GEMM=0 \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
   -e TORCH_CUDA_ARCH_LIST=12.1a \
@@ -85,7 +86,7 @@ docker run -d --name "${NAME}" \
   --max-model-len "${MAX_MODEL_LEN:-524288}" \
   --max-num-seqs "${MAX_NUM_SEQS:-6}" --max-num-batched-tokens 8192 \
   --max-cudagraph-capture-size "${MAX_CUGRAPH:-36}" \
-  --gpu-memory-utilization 0.86 \
+  --gpu-memory-utilization 0.87 \
   --tokenizer-mode deepseek_v4 \
   --tool-call-parser deepseek_v4 \
   --enable-auto-tool-choice \

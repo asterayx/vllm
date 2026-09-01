@@ -14,9 +14,12 @@ from vllm.utils.sm12x import (
     sm12x_align_decode_q_len,
     sm12x_align_prefill_q_len,
     sm12x_align_tokens,
+    sm12x_allow_full_decode_capture,
     sm12x_disable_attn_aux_streams,
     sm12x_dspark_capture_sizes,
     sm12x_extend_prefill_slots,
+    sm12x_flashinfer_decode_tune_sizes,
+    sm12x_kernel_warmup_prefill_len,
     sm12x_mixed_warmup_decode_prompt_len,
     sm12x_mixed_warmup_prefill_len,
     sm12x_pad_prefill_token_rows,
@@ -363,10 +366,59 @@ def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
     assert _dspark_full_decode_capture_sizes(aligned) == [36, 24, 18, 12, 6]
     assert 25 not in _dspark_full_decode_capture_sizes(aligned)
     sizes = [1, 2, 4, 8, 16, 24, 32, 36]
-    assert sm12x_dspark_capture_sizes(sizes, aligned) == [6, 24, 36]
-    assert 18 not in sm12x_dspark_capture_sizes(sizes, aligned)
-    assert 12 not in sm12x_dspark_capture_sizes(sizes, aligned)
+    assert sm12x_dspark_capture_sizes(sizes, aligned) == [6, 12, 18, 24, 36]
     assert 25 not in sm12x_dspark_capture_sizes(sizes, aligned)
+    assert sm12x_allow_full_decode_capture(36, aligned) is True
+    assert sm12x_allow_full_decode_capture(24, aligned) is True
+    assert sm12x_allow_full_decode_capture(18, aligned) is True
+    assert sm12x_allow_full_decode_capture(12, aligned) is True
+    assert sm12x_allow_full_decode_capture(6, aligned) is True
+    assert sm12x_flashinfer_decode_tune_sizes(sizes, aligned) == [
+        6,
+        12,
+        18,
+        24,
+        36,
+    ]
+    assert sm12x_kernel_warmup_prefill_len(6) == 8
+    from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+    from vllm.v1.worker.gpu.warmup import warmup_kernels
+
+    assert "sm12x_allow_full_decode_capture" in (
+        CudaGraphManager._init_candidates.__code__.co_names
+    )
+    assert "sm12x_kernel_warmup_prefill_len" in (
+        warmup_kernels.__wrapped__.__code__.co_names
+    )
+    from vllm.model_executor.warmup import flashinfer_sparse_mla_warmup as fi_warmup
+
+    assert "_autotune_sm12x_decode_sizes" in (
+        fi_warmup._run_flashinfer_sparse_mla_decode_autotune.__code__.co_names
+    )
+    from contextlib import nullcontext
+
+    seen: list[tuple[int, bool]] = []
+
+    class _Runner:
+        vllm_config = SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                cudagraph_capture_sizes=[1, 2, 4, 8, 16, 24, 32, 36]
+            )
+        )
+        decode_query_len = 6
+
+        def _dummy_run(self, num_tokens: int, **kwargs: object) -> None:
+            seen.append((num_tokens, bool(kwargs.get("uniform_decode"))))
+
+    monkeypatch.setattr(fi_warmup, "flashinfer_autotune", lambda *a, **k: nullcontext())
+    fi_warmup._autotune_sm12x_decode_sizes(_Runner(), "/tmp/x", is_leader=True)
+    assert seen == [
+        (6, True),
+        (12, True),
+        (18, True),
+        (24, True),
+        (36, True),
+    ]
 
 
 def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
@@ -385,6 +437,9 @@ def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
     assert sm12x_disable_attn_aux_streams() is False
     sizes = [1, 2, 4, 8, 16, 24, 32, 36]
     assert sm12x_dspark_capture_sizes(sizes, 6) == sizes
+    assert sm12x_allow_full_decode_capture(18, 6) is True
+    assert sm12x_flashinfer_decode_tune_sizes(sizes, 6) == []
+    assert sm12x_kernel_warmup_prefill_len(6) == 7
 
 
 def test_sm12x_pad_token_rows(monkeypatch):
@@ -474,6 +529,43 @@ def test_sm12x_dspark_capture_dummy_splits_as_all_decodes(monkeypatch):
         decode_threshold=6,
         treat_short_extends_as_decodes=False,
     ) == (6, 0, 36, 0)
+
+
+def test_sm12x_full_cg_pad_aligns_unpadded_is_prefilling(monkeypatch):
+    """FULL-CG pads 2 DSpark decodes to 4 slots; is_prefilling stays [2].
+
+    Live query_start_loc is ``[0, 6, 12, 12, 12]`` (extra slots q_len=0).
+    ``is_prefill |= prefilling`` then crashed:
+    ``The size of tensor a (4) must match the size of tensor b (2)``.
+    """
+    from vllm.utils import sm12x as sm12x_utils
+    from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    cam = SimpleNamespace(
+        max_query_len=6,
+        num_reqs=4,
+        num_actual_tokens=24,
+        query_start_loc_cpu=torch.tensor([0, 6, 12, 12, 12], dtype=torch.int32),
+        is_prefilling=torch.tensor([False, False]),
+    )
+    assert split_decodes_and_prefills(
+        cam,
+        decode_threshold=6,
+        treat_short_extends_as_decodes=sm12x_treat_short_extends_as_decodes(),
+    ) == (4, 0, 24, 0)
+    cam_mixed = SimpleNamespace(
+        **{**cam.__dict__, "is_prefilling": torch.tensor([False, True])}
+    )
+    assert split_decodes_and_prefills(
+        cam_mixed,
+        decode_threshold=6,
+        treat_short_extends_as_decodes=False,
+    ) == (1, 3, 6, 18)
 
 
 def test_sm12x_c128a_split_matches_swa_for_mixed_warmup(monkeypatch):

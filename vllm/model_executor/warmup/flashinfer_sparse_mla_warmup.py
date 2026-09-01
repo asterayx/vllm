@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Warmup and autotune helpers for FlashInfer sparse MLA backends."""
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -14,6 +15,7 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import autotune as flashinfer_autotune
 from vllm.utils.flashinfer import has_flashinfer
+from vllm.utils.sm12x import sm12x_flashinfer_decode_tune_sizes
 from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
 
 if TYPE_CHECKING:
@@ -75,6 +77,45 @@ def _flashinfer_sparse_mla_decode_label(
 
 def _clamp_warmup_tokens(num_tokens: int, max_tokens: int) -> int:
     return max(0, min(num_tokens, max_tokens))
+
+
+def _runner_decode_query_len(runner: object) -> int:
+    return int(
+        getattr(runner, "decode_query_len", None)
+        or getattr(runner, "uniform_decode_query_len", 1)
+        or 1
+    )
+
+
+def _autotune_sm12x_decode_sizes(
+    runner: "GPUModelRunner",
+    cache_path: object,
+    *,
+    is_leader: bool,
+) -> None:
+    """Dummy-run DSpark FULL sizes so FlashInfer records those decode shapes."""
+    sizes = sm12x_flashinfer_decode_tune_sizes(
+        list(runner.vllm_config.compilation_config.cudagraph_capture_sizes or []),
+        _runner_decode_query_len(runner),
+    )
+    if not sizes:
+        return
+    if is_leader:
+        logger.info(
+            "SM12x FlashInfer: autotune DSpark decode sizes %s",
+            sizes,
+        )
+    ctx = (
+        flashinfer_autotune(True, cache=str(cache_path)) if is_leader else nullcontext()
+    )
+    dummy_kwargs = dict(
+        skip_eplb=True,
+        is_profile=True,
+        uniform_decode=True,
+    )
+    with ctx:
+        for num_tokens in sizes:
+            runner._dummy_run(num_tokens, **dummy_kwargs)
 
 
 def _uses_v2_model_runner(runner: "GPUModelRunner") -> bool:
@@ -155,6 +196,8 @@ def _run_flashinfer_sparse_mla_decode_autotune(
                 )
             else:
                 runner._dummy_run(**dummy_run_kwargs)
+        if warmup_executed:
+            _autotune_sm12x_decode_sizes(runner, cache_path, is_leader=is_leader)
 
     if not warmup_executed:
         return False
