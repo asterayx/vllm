@@ -2469,8 +2469,7 @@ def _overwrite_image_rows_with_bias_vl(
     )
     if is_padding is not None:
         image_mask = image_mask & ~is_padding.to(dtype=torch.bool)
-    if not bool(image_mask.any()):
-        return
+    # No .any() / host sync: this runs inside CUDA-graph capture.
     scores = torch.sqrt(
         torch.nn.functional.softplus(gating_output.to(torch.float32))
     )
