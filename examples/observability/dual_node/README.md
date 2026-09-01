@@ -92,9 +92,12 @@ On the head (`192.168.100.10`), publish Grafana at
 4. Restart the tunnel (`sudo systemctl restart cloudflared` or
    `cloudflared tunnel run`).
 
-Grafana origin is `http://192.168.8.134:3000` (Wi-Fi bind). Login at
-`https://token.asterayx.com/dash` with `admin` / `admin`. Change that
-password; this URL is on the public internet.
+Cloudflare **URL** must be `http://127.0.0.1:3000` with Path `dash`.
+Do not set the origin to `http://127.0.0.1:3000/dash` — the public
+path is already forwarded, and you would get `/dash/dash`.
+
+Login at `https://token.asterayx.com/dash` with `admin` / `admin`.
+Change that password; this URL is on the public internet.
 
 ## Spark-2 / worker
 

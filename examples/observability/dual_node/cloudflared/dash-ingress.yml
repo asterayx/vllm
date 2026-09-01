@@ -4,7 +4,7 @@
 #   # or: cloudflared tunnel run
 - hostname: token.asterayx.com
   path: /dash(/.*)?
-  service: http://192.168.8.134:3000
+  service: http://127.0.0.1:3000
   originRequest:
     httpHostHeader: token.asterayx.com
     disableChunkedEncoding: true

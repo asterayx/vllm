@@ -11,10 +11,11 @@ tunnel: TUNNEL_ID
 credentials-file: /home/YOUR_USER/.cloudflared/TUNNEL_ID.json
 
 ingress:
-  # Grafana (this stack). Origin is the Wi-Fi bind from config.env.
+  # Grafana on loopback. Do not put /dash on the service URL — the
+  # public path is forwarded as-is (…/dash → 127.0.0.1:3000/dash).
   - hostname: token.asterayx.com
     path: /dash(/.*)?
-    service: http://192.168.8.134:3000
+    service: http://127.0.0.1:3000
     originRequest:
       httpHostHeader: token.asterayx.com
       disableChunkedEncoding: true
