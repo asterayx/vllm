@@ -591,8 +591,15 @@ class DeepseekV4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
         # hf_config.architectures (get_model_architecture).
         # The VL wrapper marks the config copy it hands to the inner text
         # backbone with _dsv4_vl_inner so this rewrite does not recurse.
-        if getattr(hf_config, "vision_n_layers", 0) > 0 and not getattr(
-            hf_config, "_dsv4_vl_inner", False
+        # DSpark/MTP drafts reuse the vision checkpoint config but must stay
+        # on the text draft class — rewriting them to the VL wrapper rebuilds
+        # language_model.model.layers.* and collides with the target SWA cache.
+        archs = set(getattr(hf_config, "architectures", None) or [])
+        if (
+            getattr(hf_config, "vision_n_layers", 0) > 0
+            and not getattr(hf_config, "_dsv4_vl_inner", False)
+            and "DSparkDraftModel" not in archs
+            and "DeepSeekV4MTPModel" not in archs
         ):
             hf_config.architectures = ["DeepseekV4ForConditionalGeneration"]
         super().__init__(hf_config, hf_text_config, revision)

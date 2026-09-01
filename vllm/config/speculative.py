@@ -1345,6 +1345,9 @@ class SpeculativeConfig:
                     self.draft_model_config.hf_config.architectures = [
                         "DSparkDraftModel"
                     ]
+                    # Keep the convertor from rewriting this back to the VL
+                    # wrapper (vision_n_layers > 0 on Vision-Exp).
+                    self.draft_model_config.hf_config._dsv4_vl_inner = True
                     # hf_config_override stamped n_predict from
                     # num_nextn_predict_layers (0731=1, Vision-Exp=3). That
                     # value is the MTP reuse stride, not DSpark k. Leaving

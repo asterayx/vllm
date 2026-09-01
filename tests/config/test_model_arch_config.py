@@ -488,3 +488,27 @@ def test_deepseek_v4_convertor_splits_vision_architecture():
     conv = DeepseekV4ModelArchConfigConvertor(vl_cfg, vl_cfg)
     assert conv.get_architectures() == ["DeepseekV4ForConditionalGeneration"]
     assert vl_cfg.architectures == ["DeepseekV4ForConditionalGeneration"]
+
+
+def test_deepseek_v4_convertor_keeps_dspark_draft_architecture():
+    """Vision-Exp DSpark drafts reuse the VL checkpoint config; the
+    convertor must not rewrite them to the VL wrapper (duplicate SWA
+    cache names under language_model.model.layers.*)."""
+    from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
+    from vllm.transformers_utils.model_arch_config_convertor import (
+        DeepseekV4ModelArchConfigConvertor,
+    )
+
+    draft_cfg = DeepseekV4Config(
+        architectures=["DSparkDraftModel"], vision_n_layers=32
+    )
+    conv = DeepseekV4ModelArchConfigConvertor(draft_cfg, draft_cfg)
+    assert conv.get_architectures() == ["DSparkDraftModel"]
+    assert draft_cfg.architectures == ["DSparkDraftModel"]
+
+    mtp_cfg = DeepseekV4Config(
+        architectures=["DeepSeekV4MTPModel"], vision_n_layers=32
+    )
+    conv = DeepseekV4ModelArchConfigConvertor(mtp_cfg, mtp_cfg)
+    assert conv.get_architectures() == ["DeepSeekV4MTPModel"]
+    assert mtp_cfg.architectures == ["DeepSeekV4MTPModel"]
