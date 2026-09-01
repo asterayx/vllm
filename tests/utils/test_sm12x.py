@@ -420,6 +420,11 @@ def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
     sizes = [1, 2, 4, 8, 16, 24, 32, 36]
     assert sm12x_dspark_capture_sizes(sizes, aligned) == [6, 12, 18, 24, 36]
     assert 25 not in sm12x_dspark_capture_sizes(sizes, aligned)
+    # Vision-Exp k=3 is native q_len=4; 0731 k=5 set must stay 6/12/18/24/36.
+    vision_sizes = [1, 2, 4, 8, 12, 16, 24]
+    assert sm12x_align_decode_q_len(4) == 4
+    assert sm12x_dspark_capture_sizes(vision_sizes, 4) == [4, 8, 12, 16, 24]
+    assert sm12x_dspark_capture_sizes(sizes, 6) == [6, 12, 18, 24, 36]
     assert sm12x_allow_full_decode_capture(36, aligned) is True
     assert sm12x_allow_full_decode_capture(24, aligned) is True
     assert sm12x_allow_full_decode_capture(18, aligned) is True

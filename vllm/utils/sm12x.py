@@ -28,11 +28,12 @@ SM12X_SAFE_MIN_TOKENS = 16
 SM12X_SAFE_DECODE_Q_LENS = (1, 4, 6, 8, 16, 24, 32, 36)
 SM12X_SAFE_PREFILL_DECODE_Q_LENS = (1, 6, 8, 16, 24, 32, 36)
 SM12X_UNSAFE_PER_REQUEST_Q_LENS = (2, 3)
-# DSpark FULL dummies after aligning q_len 5→6. 6/12/18/24/36 all
-# captured green as the 5/5 set (8→12, 16→18). Keep 12 and 18 so a
-# 2- or 3-req DSpark batch does not pad to 4/6 slots. Dropping them
-# forced 12→24 and crashed: is_prefilling length 2 vs query_lens 4.
-SM12X_DSPARK_SAFE_CAPTURE_TOKENS = (6, 12, 18, 24, 36)
+# DSpark FULL dummies. k=5 aligns q_len 5→6 (6/12/18/24/36). k=3 is
+# native q_len=4 (4/8/12/16/24). Keep 12 and 18 so a 2- or 3-req
+# DSpark batch does not pad to 4/6 slots. Dropping them forced 12→24
+# and crashed: is_prefilling length 2 vs query_lens 4. Extra 4/8/16
+# are ignored for q_len=6 (not divisible).
+SM12X_DSPARK_SAFE_CAPTURE_TOKENS = (4, 6, 8, 12, 16, 18, 24, 36)
 
 
 def sm12x_align_tokens(num_tokens: int, min_tokens: int = SM12X_SAFE_MIN_TOKENS) -> int:
