@@ -121,6 +121,21 @@ def _module_level_shrink(hf_config: PretrainedConfig) -> PretrainedConfig:
 
 
 @pytest.mark.cpu_test
+def test_deepseek_v4_vision_keeps_speculative_decode():
+    """Image sentinels are in-vocab reserved ids, so DSpark is allowed."""
+    config = _make_hf_config(
+        architectures=["DeepseekV4ForCausalLM"],
+        model_type="deepseek_v4",
+        vision_n_layers=32,
+        num_nextn_predict_layers=1,
+    )
+    out = SpeculativeConfig.hf_config_override(config)
+    assert out.model_type == "deepseek_mtp"
+    assert out.architectures == ["DeepSeekV4MTPModel"]
+    assert out.n_predict == 1
+
+
+@pytest.mark.cpu_test
 def test_composed_override_is_picklable():
     """The draft ``ModelConfig`` is sent to spawned engine-core processes, so
     the composed override must be picklable. A nested local closure is not

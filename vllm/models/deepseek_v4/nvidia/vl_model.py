@@ -15,6 +15,8 @@ Thin multimodal wrapper around the text-only ``DeepseekV4ForCausalLM``:
   its hyper-connection stream expansion. Raw ``input_ids`` still flow into
   the model so the MoE router can apply ``bias_vl`` to image tokens
   (``requires_raw_input_tokens``).
+- Image sentinels are in-vocab reserved ids, so DSpark can stay enabled;
+  ``lm_head`` and ``get_mtp_target_hidden_states`` proxy the text backbone.
 """
 
 from collections.abc import Iterable
@@ -71,8 +73,7 @@ def _make_deepseek_v4_vl_weights_mapper(
         },
         orig_to_new_substr={
             ".shared_experts.w2": ".shared_experts.down_proj",
-            # The MTP/DSpark draft heads are not supported for the vision
-            # variant; drop their weights.
+            # Target wrapper drops MTP; DSpark draft loads mtp.* separately.
             "mtp.": None,
         },
     )
@@ -264,6 +265,13 @@ class DeepseekV4ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
             multimodal_embeddings=multimodal_embeddings,
             is_multimodal=is_multimodal,
         )
+
+    @property
+    def lm_head(self):
+        return self.language_model.lm_head
+
+    def get_mtp_target_hidden_states(self):
+        return self.language_model.get_mtp_target_hidden_states()
 
     def forward(
         self,

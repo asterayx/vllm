@@ -75,7 +75,7 @@ docker run -d --name "${NAME}" \
        exec vllm "$@"' \
   vllm \
   serve "${MODEL_PATH}" \
-  --served-model-name deepseek-v4-flash-0731 \
+  --served-model-name "${SERVED_MODEL_NAME:-deepseek-v4-flash-0731}" \
   --host 0.0.0.0 --port "${VLLM_PORT:-30001}" \
   --trust-remote-code \
   --tensor-parallel-size 2 --pipeline-parallel-size 1 \
@@ -86,7 +86,7 @@ docker run -d --name "${NAME}" \
   --max-model-len "${MAX_MODEL_LEN:-524288}" \
   --max-num-seqs "${MAX_NUM_SEQS:-6}" --max-num-batched-tokens 8192 \
   --max-cudagraph-capture-size "${MAX_CUGRAPH:-36}" \
-  --gpu-memory-utilization 0.87 \
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.87}" \
   --tokenizer-mode deepseek_v4 \
   --tool-call-parser deepseek_v4 \
   --enable-auto-tool-choice \
@@ -97,6 +97,7 @@ docker run -d --name "${NAME}" \
   --linear-backend "${LINEAR_BACKEND}" \
   --moe-backend "${MOE_BACKEND}" \
   --compilation-config "${CUGRAPH_CFG}" \
+  ${EXTRA_VLLM_ARGS:-} \
   ${HEADLESS}
 
 echo "started ${NAME}; logs: docker logs -f ${NAME}"
