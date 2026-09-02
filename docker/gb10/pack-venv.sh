@@ -3,7 +3,7 @@
 # Run from the repo root on the Spark that already has the compiled venv.
 #
 #   VENV=/home/roccen/.venvs/vllm028 ./docker/gb10/pack-venv.sh
-#   INSTALL_FLASHINFER_NIGHTLY=1 VENV=/home/roccen/.venvs/vllm028 ./docker/gb10/pack-venv.sh
+#   INSTALL_FLASHINFER=1 VENV=/home/roccen/.venvs/vllm028 ./docker/gb10/pack-venv.sh
 #   INSTALL_B12X=1 VENV=/home/roccen/.venvs/vllm028 ./docker/gb10/pack-venv.sh
 # To inject b12x into an already-packed image without recopying the venv:
 #   ./docker/gb10/pack-b12x.sh
@@ -25,7 +25,7 @@ if [[ -z "${VENV:-}" ]]; then
 fi
 VENV="${VENV:-${HOME}/.venvs/vllm028}"
 IMAGE="${VLLM_GB10_IMAGE:-vllm-gb10:dspark}"
-INSTALL_FLASHINFER_NIGHTLY="${INSTALL_FLASHINFER_NIGHTLY:-0}"
+INSTALL_FLASHINFER="${INSTALL_FLASHINFER:-${INSTALL_FLASHINFER_NIGHTLY:-0}}"
 INSTALL_B12X="${INSTALL_B12X:-0}"
 
 if [[ ! -x "${VENV}/bin/python" ]]; then
@@ -57,7 +57,8 @@ docker build \
   -f "${STAGE}/Dockerfile" \
   --build-arg OLD_VENV="${VENV}" \
   --build-arg OLD_SRC="$(pwd)" \
-  --build-arg INSTALL_FLASHINFER_NIGHTLY="${INSTALL_FLASHINFER_NIGHTLY}" \
+  --build-arg INSTALL_FLASHINFER="${INSTALL_FLASHINFER}" \
+  --build-arg INSTALL_FLASHINFER_NIGHTLY="${INSTALL_FLASHINFER_NIGHTLY:-0}" \
   --build-arg INSTALL_B12X="${INSTALL_B12X}" \
   -t "${IMAGE}" \
   "${STAGE}"

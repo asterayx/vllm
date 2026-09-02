@@ -13,11 +13,10 @@ PyNvVideoCodec==2.0.4
 # FlashInfer should be updated together with the Dockerfile
 # flashinfer-cubin is not on PyPI since 0.6.14; setup.py excludes it from
 # install_requires so the published wheel does not carry an unresolvable pin
-# Default stays 0.6.17 (vLLM 0.28). GB10/DSpark native topk=192 (#4380)
-# until 0.6.18 stable: requirements/flashinfer-sm12x-nightly.txt
+# 0.6.18 includes flashinfer#4380 (DSV4 SM120/121 topk 192/256).
 --extra-index-url https://flashinfer.ai/whl/
-flashinfer-python==0.6.17
-flashinfer-cubin==0.6.17
+flashinfer-python==0.6.18
+flashinfer-cubin==0.6.18
 apache-tvm-ffi==0.1.11
 tilelang==0.1.12
 nvidia-cudnn-frontend>=1.19.1

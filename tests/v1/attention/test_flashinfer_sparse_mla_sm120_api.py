@@ -104,7 +104,7 @@ def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
 
 
 def test_resolve_sm120_dsv4_topk_snaps_missing_dspark_width(monkeypatch) -> None:
-    """0.6.17 ships 128/512/1024, not DSpark's aligned width 192."""
+    """Older 0.6.17 packages ship 128/512/1024, not DSpark width 192."""
     fake_module = SimpleNamespace(
         _DECODE_DSV4_DISPATCH=frozenset({(32, 128), (32, 512), (32, 1024)})
     )
@@ -119,6 +119,27 @@ def test_resolve_sm120_dsv4_topk_snaps_missing_dspark_width(monkeypatch) -> None
     assert fi_utils.resolve_sm120_dsv4_topk(2048, 32) is None
     assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 192)
     assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 512)
+
+    fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
+    fi_utils.resolve_sm120_dsv4_topk.cache_clear()
+
+
+def test_resolve_sm120_dsv4_topk_uses_native_192_when_shipped(monkeypatch) -> None:
+    """0.6.18 (#4380) ships DSpark's aligned width 192 and 256."""
+    fake_module = SimpleNamespace(
+        _DECODE_DSV4_DISPATCH=frozenset(
+            {(32, 128), (32, 192), (32, 256), (32, 512), (32, 1024)}
+        )
+    )
+    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: True)
+    monkeypatch.setattr(fi_utils, "_get_submodule", lambda _name: fake_module)
+    fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
+    fi_utils.resolve_sm120_dsv4_topk.cache_clear()
+
+    assert fi_utils.resolve_sm120_dsv4_topk(128, 32) == 128
+    assert fi_utils.resolve_sm120_dsv4_topk(192, 32) == 192
+    assert fi_utils.resolve_sm120_dsv4_topk(193, 32) == 256
+    assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 192)
 
     fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
     fi_utils.resolve_sm120_dsv4_topk.cache_clear()

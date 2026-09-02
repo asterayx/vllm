@@ -299,9 +299,9 @@ def resolve_sm120_dsv4_topk(
 ) -> int | None:
     """Smallest FlashInfer DSV4 decode ``top_k`` that covers ``required_topk``.
 
-    0.6.17 ships ``{128, 512, 1024}`` but not DSpark's aligned width 192.
-    Padding the SWA index list up to the next specialization keeps the
-    logical window unchanged and hits a real cubin.
+    0.6.18 ships ``{128, 192, 256, 512, 1024}`` (flashinfer#4380). Older
+    0.6.17 packages only have ``{128, 512, 1024}``; snap a missing 192
+    up to the next specialization so the logical window is unchanged.
     """
     dispatch = _sm120_dsv4_dispatch()
     if not dispatch:
