@@ -94,16 +94,20 @@ def _autotune_sm12x_decode_sizes(
     is_leader: bool,
 ) -> None:
     """Dummy-run DSpark FULL sizes so FlashInfer records those decode shapes."""
+    decode_query_len = _runner_decode_query_len(runner)
     sizes = sm12x_flashinfer_decode_tune_sizes(
         list(runner.vllm_config.compilation_config.cudagraph_capture_sizes or []),
-        _runner_decode_query_len(runner),
+        decode_query_len,
     )
+    # Belt-and-suspenders: uniform_decode dummy_run requires exact packing.
+    sizes = [n for n in sizes if decode_query_len <= 1 or n % decode_query_len == 0]
     if not sizes:
         return
     if is_leader:
         logger.info(
-            "SM12x FlashInfer: autotune DSpark decode sizes %s",
+            "SM12x FlashInfer: autotune DSpark decode sizes %s (q_len=%d)",
             sizes,
+            decode_query_len,
         )
     ctx = (
         flashinfer_autotune(True, cache=str(cache_path)) if is_leader else nullcontext()
