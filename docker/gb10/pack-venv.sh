@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Pack an already-compiled host venv into the GB10 image. Does not compile.
+# Build that venv first:
+#   ./docker/gb10/build-venv.sh
 # The venv must be from THIS v0.28.0 tree (vllm._C_stable_libtorch present).
 # Do not pack later-main ~/.venvs/vllm028 onto vllm-gb10:v0.28.0-dsv4-spark.
 #
-#   VENV=/home/roccen/.venvs/vllm-gb10-v0280 ./docker/gb10/pack-venv.sh
+#   VENV=/home/roccen/.venvs/vllm028 ./docker/gb10/pack-venv.sh
 #   INSTALL_FLASHINFER=1 VENV=... ./docker/gb10/pack-venv.sh
 #   INSTALL_B12X=1 VENV=... ./docker/gb10/pack-venv.sh
 set -euo pipefail

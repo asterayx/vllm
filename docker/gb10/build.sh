@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # From-scratch image (downloads wheels, compiles vLLM). Rebuilds reuse the
-# BuildKit uv cache. To copy a host venv that already has this tree compiled:
-#   VENV=~/.venvs/vllm-gb10-v0280 ./docker/gb10/pack-venv.sh
+# BuildKit uv cache. Host compile + pack instead:
+#   ./docker/gb10/build-venv.sh
+#   VENV=~/.venvs/vllm028 ./docker/gb10/pack-venv.sh
 # Do not --no-cache unless a cached RUN layer is known-bad.
 # Do not pack-venv an old later-main ~/.venvs/vllm028 onto this tag.
 set -euo pipefail
