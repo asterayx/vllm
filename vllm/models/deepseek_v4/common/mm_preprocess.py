@@ -391,6 +391,34 @@ class DeepseekV4VLDummyInputsBuilder(
 class DeepseekV4VLMultiModalProcessor(
     BaseMultiModalProcessor[DeepseekV4VLProcessingInfo]
 ):
+    def _hf_processor_applies_updates(
+        self,
+        prompt_text: str,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> bool:
+        # The VL processor only emits vision tensors. Placeholder expansion
+        # happens in ``_get_prompt_updates``.
+        return False
+
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        # Official v0.28.0 always pops ``input_ids`` from the HF output.
+        # ``DeepseekV4VLProcessor`` only returns patches / grids / sentinels.
+        processed = super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+        tokenizer = self.info.get_tokenizer()
+        add_special_tokens = bool(tok_kwargs.get("add_special_tokens", False))
+        processed["input_ids"] = [
+            tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+        ]
+        return processed
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
