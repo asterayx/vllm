@@ -478,6 +478,57 @@ def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
     ]
 
 
+def test_dspark_init_cudagraph_manager_copies_capture_sizes(monkeypatch):
+    """Vision k=3 capture override must copy configs; missing import copy crashed."""
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.utils import sm12x as sm12x_utils
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm.v1.worker.gpu.spec_decode.dflash import speculator as spec_mod
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+
+    orig_sizes = [1, 2, 4, 8, 16, 24, 32, 36]
+    compilation_config = SimpleNamespace(cudagraph_capture_sizes=list(orig_sizes))
+    vllm_config = SimpleNamespace(compilation_config=compilation_config)
+    captured: dict[str, object] = {}
+
+    class _Mgr:
+        def __init__(
+            self,
+            cfg: object,
+            device: object,
+            cudagraph_mode: object,
+            decode_query_len: int,
+        ) -> None:
+            captured["sizes"] = list(cfg.compilation_config.cudagraph_capture_sizes)
+            captured["q"] = decode_query_len
+            captured["cfg_id"] = id(cfg)
+            captured["comp_id"] = id(cfg.compilation_config)
+
+    monkeypatch.setattr(spec_mod, "DFlashCudaGraphManager", _Mgr)
+
+    spec = spec_mod.DFlashSpeculator.__new__(spec_mod.DFlashSpeculator)
+    spec.vllm_config = vllm_config
+    spec.device = "cpu"
+    spec.num_query_per_req = 3
+    spec._speculator_name = "DSpark"
+    spec.attn_cg_support = SimpleNamespace(
+        min_cg_support=AttentionCGSupport.UNIFORM_BATCH,
+        min_cg_attn_backend="x",
+    )
+    spec.init_cudagraph_manager(CUDAGraphMode.FULL)
+
+    assert captured["q"] == 6
+    assert captured["sizes"] == [6, 12, 18, 24, 36]
+    assert captured["cfg_id"] != id(vllm_config)
+    assert captured["comp_id"] != id(compilation_config)
+    assert compilation_config.cudagraph_capture_sizes == orig_sizes
+
+
 def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
     from vllm.utils import sm12x as sm12x_utils
 
