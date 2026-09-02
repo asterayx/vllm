@@ -19,6 +19,41 @@ if [ "${MOUNT_VLLM_SRC:-0}" != "0" ]; then
   done
 fi
 
+# uv editable metadata is invisible when launching via PYTHONPATH=/opt/vllm.
+# Write a stub dist-info so importlib.metadata.version("vllm") succeeds.
+/opt/venv/bin/python -c '
+import importlib.metadata as m
+import os
+from pathlib import Path
+ver = os.environ.get("VLLM_VERSION_OVERRIDE", "0.28.0")
+text = "Metadata-Version: 2.1\nName: vllm\nVersion: %s\n" % ver
+try:
+    print("vllm metadata", m.version("vllm"), flush=True)
+except m.PackageNotFoundError:
+    dests = [Path("/tmp") / ("vllm-%s.dist-info" % ver)]
+    try:
+        import site
+        dests.extend(
+            Path(p) / ("vllm-%s.dist-info" % ver)
+            for p in site.getsitepackages()
+            if p
+        )
+    except Exception:
+        pass
+    wrote = False
+    for dest in dests:
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / "METADATA").write_text(text)
+            print("wrote stub", dest, flush=True)
+            wrote = True
+        except OSError as e:
+            print("could not write", dest, e, flush=True)
+    if not wrote:
+        raise SystemExit("could not create vllm package metadata")
+'
+export PYTHONPATH="/tmp${PYTHONPATH:+:${PYTHONPATH}}"
+
 # WORKDIR is /opt/vllm; a bare `vllm` hits the package directory.
 if [[ "${1:-}" == "vllm" ]]; then
   shift

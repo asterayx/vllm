@@ -85,9 +85,6 @@ docker run -d --name "${NAME}" \
   "${IMAGE}" \
   -c 'export PATH=/opt/venv/bin:${PATH}
        export PYTHONPATH=/opt/vllm${PYTHONPATH:+:$PYTHONPATH}
-       # Image mode: keep uv/pip editable metadata. Stripping the
-       # finders leaves PYTHONPATH imports working but
-       # importlib.metadata.version("vllm") raises PackageNotFoundError.
        if [ "${MOUNT_VLLM_SRC:-1}" != "0" ]; then
          for site in /opt/venv/lib/python*/site-packages; do
            [ -d "$site" ] || continue
@@ -95,6 +92,41 @@ docker run -d --name "${NAME}" \
            echo /opt/vllm > "$site"/_vllm_relocated.pth
          done
        fi
+       # uv editable metadata is invisible when launching via PYTHONPATH.
+       # The baked CLI calls version("vllm") at parse time and dies.
+       # Write a stub dist-info under /tmp (always writable) and site-packages.
+       /opt/venv/bin/python -c "
+import importlib.metadata as m
+import os
+from pathlib import Path
+ver = os.environ.get(\"VLLM_VERSION_OVERRIDE\", \"0.28.0\")
+text = \"Metadata-Version: 2.1\\nName: vllm\\nVersion: %s\\n\" % ver
+try:
+    print(\"vllm metadata\", m.version(\"vllm\"), flush=True)
+except m.PackageNotFoundError:
+    dests = [Path(\"/tmp\") / (\"vllm-%s.dist-info\" % ver)]
+    try:
+        import site
+        dests.extend(
+            Path(p) / (\"vllm-%s.dist-info\" % ver)
+            for p in site.getsitepackages()
+            if p
+        )
+    except Exception:
+        pass
+    wrote = False
+    for dest in dests:
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / \"METADATA\").write_text(text)
+            print(\"wrote stub\", dest, flush=True)
+            wrote = True
+        except OSError as e:
+            print(\"could not write\", dest, e, flush=True)
+    if not wrote:
+        raise SystemExit(\"could not create vllm package metadata\")
+"
+       export PYTHONPATH="/tmp:${PYTHONPATH}"
        exec /opt/venv/bin/python -m vllm.entrypoints.cli.main "$@"' \
   vllm \
   serve "${MODEL_PATH}" \
