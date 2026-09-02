@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# From-scratch image (re-downloads torch, recompiles vLLM). Prefer
-# docker/gb10/pack-venv.sh if this Spark already has ~/.venvs/vllm028.
+# From-scratch image (re-downloads torch, recompiles vLLM).
+# Do not --no-cache unless a cached RUN layer is known-bad.
+# Do not pack-venv an old later-main ~/.venvs/vllm028 onto this tag.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 

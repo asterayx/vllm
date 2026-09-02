@@ -17,6 +17,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     TORCH_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_CUDA_ARCH_LIST=12.1a \
+    VLLM_TARGET_DEVICE=cuda \
     VLLM_USE_DEEP_GEMM=0 \
     UV_SYSTEM_PYTHON=0
 
@@ -47,6 +48,9 @@ COPY . /opt/vllm
 
 # PyTorch's cu130 index ships packaging<=24.1; FlashInfer 0.6.18 needs >=24.2.
 # Same strategy as the stock CUDA Dockerfile.
+# --torch-backend cu130 is required: unsafe-best-match can otherwise pick
+# PyPI's CPU torch==2.13.0 over torch==2.13.0+cu130, and then setup.py
+# skips vllm._C_stable_libtorch.
 ENV UV_INDEX_STRATEGY=unsafe-best-match
 
 # GB10 has ~20 ARM cores and 128GB unified memory. 8 is the idle-build
@@ -58,12 +62,22 @@ RUN if [ "$(uname -m)" = "aarch64" ]; then \
     fi \
     && uv venv --python 3.12 /opt/venv \
     && uv pip install --python /opt/venv/bin/python \
+        --torch-backend cu130 \
         --extra-index-url https://download.pytorch.org/whl/cu130 \
         -r requirements/cuda.txt \
+    && /opt/venv/bin/python -c "import torch; assert torch.version.cuda, torch.__version__; print('torch', torch.__version__, 'cuda', torch.version.cuda, flush=True)" \
     && /opt/venv/bin/python use_existing_torch.py --prefix \
-    && MAX_JOBS=${MAX_JOBS} TORCH_CUDA_ARCH_LIST=12.1a \
+    && MAX_JOBS=${MAX_JOBS} TORCH_CUDA_ARCH_LIST=12.1a VLLM_TARGET_DEVICE=cuda \
         uv pip install --python /opt/venv/bin/python \
         --no-build-isolation -e . \
+    && /opt/venv/bin/python -c "\
+from pathlib import Path;\
+hits = list(Path('/opt/vllm/vllm').glob('*_C_stable_libtorch*.so'));\
+hits += list(Path('/opt/vllm').glob('build*/**/*_C_stable_libtorch*.so'));\
+hits += list(Path('/opt/venv').glob('lib/python*/site-packages/**/*_C_stable_libtorch*.so'));\
+print('extensions', hits, flush=True);\
+assert hits, 'vllm._C_stable_libtorch was not compiled'\
+" \
     && uv pip uninstall --python /opt/venv/bin/python flashinfer-jit-cache || true \
     && chmod +x /opt/vllm/docker/gb10/entrypoint.sh \
                /opt/vllm/docker/gb10/install-b12x.sh \
