@@ -5,7 +5,7 @@
 # Release (baked /opt/vllm, no source mount): ./docker/gb10/run-image.sh
 set -euo pipefail
 
-IMAGE="${VLLM_GB10_IMAGE:-vllm-gb10:dspark}"
+IMAGE="${VLLM_GB10_IMAGE:-vllm-gb10:v0.28.0-dsv4-spark}"
 MODEL_HOST="${MODEL_HOST:-${HOME}/models/DeepSeek-V4-Flash-0731}"
 MODEL_PATH="${MODEL_PATH:-/models/DeepSeek-V4-Flash-0731}"
 MOUNT_VLLM_SRC="${MOUNT_VLLM_SRC:-1}"

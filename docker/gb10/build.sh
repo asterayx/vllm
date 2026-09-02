@@ -9,7 +9,7 @@ if [[ "$(uname -m)" != "aarch64" ]]; then
   exit 1
 fi
 
-IMAGE="${VLLM_GB10_IMAGE:-vllm-gb10:dspark}"
+IMAGE="${VLLM_GB10_IMAGE:-vllm-gb10:v0.28.0-dsv4-spark}"
 MAX_JOBS="${MAX_JOBS:-8}"
 
 exec docker build \
