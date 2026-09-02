@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import importlib
 import importlib.metadata as metadata
 import os
@@ -10,6 +11,16 @@ import sys
 from pathlib import Path
 
 import torch
+
+
+def _libcuda_available() -> bool:
+    for name in ("libcuda.so.1", "libcuda.so"):
+        try:
+            ctypes.CDLL(name)
+            return True
+        except OSError:
+            continue
+    return False
 
 def _repo_root(script: Path) -> Path:
     env = os.environ.get("VLLM_ROOT")
@@ -59,6 +70,16 @@ for root in roots:
 uniq = list(dict.fromkeys(p.resolve() for p in hits if p.is_file()))
 print("extensions", uniq, flush=True)
 assert uniq, "vllm._C_stable_libtorch was not compiled"
+
+# docker build has CUDA toolkit but not the host driver. The .so files
+# already prove compile; importing them needs libcuda.so.1 (nvidia-container
+# at run time). pack-venv.sh imports on the host before this image step.
+if not _libcuda_available():
+    print(
+        "skipping import: libcuda.so.1 not in this environment (docker build)",
+        flush=True,
+    )
+    raise SystemExit(0)
 
 mod = importlib.import_module("vllm._C_stable_libtorch")
 print("imported", getattr(mod, "__file__", mod), flush=True)
