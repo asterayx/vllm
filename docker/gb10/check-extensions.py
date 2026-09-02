@@ -17,6 +17,10 @@ print("torch", torch.__version__, "cuda", torch.version.cuda, flush=True)
 try:
     ver = metadata.version("vllm")
 except metadata.PackageNotFoundError as exc:
+    sites = list(Path("/opt/venv").glob("lib/python*/site-packages"))
+    for site in sites:
+        print("site-packages", site, flush=True)
+        print(sorted(p.name for p in site.glob("*vllm*")), flush=True)
     raise SystemExit(
         "vllm is not installed in the venv (no package metadata). "
         "uv pip install -e . did not install the project."

@@ -78,10 +78,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --torch-backend cu130 \
         --extra-index-url https://download.pytorch.org/whl/cu130 \
         -r requirements/build/cuda.txt \
+    && chmod +x /opt/vllm/docker/gb10/install-vllm.sh \
     && MAX_JOBS=${MAX_JOBS} TORCH_CUDA_ARCH_LIST=12.1a VLLM_TARGET_DEVICE=cuda \
-        uv pip install --python /opt/venv/bin/python \
-        --no-build-isolation -e . \
-    && /opt/venv/bin/python /opt/vllm/docker/gb10/check-extensions.py \
+        /opt/vllm/docker/gb10/install-vllm.sh /opt/venv/bin/python \
     && uv pip uninstall --python /opt/venv/bin/python flashinfer-jit-cache || true \
     && chmod +x /opt/vllm/docker/gb10/entrypoint.sh \
                /opt/vllm/docker/gb10/install-b12x.sh \
