@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-# Copy a built image to the other Spark over SSH (use the ConnectX IP).
+# Copy a built image to the other Spark over the ConnectX IP.
+#
+# Docker layers are already gzip-compressed. ssh -C re-compresses them
+# on the CPU and is slower on 100GbE. This script does not use -C.
 #
 #   ./docker/gb10/sync-image.sh roccen@192.168.100.11
 #   ./docker/gb10/sync-image.sh roccen@192.168.100.11 vllm-gb10:v0.28.0-dsv4-spark
-#   VLLM_GB10_IMAGE=vllm-gb10:v0.28.0-dsv4-spark \
-#     ./docker/gb10/sync-image.sh roccen@192.168.100.11
+#
+# Faster on a trusted ConnectX link (two terminals, no SSH crypto):
+#   # worker
+#   nc -l 18765 | docker load
+#   # head
+#   docker save vllm-gb10:v0.28.0-dsv4-spark | nc -N 192.168.100.11 18765
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -23,10 +30,10 @@ if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Saving ${IMAGE} and loading on ${REMOTE}..."
-docker save "${IMAGE}" | ssh -C "${REMOTE}" docker load
+echo "Saving ${IMAGE} and loading on ${REMOTE} (ssh, no compression)..."
+docker save "${IMAGE}" | ssh -o Compression=no "${REMOTE}" docker load
 echo "Loaded ${IMAGE} on ${REMOTE}."
 echo "Start the worker with the same tag:"
-echo "  VLLM_GB10_IMAGE=${IMAGE} NODE_RANK=1 VLLM_HOST_IP=192.168.100.11 HEADLESS=--headless ./docker/gb10/run-image.sh"
+echo "  VLLM_GB10_IMAGE=${IMAGE} NODE_RANK=1 VLLM_HOST_IP=192.168.100.11 HEADLESS=--headless ./docker/gb10/run-vision-image.sh"
 echo "Rsync HF weights separately if the other node does not have them:"
 echo "  rsync -aHAX --info=progress2 ~/.cache/huggingface/ ${REMOTE}:.cache/huggingface/"
