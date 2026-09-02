@@ -7,8 +7,9 @@
 # To inject official b12x==1.2.6 without recopying the venv:
 #   ./docker/gb10/pack-b12x.sh
 #
-# Optional FlashInfer 0814 overlay (wheel only):
-#   INSTALL_FLASHINFER_NIGHTLY=1 ./docker/gb10/pack-venv.sh
+# Optional FlashInfer 0.6.18 overlay (wheel only; also accepts the old
+# INSTALL_FLASHINFER_NIGHTLY=1 name):
+#   INSTALL_FLASHINFER=1 ./docker/gb10/pack-venv.sh
 # Optional official b12x extra (stock --moe-backend b12x, not flashinfer_b12x):
 #   INSTALL_B12X=1 ./docker/gb10/pack-venv.sh
 
@@ -60,11 +61,14 @@ RUN chmod +x /tmp/relocate-venv.sh \
     && /tmp/relocate-venv.sh /opt/venv /opt/vllm "${OLD_VENV}" "${OLD_SRC}" \
     && rm /tmp/relocate-venv.sh
 
+ARG INSTALL_FLASHINFER=0
 ARG INSTALL_FLASHINFER_NIGHTLY=0
-RUN if [ "${INSTALL_FLASHINFER_NIGHTLY}" = "1" ]; then \
+RUN if [ "${INSTALL_FLASHINFER}" = "1" ] || [ "${INSTALL_FLASHINFER_NIGHTLY}" = "1" ]; then \
       curl -LsSf https://astral.sh/uv/install.sh | sh \
+      && grep -E '^(--extra-index-url |flashinfer-)' \
+           /opt/vllm/requirements/cuda.txt > /tmp/flashinfer.txt \
       && /root/.local/bin/uv pip install --python /opt/venv/bin/python \
-           -r /opt/vllm/requirements/flashinfer-sm12x-nightly.txt \
+           -r /tmp/flashinfer.txt \
       && /root/.local/bin/uv pip uninstall --python /opt/venv/bin/python \
            flashinfer-jit-cache || true; \
     fi
