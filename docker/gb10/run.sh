@@ -21,9 +21,11 @@ LINEAR_BACKEND="${LINEAR_BACKEND:-b12x}"
 MOE_BACKEND="${MOE_BACKEND:-b12x}"
 
 src_mount=()
+pythonpath_args=()
 if [ "${MOUNT_VLLM_SRC}" != "0" ]; then
   VLLM_SRC="${VLLM_SRC:-$(cd "$(dirname "$0")/../.." && pwd)}"
   src_mount=(-v "${VLLM_SRC}:/opt/vllm")
+  pythonpath_args=(-e PYTHONPATH=/opt/vllm)
   echo "dev: mounting ${VLLM_SRC} -> /opt/vllm"
 else
   echo "image: using baked /opt/vllm (no host source mount)"
@@ -56,7 +58,7 @@ docker run -d --name "${NAME}" \
   -v "${B12X_CACHE}:/root/.cache/b12x" \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
-  -e PYTHONPATH=/opt/vllm \
+  "${pythonpath_args[@]}" \
   -e MOUNT_VLLM_SRC="${MOUNT_VLLM_SRC}" \
   -e VLLM_HOST_IP="${VLLM_HOST_IP}" \
   -e VLLM_LOGGING_COLOR=1 \
@@ -84,31 +86,47 @@ docker run -d --name "${NAME}" \
   --entrypoint bash \
   "${IMAGE}" \
   -c 'export PATH=/opt/venv/bin:${PATH}
-       export PYTHONPATH=/opt/vllm${PYTHONPATH:+:$PYTHONPATH}
        if [ "${MOUNT_VLLM_SRC:-1}" != "0" ]; then
+         export PYTHONPATH=/opt/vllm${PYTHONPATH:+:$PYTHONPATH}
          for site in /opt/venv/lib/python*/site-packages; do
            [ -d "$site" ] || continue
            rm -f "$site"/__editable__.vllm* "$site"/__editable___vllm*
            echo /opt/vllm > "$site"/_vllm_relocated.pth
          done
+       else
+         # Image mode: do not put /opt/vllm on PYTHONPATH. That loads the
+         # source tree as a regular package and hides cmake .so files that
+         # the uv editable finder would otherwise add to vllm.__path__.
+         _pp=""
+         _save_ifs="$IFS"
+         IFS=:
+         for _p in ${PYTHONPATH:-}; do
+           [ -z "$_p" ] && continue
+           [ "$_p" = "/opt/vllm" ] && continue
+           _pp="${_pp:+$_pp:}$_p"
+         done
+         IFS="$_save_ifs"
+         if [ -n "$_pp" ]; then
+           export PYTHONPATH="$_pp"
+         else
+           unset PYTHONPATH
+         fi
        fi
-       # uv editable metadata is invisible when launching via PYTHONPATH.
-       # The baked CLI calls version("vllm") at parse time and dies.
-       # Write a stub dist-info under /tmp (always writable) and site-packages.
-       /opt/venv/bin/python -c "
+       /opt/venv/bin/python - <<'"'"'PY'"'"'
 import importlib.metadata as m
 import os
 from pathlib import Path
-ver = os.environ.get(\"VLLM_VERSION_OVERRIDE\", \"0.28.0\")
-text = \"Metadata-Version: 2.1\\nName: vllm\\nVersion: %s\\n\" % ver
+
+ver = os.environ.get("VLLM_VERSION_OVERRIDE", "0.28.0")
+text = "Metadata-Version: 2.1\nName: vllm\nVersion: %s\n" % ver
 try:
-    print(\"vllm metadata\", m.version(\"vllm\"), flush=True)
+    print("vllm metadata", m.version("vllm"), flush=True)
 except m.PackageNotFoundError:
-    dests = [Path(\"/tmp\") / (\"vllm-%s.dist-info\" % ver)]
+    dests = [Path("/tmp") / ("vllm-%s.dist-info" % ver)]
     try:
         import site
         dests.extend(
-            Path(p) / (\"vllm-%s.dist-info\" % ver)
+            Path(p) / ("vllm-%s.dist-info" % ver)
             for p in site.getsitepackages()
             if p
         )
@@ -118,15 +136,61 @@ except m.PackageNotFoundError:
     for dest in dests:
         try:
             dest.mkdir(parents=True, exist_ok=True)
-            (dest / \"METADATA\").write_text(text)
-            print(\"wrote stub\", dest, flush=True)
+            (dest / "METADATA").write_text(text)
+            print("wrote stub", dest, flush=True)
             wrote = True
         except OSError as e:
-            print(\"could not write\", dest, e, flush=True)
+            print("could not write", dest, e, flush=True)
     if not wrote:
-        raise SystemExit(\"could not create vllm package metadata\")
-"
-       export PYTHONPATH="/tmp:${PYTHONPATH}"
+        raise SystemExit("could not create vllm package metadata")
+
+# cmake install may leave extensions under build/ rather than vllm/.
+# PYTHONPATH and a plain .pth only see the source package dir.
+pkg = Path("/opt/vllm/vllm")
+names = (
+    "_C_stable_libtorch",
+    "_moe_C_stable_libtorch",
+    "_C",
+    "_moe_C",
+)
+search_roots = [pkg]
+search_roots.extend(Path("/opt/vllm").glob("build*"))
+search_roots.extend(Path("/opt/vllm").glob("_skbuild*"))
+search_roots.extend(Path("/opt/venv").glob("lib/python*/site-packages"))
+search_roots.extend(Path("/opt/venv").glob("lib/python*/site-packages/vllm"))
+for name in names:
+    already = sorted(pkg.glob(f"{name}*.so")) if pkg.is_dir() else []
+    if already:
+        print("have", already[0], flush=True)
+        continue
+    found = []
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+        found.extend(p for p in root.glob(f"{name}*.so") if p.is_file())
+        found.extend(p for p in root.glob(f"**/{name}*.so") if p.is_file())
+    uniq, seen = [], set()
+    for p in found:
+        rp = str(p.resolve())
+        if rp in seen:
+            continue
+        seen.add(rp)
+        uniq.append(p)
+    print(f"candidates {name}: {uniq}", flush=True)
+    if not uniq or not pkg.is_dir():
+        continue
+    src = uniq[0]
+    dst = pkg / src.name
+    try:
+        if not dst.exists():
+            dst.symlink_to(src)
+            print("linked", dst, "->", src, flush=True)
+    except OSError as e:
+        print("could not link", dst, e, flush=True)
+PY
+       if [ -d /tmp/vllm-0.28.0.dist-info ] || [ -d /tmp/vllm-"${VLLM_VERSION_OVERRIDE:-0.28.0}".dist-info ]; then
+         export PYTHONPATH="/tmp${PYTHONPATH:+:$PYTHONPATH}"
+       fi
        exec /opt/venv/bin/python -m vllm.entrypoints.cli.main "$@"' \
   vllm \
   serve "${MODEL_PATH}" \
