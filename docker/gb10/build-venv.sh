@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Host compile for DGX Spark: fill a uv venv and build vLLM inplace.
 # Does not run use_existing_torch.py (that dirties the git tree).
-# Does not require rustc; vllm-rs is skipped when cargo is missing.
+# Needs rustc/cargo (rust-toolchain.toml, usually rustup 1.95) for vllm-rs.
 #
+#   source ~/.cargo/env
 #   ./docker/gb10/build-venv.sh
 #   VENV=~/.venvs/vllm028 RECREATE=1 MAX_JOBS=8 ./docker/gb10/build-venv.sh
-# After CUDA build_ext finished but pip failed on rust:
+# After CUDA build_ext finished, resume rust + editable install:
+#   source ~/.cargo/env
 #   SKIP_BUILD_EXT=1 ./docker/gb10/install-vllm.sh ~/.venvs/vllm028/bin/python
 # Then:
 #   VENV=~/.venvs/vllm028 INSTALL_B12X=1 ./docker/gb10/pack-venv.sh

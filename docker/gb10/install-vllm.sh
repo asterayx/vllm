@@ -15,16 +15,17 @@ export VLLM_ROOT="${VLLM_ROOT:-${ROOT}}"
 
 "${PYTHON}" -c "import torch; print('torch', torch.__version__, torch.version.cuda, flush=True)"
 
-# vllm-rs is optional. Python serve does not need rustc. If rustup was
-# installed into the default location, pick it up.
+# rustup installs rustc/cargo here. A login shell may not have sourced it.
 if [[ -f "${HOME}/.cargo/env" ]]; then
   # shellcheck source=/dev/null
   source "${HOME}/.cargo/env"
 fi
-export VLLM_REQUIRE_RUST_FRONTEND="${VLLM_REQUIRE_RUST_FRONTEND:-0}"
 if ! command -v rustc >/dev/null || ! command -v cargo >/dev/null; then
-  echo "rustc/cargo not found; skipping vllm-rs (Python serve is unaffected)"
+  echo "rustc/cargo not found. source \$HOME/.cargo/env (toolchain ${ROOT}/rust-toolchain.toml)." >&2
+  exit 1
 fi
+rustc --version
+cargo --version
 
 SKIP_BUILD_EXT="${SKIP_BUILD_EXT:-0}"
 if [[ "${SKIP_BUILD_EXT}" != "1" ]]; then

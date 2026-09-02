@@ -59,10 +59,6 @@ def should_require_rust_frontend() -> bool:
     return value.lower() not in ("", "0", "false", "no")
 
 
-def rust_compiler_available() -> bool:
-    return which("rustc") is not None and which("cargo") is not None
-
-
 def get_precompiled_rust_extension_paths() -> list[Path]:
     return sorted((ROOT_DIR / "vllm").glob("_rust_*.so"))
 
@@ -1498,20 +1494,10 @@ if (
     cmdclass["build_rust"] = precompiled_build_rust
 
 # Rust artifacts, built via setuptools-rust and installed into the package
-# directory alongside the Python modules. setuptools-rust still runs
-# build_rust when extensions are optional and rustc is missing, which
-# fails the install after CUDA compile. Skip unless rustc+cargo exist
-# or the caller required the frontend.
-if should_require_rust_frontend() or rust_compiler_available():
-    rust_extensions = rust_build.rust_extensions(
-        optional=not should_require_rust_frontend()
-    )
-else:
-    print(
-        "Rust compiler not found; skipping vllm-rs / _rust_tool_parser. "
-        "Python `vllm serve` does not need them."
-    )
-    rust_extensions = []
+# directory alongside the Python modules.
+rust_extensions = rust_build.rust_extensions(
+    optional=not should_require_rust_frontend()
+)
 
 setup(
     # static metadata should rather go in pyproject.toml
