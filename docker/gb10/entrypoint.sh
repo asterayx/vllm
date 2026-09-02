@@ -16,4 +16,9 @@ for site in /opt/venv/lib/python*/site-packages; do
   printf '%s\n' /opt/vllm > "${site}/_vllm_relocated.pth"
 done
 
+# WORKDIR is /opt/vllm; a bare `vllm` hits the package directory.
+if [[ "${1:-}" == "vllm" ]]; then
+  shift
+  exec /opt/venv/bin/python -m vllm.entrypoints.cli.main "$@"
+fi
 exec "$@"

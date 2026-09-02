@@ -79,6 +79,7 @@ docker run -d --name "${NAME}" \
   -e TP_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-enp1s0f1np1}" \
   -e NCCL_IB_HCA="${NCCL_IB_HCA:-rocep1s0f1,roceP2p1s0f1}" \
   -e NCCL_DEBUG="${NCCL_DEBUG:-WARN}" \
+  -w / \
   --entrypoint bash \
   "${IMAGE}" \
   -c 'export PATH=/opt/venv/bin:${PATH}
@@ -88,7 +89,7 @@ docker run -d --name "${NAME}" \
          echo /opt/vllm > "$site"/_vllm_relocated.pth
        done
        export PYTHONPATH=/opt/vllm${PYTHONPATH:+:$PYTHONPATH}
-       exec vllm "$@"' \
+       exec /opt/venv/bin/python -m vllm.entrypoints.cli.main "$@"' \
   vllm \
   serve "${MODEL_PATH}" \
   --served-model-name "${SERVED_MODEL_NAME:-deepseek-v4-flash-0731}" \
