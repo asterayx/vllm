@@ -24,7 +24,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     TORCH_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_CUDA_ARCH_LIST=12.1a \
-    VLLM_USE_DEEP_GEMM=0
+    VLLM_USE_DEEP_GEMM=0 \
+    UV_INDEX_STRATEGY=unsafe-best-match
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 \
