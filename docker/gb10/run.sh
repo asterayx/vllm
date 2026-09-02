@@ -57,6 +57,7 @@ docker run -d --name "${NAME}" \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
   -e PYTHONPATH=/opt/vllm \
+  -e MOUNT_VLLM_SRC="${MOUNT_VLLM_SRC}" \
   -e VLLM_HOST_IP="${VLLM_HOST_IP}" \
   -e VLLM_LOGGING_COLOR=1 \
   -e VLLM_USE_DEEP_GEMM=0 \
@@ -83,12 +84,17 @@ docker run -d --name "${NAME}" \
   --entrypoint bash \
   "${IMAGE}" \
   -c 'export PATH=/opt/venv/bin:${PATH}
-       for site in /opt/venv/lib/python*/site-packages; do
-         [ -d "$site" ] || continue
-         rm -f "$site"/__editable__.vllm* "$site"/__editable___vllm*
-         echo /opt/vllm > "$site"/_vllm_relocated.pth
-       done
        export PYTHONPATH=/opt/vllm${PYTHONPATH:+:$PYTHONPATH}
+       # Image mode: keep uv/pip editable metadata. Stripping the
+       # finders leaves PYTHONPATH imports working but
+       # importlib.metadata.version("vllm") raises PackageNotFoundError.
+       if [ "${MOUNT_VLLM_SRC:-1}" != "0" ]; then
+         for site in /opt/venv/lib/python*/site-packages; do
+           [ -d "$site" ] || continue
+           rm -f "$site"/__editable__.vllm* "$site"/__editable___vllm*
+           echo /opt/vllm > "$site"/_vllm_relocated.pth
+         done
+       fi
        exec /opt/venv/bin/python -m vllm.entrypoints.cli.main "$@"' \
   vllm \
   serve "${MODEL_PATH}" \
