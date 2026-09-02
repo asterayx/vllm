@@ -13,20 +13,36 @@ export MAX_JOBS="${MAX_JOBS:-8}"
 export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION:-0.28.0+dsv4.spark}"
 export VLLM_ROOT="${VLLM_ROOT:-${ROOT}}"
 
-if ! command -v cmake >/dev/null; then
-  echo "cmake not found. apt-get install -y cmake ninja-build build-essential" >&2
-  exit 1
-fi
-if ! command -v nvcc >/dev/null; then
-  echo "nvcc not found. Use the CUDA devel toolkit (nvcc on PATH)." >&2
-  exit 1
-fi
-cmake --version
-nvcc --version
 "${PYTHON}" -c "import torch; print('torch', torch.__version__, torch.version.cuda, flush=True)"
 
-echo "building vLLM extensions inplace (MAX_JOBS=${MAX_JOBS})"
-"${PYTHON}" setup.py build_ext --inplace
+# vllm-rs is optional. Python serve does not need rustc. If rustup was
+# installed into the default location, pick it up.
+if [[ -f "${HOME}/.cargo/env" ]]; then
+  # shellcheck source=/dev/null
+  source "${HOME}/.cargo/env"
+fi
+export VLLM_REQUIRE_RUST_FRONTEND="${VLLM_REQUIRE_RUST_FRONTEND:-0}"
+if ! command -v rustc >/dev/null || ! command -v cargo >/dev/null; then
+  echo "rustc/cargo not found; skipping vllm-rs (Python serve is unaffected)"
+fi
+
+SKIP_BUILD_EXT="${SKIP_BUILD_EXT:-0}"
+if [[ "${SKIP_BUILD_EXT}" != "1" ]]; then
+  if ! command -v cmake >/dev/null; then
+    echo "cmake not found. apt-get install -y cmake ninja-build build-essential" >&2
+    exit 1
+  fi
+  if ! command -v nvcc >/dev/null; then
+    echo "nvcc not found. Use the CUDA devel toolkit (nvcc on PATH)." >&2
+    exit 1
+  fi
+  cmake --version
+  nvcc --version
+  echo "building vLLM extensions inplace (MAX_JOBS=${MAX_JOBS})"
+  "${PYTHON}" setup.py build_ext --inplace
+else
+  echo "SKIP_BUILD_EXT=1: not running setup.py build_ext"
+fi
 
 echo "installing editable vllm metadata"
 uv pip install --python "${PYTHON}" --no-build-isolation --reinstall-package vllm -e .
