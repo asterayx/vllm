@@ -24,6 +24,7 @@ from vllm.utils.deep_gemm import (
     native_next_n_supported,
 )
 from vllm.utils.platform_utils import num_compute_units
+from vllm.utils.sm12x import sm12x_treat_short_extends_as_decodes
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -843,7 +844,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata,
                 decode_threshold=self.decode_threshold,
                 require_uniform=not (self.use_flattening or self.supports_varlen),
-                treat_short_extends_as_decodes=not self.use_pcp,
+                treat_short_extends_as_decodes=(
+                    not self.use_pcp and sm12x_treat_short_extends_as_decodes()
+                ),
             )
         )
 

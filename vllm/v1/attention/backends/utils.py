@@ -638,6 +638,24 @@ def split_decodes_prefills_and_extends(
     )
 
 
+def align_per_req_tensor(tensor: torch.Tensor, num_reqs: int) -> torch.Tensor:
+    """Pad or slice a per-request tensor to ``num_reqs``.
+
+    FULL CUDA graphs pad the batch to the next capture size, but some
+    per-request flags (for example ``is_prefilling``) are only filled for
+    the real requests. Combining those tensors then raises
+    ``The size of tensor a (4) must match the size of tensor b (2)``.
+    Extra slots are False / zero (decode).
+    """
+    if tensor.shape[0] == num_reqs:
+        return tensor
+    aligned = tensor.new_zeros((num_reqs, *tensor.shape[1:]))
+    n = min(tensor.shape[0], num_reqs)
+    if n:
+        aligned[:n] = tensor[:n]
+    return aligned
+
+
 def split_decodes_and_prefills(
     common_attn_metadata: CommonAttentionMetadata,
     decode_threshold: int = 1,
@@ -698,8 +716,12 @@ def split_decodes_and_prefills(
         is_prefill = query_lens > decode_threshold
 
     if not treat_short_extends_as_decodes:
-        assert common_attn_metadata.is_prefilling is not None
-        is_prefill |= common_attn_metadata.is_prefilling
+        # SM12x needs this flag to keep q_len=2 first prefills on the
+        # pad-to-[1, 6] path. Missing (DSpark capture 16:41) means no
+        # extra prefills; do not assert and kill the worker.
+        prefilling = common_attn_metadata.is_prefilling
+        if prefilling is not None:
+            is_prefill |= align_per_req_tensor(prefilling, is_prefill.shape[0])
 
     if not torch.any(is_prefill):
         return num_reqs, 0, num_tokens, 0

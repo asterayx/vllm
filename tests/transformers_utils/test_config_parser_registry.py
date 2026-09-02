@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 from transformers import PretrainedConfig
 
-from vllm.transformers_utils.config import get_config_parser, register_config_parser
+from vllm.transformers_utils.config import (
+    HFConfigParser,
+    get_config_parser,
+    register_config_parser,
+)
 from vllm.transformers_utils.config_parser_base import ConfigParserBase
 
 
@@ -25,6 +29,11 @@ class CustomConfigParser(ConfigParserBase):
 
 def test_register_config_parser():
     assert isinstance(get_config_parser("custom_config_parser"), CustomConfigParser)
+
+
+def test_deepseek_v4_config_format_aliases_hf():
+    assert isinstance(get_config_parser("deepseek_v4"), HFConfigParser)
+    assert isinstance(get_config_parser("hf"), HFConfigParser)
 
 
 def test_invalid_config_parser():

@@ -8,11 +8,11 @@ from functools import cache
 
 import torch
 
-from vllm.platforms import current_platform
+from vllm.model_executor.kernels.mhc.tilelang import mhc_pdl_enabled
 from vllm.tilelang_utils import T, tilelang, tilelang_jit
 from vllm.utils.math_utils import cdiv
 
-ENABLE_PDL = current_platform.is_arch_support_pdl() and current_platform.is_cuda()
+ENABLE_PDL = mhc_pdl_enabled()
 
 
 @cache
@@ -656,7 +656,7 @@ def mhc_post_tilelang(
             T.copy(d_shared, d_local)
             for i_hco, i1_h in T.Parallel(hc, h_blk):
                 x_local[i_hco, i1_h] = c_local[i_hco] * d_local[i1_h]
-                for i_hci in T.vectorized(hc):
+                for i_hci in T.unroll(hc):
                     x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
 
             T.copy(x_local, x[i_n, 0, i0_h * h_blk])

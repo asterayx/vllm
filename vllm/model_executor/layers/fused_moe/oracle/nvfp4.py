@@ -18,6 +18,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     nvfp4_w4a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.layers.quantization.utils.b12x_moe import (
+    prepare_nvfp4_moe_layer_for_b12x,
+)
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     nvfp4_swizzled_scale_to_cutedsl_mma_view,
     prepare_nvfp4_moe_layer_for_fi_or_cutlass,
@@ -37,6 +40,7 @@ logger = init_logger(__name__)
 
 
 class NvFp4MoeBackend(Enum):
+    B12X = "B12X"
     FLASHINFER_TRTLLM = "FLASHINFER_TRTLLM"
     FLASHINFER_CUTLASS = "FLASHINFER_CUTLASS"
     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
@@ -68,6 +72,11 @@ def is_global_sf_supported_for_nvfp4_backend(backend: NvFp4MoeBackend) -> bool:
 def backend_to_kernel_cls(
     backend: NvFp4MoeBackend,
 ) -> list[type[mk.FusedMoEExperts]]:
+    if backend == NvFp4MoeBackend.B12X:
+        from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+
+        return [B12xExperts]
+
     if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
         from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
             TrtLlmNvFp4ExpertsModular,
@@ -151,6 +160,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         "flashinfer_cutlass": NvFp4MoeBackend.FLASHINFER_CUTLASS,
         "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         "flashinfer_b12x": NvFp4MoeBackend.FLASHINFER_B12X,
+        "b12x": NvFp4MoeBackend.B12X,
         "marlin": NvFp4MoeBackend.MARLIN,
         "humming": NvFp4MoeBackend.HUMMING,
         "emulation": NvFp4MoeBackend.EMULATION,
@@ -189,6 +199,7 @@ def select_nvfp4_moe_backend(
     ]
 
     NVFP4_BACKENDS_WITH_CLAMP = {
+        NvFp4MoeBackend.B12X,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
@@ -264,8 +275,8 @@ def select_nvfp4_moe_backend(
                 f"Model sets swiglu_limit={config.swiglu_limit}, but the "
                 f"explicitly requested moe_backend={runner_backend!r} does "
                 f"not apply the SwiGLU clamp. Use 'flashinfer_trtllm', "
-                f"'flashinfer_cutlass', 'flashinfer_cutedsl', 'cutlass', "
-                f"'marlin', or 'humming' instead."
+                f"'flashinfer_cutlass', 'flashinfer_cutedsl', 'b12x', "
+                f"'cutlass', 'marlin', or 'humming' instead."
             )
         return _return_or_raise(
             requested_backend, config, weight_key, activation_key, activation_format
@@ -340,6 +351,30 @@ def convert_to_nvfp4_moe_kernel_format(
             w2_scale=w2_scale,
             w2_scale_2=w2_scale_2,
             a2_scale=a2_scale,
+        )
+    elif nvfp4_backend == NvFp4MoeBackend.B12X:
+        if a13_scale is None or a2_scale is None:
+            raise ValueError("b12x NVFP4 MoE requires activation scales")
+        (
+            w13,
+            w13_scale,
+            w13_scale_2,
+            a13_scale,
+            w2,
+            w2_scale,
+            w2_scale_2,
+            a2_scale,
+        ) = prepare_nvfp4_moe_layer_for_b12x(
+            w13=w13,
+            w13_scale=w13_scale,
+            w13_scale_2=w13_scale_2,
+            a13_scale=a13_scale,
+            w2=w2,
+            w2_scale=w2_scale,
+            w2_scale_2=w2_scale_2,
+            a2_scale=a2_scale,
+            is_act_and_mul=is_act_and_mul,
+            reorder_w13=False,
         )
     elif (
         nvfp4_backend in FLASHINFER_NVFP4_MOE_BACKENDS

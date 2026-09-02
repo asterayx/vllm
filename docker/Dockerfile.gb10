@@ -1,0 +1,71 @@
+# DGX Spark / ASUS GX10 (GB10, SM121, aarch64) image.
+# Baseline: official vLLM v0.28.0 + Spark DSv4-Flash patches.
+# Pins: FlashInfer 0.6.18 (requirements/cuda.txt), official b12x==1.2.6.
+# Build ON a Spark (linux/arm64 + GPU). Do not cross-build from x86.
+#
+#   docker/gb10/build.sh
+#   docker/gb10/sync-image.sh user@<other-spark-connectx-ip>
+
+ARG CUDA_VERSION=13.0.1
+ARG UBUNTU_VERSION=24.04
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:${PATH} \
+    CUDA_HOME=/usr/local/cuda \
+    TORCH_CUDA_ARCH_LIST=12.1a \
+    FLASHINFER_CUDA_ARCH_LIST=12.1a \
+    VLLM_USE_DEEP_GEMM=0 \
+    UV_SYSTEM_PYTHON=0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 \
+        python3.12-venv \
+        python3.12-dev \
+        python3-pip \
+        git \
+        curl \
+        ca-certificates \
+        ninja-build \
+        build-essential \
+        libibverbs1 \
+        ibverbs-providers \
+        ibverbs-utils \
+        libmlx5-1 \
+        librdmacm1 \
+        rdma-core \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+WORKDIR /opt/vllm
+COPY . /opt/vllm
+
+# GB10 has ~20 ARM cores and 128GB unified memory. 8 is the idle-build
+# default; raise with --build-arg MAX_JOBS=12 if `free` stays comfortable.
+ARG MAX_JOBS=8
+RUN if [ "$(uname -m)" = "aarch64" ]; then \
+        printf 'cython<3.3\n' > /tmp/build-constraints.txt \
+        && export UV_BUILD_CONSTRAINT=/tmp/build-constraints.txt; \
+    fi \
+    && uv venv --python 3.12 /opt/venv \
+    && uv pip install --python /opt/venv/bin/python \
+        --extra-index-url https://download.pytorch.org/whl/cu130 \
+        -r requirements/cuda.txt \
+    && /opt/venv/bin/python use_existing_torch.py --prefix \
+    && MAX_JOBS=${MAX_JOBS} TORCH_CUDA_ARCH_LIST=12.1a \
+        uv pip install --python /opt/venv/bin/python \
+        --no-build-isolation -e . \
+    && uv pip uninstall --python /opt/venv/bin/python flashinfer-jit-cache || true \
+    && chmod +x /opt/vllm/docker/gb10/entrypoint.sh \
+               /opt/vllm/docker/gb10/install-b12x.sh \
+    && /opt/vllm/docker/gb10/install-b12x.sh /opt/venv/bin/python \
+    && rm -rf /root/.cache/uv /root/.cache/flashinfer
+
+EXPOSE 8000
+ENTRYPOINT ["/opt/vllm/docker/gb10/entrypoint.sh"]
+CMD ["vllm", "--help"]

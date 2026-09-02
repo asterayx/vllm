@@ -53,6 +53,12 @@ from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
 )
+from vllm.utils.sm12x import (
+    sm12x_align_prefill_q_len,
+    sm12x_extend_prefill_slots,
+    sm12x_pad_prefill_token_rows,
+    sm12x_should_fill_prefill_slots,
+)
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
@@ -207,6 +213,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.n_groups = config.o_groups
         self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
+        # Vision variant: image spans are visible bidirectionally, widening
+        # prefill SWA index rows by up to max_image_tokens columns.
+        self.max_image_tokens = (
+            getattr(config, "vision_max_n_token", 0)
+            if getattr(config, "vision_n_layers", 0) > 0
+            else 0
+        )
         # NOTE(zyongye) Compress ratio can't be 0
         # we do this for because MTP layer is not included
         # in the compress ratio list
@@ -632,6 +645,33 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         assert positions.dtype == torch.int64
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         cache_dtype = swa_kv_cache.dtype
+        orig_tokens = q.shape[0]
+        slot_mapping = swa_metadata.slot_mapping
+        # First-prefill insert wrote 2 KV rows, then FlashInfer launched
+        # [1, 6] and IMA'd. Fill the pad slots by repeating the last
+        # real slot. Do not host-sync this during CUDA-graph capture.
+        if (
+            orig_tokens == slot_mapping.shape[0]
+            and swa_metadata.num_prefills > 0
+            and sm12x_should_fill_prefill_slots(
+                orig_tokens,
+                0 if swa_metadata.num_decodes == 0 else orig_tokens,
+            )
+        ):
+            launch_len = sm12x_align_prefill_q_len(orig_tokens)
+            if launch_len != orig_tokens:
+                slot_mapping = sm12x_extend_prefill_slots(
+                    slot_mapping, launch_len, swa_metadata.block_size
+                )
+                q = sm12x_pad_prefill_token_rows(q, launch_len)
+                kv = sm12x_pad_prefill_token_rows(kv, launch_len)
+                positions = sm12x_pad_prefill_token_rows(positions, launch_len)
+                logger.info_once(
+                    "SM12x: insert %d extra KV slots for prefill pad %d -> %d",
+                    launch_len - orig_tokens,
+                    orig_tokens,
+                    launch_len,
+                )
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
         if cache_dtype == torch.uint8:
@@ -647,25 +687,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     kv,
                     q_out,
                     swa_kv_cache_2d,
-                    swa_metadata.slot_mapping,
+                    slot_mapping,
                     positions,
                     cos_sin_cache,
                     self.padded_heads,
                     self.eps,
                     swa_metadata.block_size,
                 )
-                return q_out
-            return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                return q_out[:orig_tokens]
+            q_out = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,
                 swa_kv_cache_2d,
-                swa_metadata.slot_mapping,
+                slot_mapping,
                 positions,
                 cos_sin_cache,
                 self.padded_heads,
                 self.eps,
                 swa_metadata.block_size,
             )
+            return q_out[:orig_tokens]
 
         # Plain-row path: the [num_blocks, block_size, 512] cache stores the KV
         # row in its element dtype (no Q padding). bf16 rewrites q in place;
@@ -678,13 +719,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 q,
                 kv,
                 swa_kv_cache_3d,
-                swa_metadata.slot_mapping,
+                slot_mapping,
                 positions,
                 cos_sin_cache,
                 self.eps,
                 block_size,
             )
-            return q
+            return q[:orig_tokens]
 
         # per-tensor fp8 (torch.float8_e4m3fn)
         q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
@@ -693,7 +734,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             kv,
             q_fp8,
             swa_kv_cache_3d,
-            swa_metadata.slot_mapping,
+            slot_mapping,
             positions,
             cos_sin_cache,
             self._flashinfer_fp8_kv_scale,
@@ -701,7 +742,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.eps,
             block_size,
         )
-        return q_fp8
+        return q_fp8[:orig_tokens]
 
     def _global_topk_output_buffers(
         self, topk_indices: torch.Tensor

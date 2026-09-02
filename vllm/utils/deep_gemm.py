@@ -269,8 +269,9 @@ def _lazy_init() -> None:
         return
 
     # Enable PDL for DeepGEMM on architectures that support it (SM90+).
+    # SM12x / GB10 IMA'd during DSv4 PIECEWISE capture with PDL on.
     if current_platform.is_arch_support_pdl():
-        _apply_pdl(_dg, True)
+        _apply_pdl(_dg, not current_platform.is_device_capability_family(120))
     _cublaslt_gemm_nt_impl = getattr(_dg, "cublaslt_gemm_nt", None)
     _fp8_gemm_nt_impl = getattr(_dg, "fp8_gemm_nt", None)
     _fp8_einsum_impl = getattr(_dg, "fp8_einsum", None)

@@ -48,6 +48,8 @@ class HummingFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "is_bmm", False):
+            return
         from vllm.utils.humming import dtypes
 
         name_map = {"weight": "weight", "weight_scale": "weight_scale"}

@@ -38,6 +38,14 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     ) -> tuple[bool, str | None]:
         if not current_platform.is_cuda():
             return False, "requires CUDA."
+        if current_platform.is_device_capability_family(120):
+            return (
+                False,
+                (
+                    "Marlin weight-only FP8 is for GPUs without native FP8; "
+                    "SM12x should use Triton or B12X"
+                ),
+            )
         # Check if platform supports FP8 Marlin
         if not is_fp8_marlin_supported():
             return False, "FP8 Marlin requires compute capability 7.5 or higher"
@@ -59,6 +67,12 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
         return True, None
 
+    @staticmethod
+    def _block_scale_name(layer: torch.nn.Module) -> str:
+        if getattr(layer, "weight_scale_inv", None) is not None:
+            return "weight_scale_inv"
+        return "weight_scale"
+
     def __init__(
         self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]
     ) -> None:
@@ -69,12 +83,17 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.block_quant:
-            weight, weight_scale_inv = process_fp8_weight_block_strategy(
-                layer.weight, layer.weight_scale_inv
+            scale_name = self._block_scale_name(layer)
+            weight, weight_scale = process_fp8_weight_block_strategy(
+                layer.weight, getattr(layer, scale_name)
             )
-            # Update layer with new values
             replace_parameter(layer, "weight", weight.data)
-            replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
+            replace_parameter(layer, scale_name, weight_scale.data)
+        # DSv4 wo_a is consumed by fp8_einsum and must keep the checkpoint
+        # FP8 block layout. Marlin packing changes (N, K) into a workspace
+        # format and DeepGEMM then asserts m/n/k.
+        if getattr(layer, "is_bmm", False):
+            return
         # Non-block: callers must pass weight in (K, N) layout.
 
         layer.input_scale = None
@@ -90,7 +109,7 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.block_quant:
-            weight_scale = layer.weight_scale_inv
+            weight_scale = getattr(layer, self._block_scale_name(layer))
         else:
             weight_scale = layer.weight_scale
         return apply_fp8_marlin_linear(
