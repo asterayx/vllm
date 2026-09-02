@@ -680,9 +680,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             #            the padding head slots.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
-            if self.eager_scratch_pool is not None:
+            insert_out = getattr(
+                torch.ops._C,
+                "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out",
+                None,
+            )
+            if self.eager_scratch_pool is not None and insert_out is not None:
                 q_out = self.eager_scratch_pool.q_out(q.shape[0])
-                torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
+                insert_out(
                     q,
                     kv,
                     q_out,

@@ -172,6 +172,17 @@ def sm12x_disable_attn_aux_streams() -> bool:
     return current_platform.is_device_capability_family(120)
 
 
+def sm12x_disable_eager_scratch_pool() -> bool:
+    """Skip v0.28.0 eager-scratch ``_out`` insert on SM12x.
+
+    later-main never allocated this pool and used allocating
+    ``fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert``. Host-mounted
+    later-main ``_C_stable_libtorch`` does not register ``_out``, which
+    AttributeError'd mixed warmup after the 2→6 prefill pad.
+    """
+    return current_platform.is_device_capability_family(120)
+
+
 def reject_sm12x_unsafe_decode_query(query: torch.Tensor) -> None:
     """Refuse SM12x per-request FlashInfer shapes that IMA'd on GB10.
 

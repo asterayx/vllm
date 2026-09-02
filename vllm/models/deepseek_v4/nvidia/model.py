@@ -85,6 +85,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.sm12x import (
     sm12x_align_is_padding,
     sm12x_disable_attn_aux_streams,
+    sm12x_disable_eager_scratch_pool,
     sm12x_pad_token_rows,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -1077,7 +1078,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             config.num_attention_heads // get_tensor_model_parallel_world_size()
         )
         self.eager_scratch_pool: DeepseekV4EagerScratchPool | None = None
-        if not vllm_config.parallel_config.use_ubatching:
+        if (
+            not vllm_config.parallel_config.use_ubatching
+            and not sm12x_disable_eager_scratch_pool()
+        ):
             # TODO: support dbo if needed
             # this requires the buffer to have ubatch dim
             self.eager_scratch_pool = DeepseekV4EagerScratchPool(

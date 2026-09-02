@@ -17,6 +17,7 @@ from vllm.utils.sm12x import (
     sm12x_align_tokens,
     sm12x_allow_full_decode_capture,
     sm12x_disable_attn_aux_streams,
+    sm12x_disable_eager_scratch_pool,
     sm12x_dspark_capture_sizes,
     sm12x_extend_prefill_slots,
     sm12x_flashinfer_decode_tune_sizes,
@@ -86,6 +87,7 @@ def test_sm12x_align_decode_q_len_snaps_to_safe_widths(monkeypatch):
     assert sm12x_mixed_warmup_prefill_len(2) == 2
     assert sm12x_treat_short_extends_as_decodes() is False
     assert sm12x_disable_attn_aux_streams() is True
+    assert sm12x_disable_eager_scratch_pool() is True
 
 
 def test_sm12x_extend_prefill_slots_reuses_last_slot():
@@ -529,6 +531,15 @@ def test_dspark_init_cudagraph_manager_copies_capture_sizes(monkeypatch):
     assert compilation_config.cudagraph_capture_sizes == orig_sizes
 
 
+def test_fused_qnorm_insert_out_is_optional():
+    """later-main _C_stable_libtorch has no _out; do not attribute-access it."""
+    from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+
+    names = DeepseekV4Attention._fused_qnorm_rope_kv_insert.__code__.co_names
+    assert "getattr" in names
+    assert "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert" in names
+
+
 def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
     from vllm.utils import sm12x as sm12x_utils
 
@@ -543,6 +554,7 @@ def test_sm12x_align_tokens_unchanged_off_sm12x(monkeypatch):
     assert sm12x_align_prefill_q_len(2) == 2
     assert sm12x_treat_short_extends_as_decodes() is True
     assert sm12x_disable_attn_aux_streams() is False
+    assert sm12x_disable_eager_scratch_pool() is False
     sizes = [1, 2, 4, 8, 16, 24, 32, 36]
     assert sm12x_dspark_capture_sizes(sizes, 6) == sizes
     assert sm12x_allow_full_decode_capture(18, 6) is True
