@@ -24,8 +24,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     TORCH_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_CUDA_ARCH_LIST=12.1a \
-    VLLM_USE_DEEP_GEMM=0 \
-    UV_INDEX_STRATEGY=unsafe-best-match
+    VLLM_USE_DEEP_GEMM=0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 \
@@ -61,6 +60,7 @@ RUN chmod +x /tmp/relocate-venv.sh \
     && /tmp/relocate-venv.sh /opt/venv /opt/vllm "${OLD_VENV}" "${OLD_SRC}" \
     && rm /tmp/relocate-venv.sh
 
+ENV UV_INDEX_STRATEGY=unsafe-best-match
 ARG INSTALL_FLASHINFER=0
 RUN if [ "${INSTALL_FLASHINFER}" = "1" ]; then \
       curl -LsSf https://astral.sh/uv/install.sh | sh \

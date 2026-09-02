@@ -18,8 +18,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TORCH_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_CUDA_ARCH_LIST=12.1a \
     VLLM_USE_DEEP_GEMM=0 \
-    UV_SYSTEM_PYTHON=0 \
-    UV_INDEX_STRATEGY=unsafe-best-match
+    UV_SYSTEM_PYTHON=0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 \
@@ -45,6 +44,10 @@ ENV PATH="/root/.local/bin:${PATH}"
 
 WORKDIR /opt/vllm
 COPY . /opt/vllm
+
+# PyTorch's cu130 index ships packaging<=24.1; FlashInfer 0.6.18 needs >=24.2.
+# Same strategy as the stock CUDA Dockerfile.
+ENV UV_INDEX_STRATEGY=unsafe-best-match
 
 # GB10 has ~20 ARM cores and 128GB unified memory. 8 is the idle-build
 # default; raise with --build-arg MAX_JOBS=12 if `free` stays comfortable.
