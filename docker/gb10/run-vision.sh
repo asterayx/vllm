@@ -13,11 +13,12 @@
 # Stop the text-only 0731 containers first (same default port 30001):
 #   docker rm -f dspark-tp2-rank0 dspark-tp2-rank1
 #
-# Head:
+# Head (bind-mount host source):
 #   NODE_RANK=0 ./docker/gb10/run-vision.sh
 # Worker:
 #   NODE_RANK=1 VLLM_HOST_IP=192.168.100.11 HEADLESS=--headless \
 #     ./docker/gb10/run-vision.sh
+# Release (baked /opt/vllm): ./docker/gb10/run-vision-image.sh
 #
 # If load OOMs on the vision tower, retry with e.g.
 #   GPU_MEMORY_UTILIZATION=0.82 MAX_NUM_SEQS=4 ./docker/gb10/run-vision.sh

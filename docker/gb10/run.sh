@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Head (this node is 192.168.100.10):
+# Dev (bind-mount host source over /opt/vllm):
 #   NODE_RANK=0 ./docker/gb10/run.sh
-# Worker (set VLLM_HOST_IP to THAT Spark's ConnectX IP):
 #   NODE_RANK=1 VLLM_HOST_IP=192.168.100.11 HEADLESS=--headless ./docker/gb10/run.sh
+# Release (baked /opt/vllm, no source mount): ./docker/gb10/run-image.sh
 set -euo pipefail
 
 IMAGE="${VLLM_GB10_IMAGE:-vllm-gb10:dspark}"
 MODEL_HOST="${MODEL_HOST:-${HOME}/models/DeepSeek-V4-Flash-0731}"
 MODEL_PATH="${MODEL_PATH:-/models/DeepSeek-V4-Flash-0731}"
-VLLM_SRC="${VLLM_SRC:-$(cd "$(dirname "$0")/../.." && pwd)}"
+MOUNT_VLLM_SRC="${MOUNT_VLLM_SRC:-1}"
 VLLM_CACHE="${VLLM_CACHE:-${HOME}/vllm-cache}"
 HF_CACHE="${HF_CACHE:-${HOME}/.cache/huggingface}"
 B12X_CACHE="${B12X_CACHE:-${HOME}/.cache/b12x}"
@@ -19,6 +19,15 @@ HEADLESS="${HEADLESS:-}"
 NAME="${NAME:-dspark-tp2-rank${NODE_RANK}}"
 LINEAR_BACKEND="${LINEAR_BACKEND:-b12x}"
 MOE_BACKEND="${MOE_BACKEND:-b12x}"
+
+src_mount=()
+if [ "${MOUNT_VLLM_SRC}" != "0" ]; then
+  VLLM_SRC="${VLLM_SRC:-$(cd "$(dirname "$0")/../.." && pwd)}"
+  src_mount=(-v "${VLLM_SRC}:/opt/vllm")
+  echo "dev: mounting ${VLLM_SRC} -> /opt/vllm"
+else
+  echo "image: using baked /opt/vllm (no host source mount)"
+fi
 
 mkdir -p "${VLLM_CACHE}" "${HF_CACHE}/flashinfer" "${B12X_CACHE}"
 docker rm -f "${NAME}" 2>/dev/null || true
@@ -40,7 +49,7 @@ docker run -d --name "${NAME}" \
   -v /dev/infiniband:/dev/infiniband \
   -v /sys/class/infiniband:/sys/class/infiniband \
   -v "${MODEL_HOST}:${MODEL_PATH}:ro" \
-  -v "${VLLM_SRC}:/opt/vllm" \
+  "${src_mount[@]}" \
   -v "${VLLM_CACHE}:/root/.cache/vllm" \
   -v "${HF_CACHE}:/root/.cache/huggingface" \
   -v "${HF_CACHE}/flashinfer:/root/.cache/flashinfer" \
