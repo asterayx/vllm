@@ -11,8 +11,22 @@ from pathlib import Path
 
 import torch
 
+def _repo_root(script: Path) -> Path:
+    env = os.environ.get("VLLM_ROOT")
+    if env:
+        return Path(env).resolve()
+    # Host path is docker/gb10/check-extensions.py. pack-venv copies
+    # the same file to /tmp, which has no parents[2].
+    if len(script.parents) > 2 and (script.parents[2] / "vllm").is_dir():
+        return script.parents[2]
+    for candidate in (Path("/opt/vllm"), Path.cwd()):
+        if (candidate / "vllm").is_dir():
+            return candidate.resolve()
+    return Path("/opt/vllm")
+
+
 _SCRIPT = Path(__file__).resolve()
-_REPO = Path(os.environ.get("VLLM_ROOT", _SCRIPT.parents[2])).resolve()
+_REPO = _repo_root(_SCRIPT)
 _VENV = Path(os.environ.get("VIRTUAL_ENV", sys.prefix)).resolve()
 
 

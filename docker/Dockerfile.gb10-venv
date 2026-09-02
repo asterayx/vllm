@@ -58,7 +58,7 @@ ARG OLD_VENV
 ARG OLD_SRC
 RUN chmod +x /tmp/relocate-venv.sh \
     && /tmp/relocate-venv.sh /opt/venv /opt/vllm "${OLD_VENV}" "${OLD_SRC}" \
-    && /opt/venv/bin/python /tmp/check-extensions.py \
+    && VLLM_ROOT=/opt/vllm /opt/venv/bin/python /tmp/check-extensions.py \
     && rm /tmp/relocate-venv.sh /tmp/check-extensions.py
 
 ENV UV_INDEX_STRATEGY=unsafe-best-match
