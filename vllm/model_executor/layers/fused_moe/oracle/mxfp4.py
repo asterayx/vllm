@@ -128,6 +128,9 @@ class Mxfp4MoeBackend(Enum):
     EMULATION = "EMULATION"
     # Humming
     HUMMING = "HUMMING"
+    # Official b12x SM12x (MXFP4 W4A16 / W4A8)
+    B12X = "B12X"
+    B12X_MXFP8 = "B12X_MXFP8"
 
 
 # Backends that share the same TRTLLM weight format
@@ -258,6 +261,11 @@ def backend_to_kernel_cls(
 
         return [OCP_MXQuantizationEmulationTritonExperts]
 
+    elif backend in (Mxfp4MoeBackend.B12X, Mxfp4MoeBackend.B12X_MXFP8):
+        from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+
+        return [B12xExperts]
+
     else:
         raise ValueError(f"Unknown MXFP4 MoE backend: {backend.value}")
 
@@ -294,6 +302,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
         "xpu": [Mxfp4MoeBackend.XPU],
         "cpu": [Mxfp4MoeBackend.CPU],
         "emulation": [Mxfp4MoeBackend.EMULATION],
+        "b12x": [Mxfp4MoeBackend.B12X_MXFP8, Mxfp4MoeBackend.B12X],
     }
     if backends := mapping.get(runner_backend):
         return backends
@@ -364,6 +373,8 @@ def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
         return kFp8StaticTensorSym
     if backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4:
         return kMxfp4Dynamic
+    if backend == Mxfp4MoeBackend.B12X_MXFP8:
+        return kMxfp8Dynamic
     return None  # BF16 activation
 
 
@@ -678,6 +689,10 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
         # CPU AMX kernel uses BLOCK_N=32, align to 32
         intermediate_size = round_up(intermediate_size, 32)
         hidden_size = round_up(hidden_size, 32)
+    elif backend in (Mxfp4MoeBackend.B12X, Mxfp4MoeBackend.B12X_MXFP8):
+        intermediate_size = round_up(intermediate_size, 32)
+        if backend == Mxfp4MoeBackend.B12X_MXFP8:
+            hidden_size = round_up(hidden_size, 256)
     else:
         intermediate_size = round_up(intermediate_size, 64)
     return hidden_size, intermediate_size
@@ -1185,7 +1200,11 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
-    elif mxfp4_backend == Mxfp4MoeBackend.XPU:
+    elif mxfp4_backend in (
+        Mxfp4MoeBackend.XPU,
+        Mxfp4MoeBackend.B12X,
+        Mxfp4MoeBackend.B12X_MXFP8,
+    ):
         # No additional transformation needed for XPU backend
         return (
             w13_weight,
@@ -1663,6 +1682,8 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     elif mxfp4_backend in (
         Mxfp4MoeBackend.XPU,
         Mxfp4MoeBackend.EMULATION,
+        Mxfp4MoeBackend.B12X,
+        Mxfp4MoeBackend.B12X_MXFP8,
     ):
         # No additional transformation is needed: XPU consumes the checkpoint
         # layout directly, while emulation dequantizes that layout at runtime.
@@ -1777,6 +1798,17 @@ def make_mxfp4_moe_quant_config(
             gemm1_beta=gemm1_beta,
             gemm1_clamp_limit=swiglu_limit,
         )
+    elif mxfp4_backend == Mxfp4MoeBackend.B12X_MXFP8:
+        return mxfp4_mxfp8_moe_quant_config(
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=swiglu_limit,
+            is_scale_swizzled=False,
+        )
     elif mxfp4_backend in (
         Mxfp4MoeBackend.MARLIN,
         Mxfp4MoeBackend.BATCHED_MARLIN,
@@ -1786,6 +1818,7 @@ def make_mxfp4_moe_quant_config(
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.AITER_MXFP4_BF16,
         Mxfp4MoeBackend.CPU,
+        Mxfp4MoeBackend.B12X,
     ):
         return mxfp4_w4a16_moe_quant_config(
             w1_bias=w1_bias,
