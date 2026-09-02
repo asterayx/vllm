@@ -16,6 +16,8 @@ from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
     b12x_warmup_token_counts,
+)
+from vllm.utils.b12x import (
     get_b12x_blockscaled as _import_b12x_blockscaled,
 )
 
