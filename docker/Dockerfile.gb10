@@ -58,7 +58,12 @@ ENV UV_INDEX_STRATEGY=unsafe-best-match \
 # GB10 has ~20 ARM cores and 128GB unified memory. 8 is the idle-build
 # default; raise with --build-arg MAX_JOBS=12 if `free` stays comfortable.
 ARG MAX_JOBS=8
-RUN if [ "$(uname -m)" = "aarch64" ]; then \
+# uv cache mount: rebuilds reuse wheels (torch/FlashInfer) without a host
+# venv. Do not rm /root/.cache/uv — that wipes the mount. The mount is
+# not committed into the image. To copy a fully compiled host venv
+# instead, use docker/gb10/pack-venv.sh.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "$(uname -m)" = "aarch64" ]; then \
         printf 'cython<3.3\n' > /tmp/build-constraints.txt \
         && export UV_BUILD_CONSTRAINT=/tmp/build-constraints.txt; \
     fi \
@@ -81,7 +86,7 @@ RUN if [ "$(uname -m)" = "aarch64" ]; then \
     && chmod +x /opt/vllm/docker/gb10/entrypoint.sh \
                /opt/vllm/docker/gb10/install-b12x.sh \
     && /opt/vllm/docker/gb10/install-b12x.sh /opt/venv/bin/python \
-    && rm -rf /root/.cache/uv /root/.cache/flashinfer
+    && rm -rf /root/.cache/flashinfer
 
 EXPOSE 8000
 ENTRYPOINT ["/opt/vllm/docker/gb10/entrypoint.sh"]

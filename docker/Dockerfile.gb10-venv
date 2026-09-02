@@ -20,7 +20,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:/usr/local/cuda/bin:${PATH} \
-    PYTHONPATH=/opt/vllm \
     CUDA_HOME=/usr/local/cuda \
     TORCH_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_CUDA_ARCH_LIST=12.1a \
@@ -53,12 +52,14 @@ COPY venv /opt/venv
 COPY src /opt/vllm
 COPY relocate-venv.sh /tmp/relocate-venv.sh
 COPY install-b12x.sh /tmp/install-b12x.sh
+COPY check-extensions.py /tmp/check-extensions.py
 
 ARG OLD_VENV
 ARG OLD_SRC
 RUN chmod +x /tmp/relocate-venv.sh \
     && /tmp/relocate-venv.sh /opt/venv /opt/vllm "${OLD_VENV}" "${OLD_SRC}" \
-    && rm /tmp/relocate-venv.sh
+    && /opt/venv/bin/python /tmp/check-extensions.py \
+    && rm /tmp/relocate-venv.sh /tmp/check-extensions.py
 
 ENV UV_INDEX_STRATEGY=unsafe-best-match
 ARG INSTALL_FLASHINFER=0
