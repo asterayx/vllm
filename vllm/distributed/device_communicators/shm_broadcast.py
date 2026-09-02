@@ -131,7 +131,7 @@ class SpinCondition:
         is_reader: bool,
         context: zmq.Context,
         notify_address: str,
-        busy_loop_s: float = 1,
+        busy_loop_s: float | None = None,
     ):
         self.is_reader = is_reader
 
@@ -139,7 +139,12 @@ class SpinCondition:
             # Time of last shm buffer read
             self.last_read = time.monotonic()
 
-            # Time to keep busy-looping on the shm buffer before going idle
+            # Time to keep busy-looping on the shm buffer before going idle.
+            # Default 2 ms (was 1 s): on Grace/Spark TP=2 the long spin burns
+            # P-cores; MiaAI #79 / Anemll hotfix. Override with
+            # VLLM_SHM_BROADCAST_BUSY_LOOP_S.
+            if busy_loop_s is None:
+                busy_loop_s = envs.VLLM_SHM_BROADCAST_BUSY_LOOP_S
             self.busy_loop_s = busy_loop_s
 
             # Readers subscribe to write notifications

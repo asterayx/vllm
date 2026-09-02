@@ -28,6 +28,8 @@ services:
       - ${VLLM_CACHE:?set VLLM_CACHE}:/root/.cache/vllm
       - ${HF_CACHE:?set HF_CACHE}:/root/.cache/huggingface
       - ${HF_CACHE}/flashinfer:/root/.cache/flashinfer
+      - ${HF_CACHE}/triton:/root/.cache/huggingface/triton
+      - ${HF_CACHE}/tilelang:/root/.cache/huggingface/tilelang
       - ${B12X_CACHE:-${HOME}/.cache/b12x}:/root/.cache/b12x
       - ${VLLM_SRC:-/home/roccen/src/vllm}:/opt/vllm
     environment:
@@ -43,6 +45,10 @@ services:
       FLASHINFER_DISABLE_VERSION_CHECK: "1"
       B12X_CUTE_COMPILE_CACHE_DIR: /root/.cache/b12x/cute_compile
       B12X_PRINT_COMPILE_PROGRESS: ${B12X_PRINT_COMPILE_PROGRESS:-1}
+      VLLM_USE_BREAKABLE_CUDAGRAPH: ${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}
+      VLLM_SHM_BROADCAST_BUSY_LOOP_S: ${VLLM_SHM_BROADCAST_BUSY_LOOP_S:-0.002}
+      TRITON_CACHE_DIR: /root/.cache/huggingface/triton
+      TILELANG_CACHE_DIR: /root/.cache/huggingface/tilelang
       NCCL_NET: ${NCCL_NET:-IB}
       NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-0}
       NCCL_IB_MERGE_NICS: ${NCCL_IB_MERGE_NICS:-1}
@@ -73,7 +79,7 @@ services:
         --tool-call-parser deepseek_v4
         --enable-auto-tool-choice
         --reasoning-parser deepseek_v4
-        --kv-cache-dtype fp8_ds_mla
+        --kv-cache-dtype ${KV_CACHE_DTYPE:-nvfp4_ds_mla}
         --block-size 256
         --tensor-parallel-size 2
         --pipeline-parallel-size 1
@@ -83,7 +89,7 @@ services:
         --master-port ${MASTER_PORT:-29500}
         --distributed-executor-backend mp
         --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.85}
-        --max-model-len ${MAX_MODEL_LEN:-524288}
+        --max-model-len ${MAX_MODEL_LEN:-1048576}
         --max-num-seqs ${MAX_NUM_SEQS:-6}
         --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS:-8192}
         --max-cudagraph-capture-size ${MAX_CUGRAPH:-36}

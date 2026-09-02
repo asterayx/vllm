@@ -494,6 +494,9 @@ def resolve_kv_cache_dtype_string(
     """Resolve 'auto' kv_cache_dtype to the actual string value from model config.
     Returns the resolved cache_dtype string.
     """
+    # Spark / Anemll recipe alias: same UE8M0 MLA row as fp8_ds_mla.
+    if kv_cache_dtype == "nvfp4_ds_mla":
+        return "fp8_ds_mla"
     if kv_cache_dtype != "auto":
         return kv_cache_dtype
 
