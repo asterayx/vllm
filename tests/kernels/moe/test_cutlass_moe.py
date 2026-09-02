@@ -107,6 +107,7 @@ def test_cutlass_moe_forwards_shared_activation_parameters():
     [
         ("cutlass", nvfp4_oracle.NvFp4MoeBackend.VLLM_CUTLASS),
         ("humming", nvfp4_oracle.NvFp4MoeBackend.HUMMING),
+        ("b12x", nvfp4_oracle.NvFp4MoeBackend.B12X),
     ],
 )
 def test_nvfp4_clamp_allows_shared_activation_backends(

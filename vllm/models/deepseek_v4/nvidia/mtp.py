@@ -56,6 +56,7 @@ from vllm.models.deepseek_v4.common.ops import (
     mtp_shared_head_rmsnorm,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.utils.sm12x import sm12x_disable_attn_aux_streams
 
 from .model import (
     DeepseekV4DecoderLayer,
@@ -204,7 +205,11 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         )
 
         # Three aux streams shared across all MTP layers, mirroring DeepseekV4Model.
-        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+        aux_stream_list = (
+            None
+            if sm12x_disable_attn_aux_streams()
+            else [torch.cuda.Stream() for _ in range(3)]
+        )
 
         # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(

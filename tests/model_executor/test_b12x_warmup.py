@@ -78,6 +78,12 @@ def test_b12x_warmup_covers_linear_serving_shapes(monkeypatch) -> None:
     monkeypatch.setattr(warmup_mod, "warmup_b12x_nvfp4_linear", linear_warmup)
     monkeypatch.setattr(warmup_mod, "warmup_b12x_tensor_fp8_linear", linear_warmup)
 
+    platform = SimpleNamespace(
+        is_cuda=lambda: True,
+        is_device_capability_family=lambda family: family == 120,
+    )
+    monkeypatch.setattr(warmup_mod, "current_platform", platform)
+
     worker = SimpleNamespace(
         get_model=lambda: model,
         scheduler_config=SimpleNamespace(
@@ -98,3 +104,62 @@ def test_b12x_warmup_covers_linear_serving_shapes(monkeypatch) -> None:
         "output_dtype": torch.float16,
     }
     assert linear_calls == [(model, expected_linear_kwargs)] * 5
+
+
+def test_b12x_warmup_collects_moe_provider(monkeypatch) -> None:
+    import vllm.model_executor.warmup.b12x_warmup as warmup_mod
+    from vllm.utils.b12x import B12xWarmupUnit
+
+    compiled: list[str] = []
+
+    class _MoE(torch.nn.Module):
+        def get_b12x_warmup_unit(self, layer, token_counts, output_dtype):
+            return B12xWarmupUnit(
+                name="MoE",
+                key=("moe", token_counts, output_dtype),
+                compile=lambda: compiled.append("moe"),
+            )
+
+    moe = _MoE()
+    layer = torch.nn.Module()
+    layer.b12x_warmup_provider = moe
+    model = torch.nn.Sequential(layer)
+
+    monkeypatch.setattr(
+        warmup_mod,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            is_device_capability_family=lambda family: family == 120,
+        ),
+    )
+    monkeypatch.setattr(
+        warmup_mod, "warmup_b12x_block_fp8_linear", lambda *args, **kwargs: 0
+    )
+    monkeypatch.setattr(
+        warmup_mod, "warmup_b12x_mxfp4_linear", lambda *args, **kwargs: 0
+    )
+    monkeypatch.setattr(
+        warmup_mod, "warmup_b12x_mxfp8_linear", lambda *args, **kwargs: 0
+    )
+    monkeypatch.setattr(
+        warmup_mod, "warmup_b12x_nvfp4_linear", lambda *args, **kwargs: 0
+    )
+    monkeypatch.setattr(
+        warmup_mod, "warmup_b12x_tensor_fp8_linear", lambda *args, **kwargs: 0
+    )
+    monkeypatch.setattr(warmup_mod.torch.accelerator, "synchronize", lambda: None)
+
+    worker = SimpleNamespace(
+        get_model=lambda: model,
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=128,
+            max_num_scheduled_tokens=None,
+        ),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(compile_sizes=[])
+        ),
+    )
+    b12x_warmup(worker, [8])
+    assert compiled == ["moe"]

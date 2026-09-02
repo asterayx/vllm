@@ -585,6 +585,43 @@ class DeepSeekMTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
         return getattr(self.hf_text_config, "num_nextn_predict_layers", 0)
 
 
+class DeepseekV4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    def __init__(
+        self,
+        hf_config: PretrainedConfig,
+        hf_text_config: PretrainedConfig,
+        revision: str | None = None,
+    ):
+        # DeepSeek-V4-Flash-Vision-Exp ships the same architectures/model_type
+        # as the text-only DeepSeek-V4-Flash; route to the VL wrapper class
+        # when the config carries a vision tower. Mutate (not just override
+        # get_architectures) because model-class resolution reads the raw
+        # hf_config.architectures (get_model_architecture).
+        # The VL wrapper marks the config copy it hands to the inner text
+        # backbone with _dsv4_vl_inner so this rewrite does not recurse.
+        # DSpark/MTP drafts reuse the vision checkpoint config but must stay
+        # on the text draft class — rewriting them to the VL wrapper rebuilds
+        # language_model.model.layers.* and collides with the target SWA cache.
+        archs = set(getattr(hf_config, "architectures", None) or [])
+        if (
+            getattr(hf_config, "vision_n_layers", 0) > 0
+            and not getattr(hf_config, "_dsv4_vl_inner", False)
+            and "DSparkDraftModel" not in archs
+            and "DeepSeekV4MTPModel" not in archs
+        ):
+            hf_config.architectures = ["DeepseekV4ForConditionalGeneration"]
+        super().__init__(hf_config, hf_text_config, revision)
+
+    def is_mm_prefix_lm(self, supports_multimodal: bool = True) -> bool:
+        # The vision variant needs the mm-prefix plumbing: it makes the
+        # scheduler prefill image spans atomically (disable_chunked_mm_input)
+        # and routes per-request image ranges to the sparse-SWA metadata
+        # builder, which widens the sliding window bidirectionally in-kernel.
+        if not supports_multimodal:
+            return False
+        return getattr(self.hf_config, "vision_n_layers", 0) > 0
+
+
 class MimoMTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
     def get_num_hidden_layers(self) -> int:
         return getattr(self.hf_text_config, "num_nextn_predict_layers", 0)
@@ -772,6 +809,7 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "cohere_asr": CohereAsrModelArchConfigConvertor,
     "dbrx": DbrxModelArchConfigConvertor,
     "deepseek_mtp": DeepSeekMTPModelArchConfigConvertor,
+    "deepseek_v4": DeepseekV4ModelArchConfigConvertor,
     "diffusion_gemma_text": Gemma4ModelArchConfigConvertor,
     "ernie_mtp": ErnieMTPModelArchConfigConvertor,
     "falcon": FalconModelArchConfigConvertor,

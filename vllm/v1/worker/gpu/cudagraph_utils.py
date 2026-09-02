@@ -29,11 +29,17 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
+from vllm.utils.sm12x import sm12x_allow_full_decode_capture
+from vllm.utils.torch_utils import current_stream
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import (
+    InputBatch,
+    InputBuffers,
+    uniform_dummy_num_reqs,
+)
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -245,6 +251,9 @@ class CudaGraphManager:
                         rounded_num_tokens > max_decode_tokens
                         or rounded_num_tokens > max_cg_capture_size
                         or rounded_num_reqs > self.max_num_reqs
+                        or not sm12x_allow_full_decode_capture(
+                            rounded_num_tokens, decode_query_len
+                        )
                     ):
                         continue
 
@@ -362,7 +371,9 @@ class CudaGraphManager:
                             set_graph_pool_id(self.pool)
                         else:
                             set_graph_pool_id(current_platform.graph_pool_handle())
-                        with torch.cuda.graph(graph, self.pool):
+                        with torch.cuda.graph(
+                            graph, self.pool, stream=current_stream()
+                        ):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
@@ -487,7 +498,16 @@ class ModelCudaGraphManager(CudaGraphManager):
             warmup: bool,
         ) -> Callable[[CUDAGraphMode], None]:
             num_tokens = desc.num_tokens
-            num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+            num_reqs = desc.num_reqs or uniform_dummy_num_reqs(
+                num_tokens, self.max_num_reqs, self.decode_query_len
+            )
+            if current_platform.is_device_capability_family(120):
+                logger.info_once(
+                    "SM12x CUDA-graph dummy: tokens=%d reqs=%d q_len=%d",
+                    num_tokens,
+                    num_reqs,
+                    num_tokens // num_reqs if num_reqs else 0,
+                )
 
             # Set LoRA state before capture so kernels see correct adapters.
             if lora_capture_hook is not None:

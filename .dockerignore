@@ -5,6 +5,8 @@
 /wheel-export/
 dist
 vllm/*.so
+vllm/**/*.so
+vllm/**/*.abi3.so
 vllm/vllm-rs
 
 # Byte-compiled / optimized / DLL files

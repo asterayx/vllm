@@ -127,11 +127,21 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         cls,
         compute_capability: int | None = None,
     ) -> tuple[bool, str | None]:
-        del compute_capability
         if not current_platform.is_cuda():
             return False, "B12X FP8 kernels are only available on CUDA"
         if not current_platform.is_device_capability_family(120):
             return False, "B12X FP8 kernels require a Blackwell 12x device"
+        # GB10 reports sm_121a; official b12x 1.2.6 compiles these GEMMs as
+        # sm_120. The TMA mismatch IMA'd on SM121.
+        cap = compute_capability
+        if cap is None:
+            device_cap = current_platform.get_device_capability()
+            cap = device_cap.to_int() if device_cap is not None else None
+        if cap == 121:
+            return False, (
+                "B12X block-FP8 dense GEMM IMAs on SM121 "
+                "(sm_120 TMA vs sm_121a)"
+            )
         blockscaled = _import_b12x_blockscaled()
         if blockscaled is None:
             return False, "Install the B12X backend with `pip install vllm[b12x]`"

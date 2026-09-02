@@ -8,10 +8,16 @@ import torch
 
 from vllm.config import set_current_vllm_config
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+    DeepseekV4FlashInferSM120Attention,
+    _batch_token_span,
     _required_sm120_sparse_topk,
+    sm12x_q_len_spans,
+    sm12x_use_per_request_decode,
+    spec_decode_uniform_next_n,
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils import flashinfer as fi_utils
+from vllm.utils.sm12x import sm12x_align_decode_q_len, sm12x_align_prefill_q_len
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseSM120Backend,
 )
@@ -64,13 +70,16 @@ def test_sm120_dsv4_capability_checks_exact_dispatch_shape(monkeypatch) -> None:
     monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: True)
     monkeypatch.setattr(fi_utils, "_get_submodule", lambda _name: fake_module)
     fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
+    fi_utils.resolve_sm120_dsv4_topk.cache_clear()
 
     assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 128)
     assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 192)
     assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 256)
     assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(16, 192)
+    assert fi_utils.resolve_sm120_dsv4_topk(192, 32) == 192
 
     fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
+    fi_utils.resolve_sm120_dsv4_topk.cache_clear()
 
 
 def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
@@ -85,3 +94,566 @@ def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
 
     assert _required_sm120_sparse_topk(causal, 128) == 128
     assert _required_sm120_sparse_topk(dspark, 128) == 192
+
+
+def test_resolve_sm120_dsv4_topk_snaps_missing_dspark_width(monkeypatch) -> None:
+    """0.6.17 ships 128/512/1024, not DSpark's aligned width 192."""
+    fake_module = SimpleNamespace(
+        _DECODE_DSV4_DISPATCH=frozenset({(32, 128), (32, 512), (32, 1024)})
+    )
+    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: True)
+    monkeypatch.setattr(fi_utils, "_get_submodule", lambda _name: fake_module)
+    fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
+    fi_utils.resolve_sm120_dsv4_topk.cache_clear()
+
+    assert fi_utils.resolve_sm120_dsv4_topk(128, 32) == 128
+    assert fi_utils.resolve_sm120_dsv4_topk(192, 32) == 512
+    assert fi_utils.resolve_sm120_dsv4_topk(192, 20) == 512
+    assert fi_utils.resolve_sm120_dsv4_topk(2048, 32) is None
+    assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 192)
+    assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 512)
+
+    fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
+    fi_utils.resolve_sm120_dsv4_topk.cache_clear()
+
+
+def test_spec_decode_uniform_next_n_accepts_dspark_and_skips_ragged_dummy():
+    """DSpark k=5 is next_n=6. Capture size 32 over max_num_seqs=6 is ragged.
+
+    The dummy CUDA-graph batch used to assert in _forward_decode; the helper
+    must return None so the kernel falls back to per-request decode-form.
+    """
+    assert spec_decode_uniform_next_n(36, 6) == 6
+    assert spec_decode_uniform_next_n(24, 6) == 4
+    assert spec_decode_uniform_next_n(8, 4) == 2
+    assert spec_decode_uniform_next_n(16, 4) == 4
+    assert spec_decode_uniform_next_n(32, 4) == 8
+    assert spec_decode_uniform_next_n(6, 6) is None
+    assert spec_decode_uniform_next_n(32, 6) is None
+    assert spec_decode_uniform_next_n(16, 6) is None
+    assert spec_decode_uniform_next_n(8, 6) is None
+    assert spec_decode_uniform_next_n(0, 0) is None
+
+
+def test_sm12x_dummy_next_n_uses_per_request_decode(monkeypatch):
+    """Size-8 dummy is 4×2 (next_n=2); batched SM120 decode IMA'd on GB10."""
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert sm12x_use_per_request_decode(2, 6)
+    assert sm12x_use_per_request_decode(2, 2)
+    assert sm12x_use_per_request_decode(4, 6)
+    assert sm12x_use_per_request_decode(4, 4)
+    assert sm12x_use_per_request_decode(5, 6)
+    assert sm12x_use_per_request_decode(5, 5)
+    assert sm12x_use_per_request_decode(8, 6)
+    assert not sm12x_use_per_request_decode(6, 6)
+    assert not sm12x_use_per_request_decode(None, 6)
+
+
+def test_non_sm12x_keeps_batched_spec_decode(monkeypatch):
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
+    assert not sm12x_use_per_request_decode(2, 6)
+    assert not sm12x_use_per_request_decode(4, 6)
+    assert not sm12x_use_per_request_decode(6, 6)
+
+
+def test_sm12x_keeps_q_len_2_as_one_span(monkeypatch):
+    """Do not split q_len=2: a 2-token prefill's second KV is not written yet."""
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert sm12x_q_len_spans(2) == [(0, 2)]
+    assert sm12x_q_len_spans(1) == [(0, 1)]
+    assert sm12x_q_len_spans(4) == [(0, 4)]
+    assert sm12x_q_len_spans(6) == [(0, 6)]
+
+
+def test_sm12x_aligns_unsafe_decode_q_len(monkeypatch):
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert sm12x_align_decode_q_len(1) == 1
+    assert sm12x_align_decode_q_len(2) == 6
+    assert sm12x_align_decode_q_len(3) == 6
+    assert sm12x_align_decode_q_len(4) == 4
+    assert sm12x_align_decode_q_len(5) == 6
+    assert sm12x_align_decode_q_len(15) == 16
+    assert sm12x_align_decode_q_len(16) == 16
+    assert sm12x_align_decode_q_len(36) == 36
+    assert sm12x_align_prefill_q_len(2) == 6
+    assert sm12x_align_prefill_q_len(4) == 6
+    assert sm12x_align_prefill_q_len(5) == 6
+    assert sm12x_align_prefill_q_len(8) == 8
+    assert sm12x_align_prefill_q_len(16) == 16
+
+
+def test_non_sm12x_keeps_q_len_2(monkeypatch):
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
+    assert sm12x_q_len_spans(2) == [(0, 2)]
+    assert sm12x_align_decode_q_len(2) == 2
+    assert sm12x_align_prefill_q_len(2) == 2
+
+
+def test_batch_token_span_repeats_last_real_row():
+    """Padded decode-form rows reuse the last real token's indices/lens."""
+    indices = torch.tensor([[10, 11], [12, 13]], dtype=torch.int32)
+    lens = torch.tensor([2, 3], dtype=torch.int32)
+    padded = _batch_token_span(indices, 0, 2, 4)
+    padded_lens = _batch_token_span(lens, 0, 2, 4)
+    assert padded.shape == (1, 4, 2)
+    assert torch.equal(padded[0, :2], indices)
+    assert torch.equal(padded[0, 2:], indices[-1:].expand(2, -1))
+    assert padded_lens.shape == (1, 4)
+    assert torch.equal(padded_lens[0, :2], lens)
+    assert torch.equal(padded_lens[0, 2:], torch.tensor([3, 3], dtype=torch.int32))
+    sentinels = _batch_token_span(indices, 0, 2, 4, fill=-1)
+    assert torch.equal(sentinels[0, 2:], torch.full((2, 2), -1, dtype=torch.int32))
+
+
+def _launch_per_request(
+    monkeypatch,
+    q_len: int,
+    *,
+    extra_cache: torch.Tensor | None = None,
+    extra_sparse_indices: torch.Tensor | None = None,
+    extra_sparse_lengths: torch.Tensor | None = None,
+    **kwargs,
+) -> list[dict]:
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+
+    launches: list[dict] = []
+
+    def _fake_launch(**launch_kwargs):
+        launches.append(launch_kwargs)
+
+    monkeypatch.setattr(
+        fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
+    )
+    dummy = SimpleNamespace(
+        scale=1.0,
+        attn_sink=None,
+        _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
+    )
+    q = torch.arange(q_len * 8 * 512, dtype=torch.float32).view(q_len, 8, 512)
+    output = torch.zeros(q_len, 8, 512)
+    swa_indices = torch.arange(q_len * 16, dtype=torch.int32).view(q_len, 16)
+    swa_lens = torch.arange(1, q_len + 1, dtype=torch.int32)
+    DeepseekV4FlashInferSM120Attention._launch_per_request_decode(
+        dummy,
+        q,
+        output,
+        torch.zeros(1),
+        extra_cache,
+        swa_indices,
+        swa_lens,
+        extra_sparse_indices,
+        extra_sparse_lengths,
+        0,
+        q_len,
+        **kwargs,
+    )
+    return launches
+
+
+def _launch_per_request_shapes(monkeypatch, q_len: int, **kwargs) -> list[torch.Size]:
+    return [
+        launch["query"].shape
+        for launch in _launch_per_request(monkeypatch, q_len, **kwargs)
+    ]
+
+
+def test_launch_per_request_decode_pads_q_len_2_once(monkeypatch):
+    """A 2-token SM12x launch must be one [1, 6], not [1, 4] or two [1, 1]."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert _launch_per_request_shapes(monkeypatch, 2) == [torch.Size([1, 6, 8, 512])]
+    assert _launch_per_request_shapes(monkeypatch, 4) == [torch.Size([1, 4, 8, 512])]
+    assert _launch_per_request_shapes(monkeypatch, 5) == [torch.Size([1, 6, 8, 512])]
+
+
+def test_launch_per_request_decode_never_snaps_2_to_4(monkeypatch):
+    """The 15:52 Spark IMA was a leftover 2→4 decode align."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    launches = _launch_per_request(monkeypatch, 2)
+    assert [launch["query"].shape for launch in launches] == [
+        torch.Size([1, 6, 8, 512])
+    ]
+    assert launches[0]["query"].shape[1] != 4
+
+
+def test_launch_per_request_prefill_pads_q_len_2_once(monkeypatch):
+    """A 2-token SM12x prefill must be one [1, 6] launch, not two [1, 1]."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    launches = _launch_per_request(monkeypatch, 2, is_prefill=True)
+    assert [launch["query"].shape for launch in launches] == [
+        torch.Size([1, 6, 8, 512])
+    ]
+    query = launches[0]["query"]
+    indices = launches[0]["sparse_indices"]
+    lens = launches[0]["swa_topk_lens"]
+    assert torch.equal(query[0, 2:], query[0, 1:2].expand(4, -1, -1))
+    assert torch.equal(indices[0, 2:], indices[0, 1:2].expand(4, -1))
+    assert torch.equal(lens[0, 2:], lens[0, 1:2].expand(4))
+    assert not torch.any(indices == -1)
+    assert _launch_per_request_shapes(monkeypatch, 4, is_prefill=True) == [
+        torch.Size([1, 6, 8, 512])
+    ]
+
+
+def test_launch_per_request_replaces_swa_minus_one_sentinels(monkeypatch):
+    """Real SWA rows already contain ``-1`` tails; pad-repeat is not enough."""
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    launches: list[dict] = []
+
+    def _fake_launch(**kwargs):
+        launches.append(kwargs)
+
+    monkeypatch.setattr(
+        fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
+    )
+    dummy = SimpleNamespace(
+        scale=1.0,
+        attn_sink=None,
+        _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
+    )
+    q_len = 2
+    width = 128
+    swa_indices = torch.full((q_len, width), -1, dtype=torch.int32)
+    swa_indices[0, 0] = 7
+    swa_indices[1, 0] = 7
+    swa_indices[1, 1] = 8
+    DeepseekV4FlashInferSM120Attention._launch_per_request_decode(
+        dummy,
+        torch.zeros(q_len, 8, 512),
+        torch.zeros(q_len, 8, 512),
+        torch.zeros(1),
+        None,
+        swa_indices,
+        torch.tensor([1, 2], dtype=torch.int32),
+        None,
+        None,
+        0,
+        q_len,
+        is_prefill=True,
+    )
+    assert len(launches) == 1
+    indices = launches[0]["sparse_indices"]
+    assert indices.shape == (1, 6, width)
+    assert not torch.any(indices == -1)
+    assert torch.equal(indices[0, 0], torch.full((width,), 7, dtype=torch.int32))
+    expect1 = torch.full((width,), 8, dtype=torch.int32)
+    expect1[0] = 7
+    assert torch.equal(indices[0, 1], expect1)
+    assert torch.equal(indices[0, 2:], expect1.unsqueeze(0).expand(4, -1))
+    assert torch.equal(
+        launches[0]["swa_topk_lens"][0, :2],
+        torch.tensor([1, 2], dtype=torch.int32),
+    )
+
+
+def test_forward_decode_q_len_2_is_one_padded_launch(monkeypatch):
+    """A 2-token seed labeled decode must still be one [1, 6], not [1, 2]."""
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    shapes: list[torch.Size] = []
+
+    def _fake_launch(**launch_kwargs):
+        shapes.append(launch_kwargs["query"].shape)
+        assert launch_kwargs["query"].is_contiguous()
+
+    monkeypatch.setattr(
+        fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
+    )
+    dummy = SimpleNamespace(
+        scale=1.0,
+        attn_sink=None,
+        kv_cache_torch_dtype=torch.bfloat16,
+        # next_n=2 must pad even if this equals decode_query_len.
+        _decode_query_len=2,
+        _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
+        _as_sparse_cache=DeepseekV4FlashInferSM120Attention._as_sparse_cache,
+        swa_cache_layer=SimpleNamespace(kv_cache=torch.zeros(2, 1, 1, 512)),
+    )
+    dummy._prepare_query = DeepseekV4FlashInferSM120Attention._prepare_query.__get__(
+        dummy
+    )
+    dummy._launch_per_request_decode = (
+        DeepseekV4FlashInferSM120Attention._launch_per_request_decode.__get__(dummy)
+    )
+    swa = SimpleNamespace(
+        num_decodes=1,
+        num_decode_tokens=2,
+        decode_swa_indices=torch.zeros(2, 16, dtype=torch.int32),
+        decode_swa_lens=torch.ones(2, dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2]),
+    )
+    q = torch.zeros(2, 8, 512, dtype=torch.bfloat16)
+    output = torch.zeros(2, 8, 512, dtype=torch.bfloat16)
+    DeepseekV4FlashInferSM120Attention._forward_decode(
+        dummy, q, None, swa, None, True, output
+    )
+    assert shapes == [torch.Size([1, 6, 8, 512])]
+
+
+def test_forward_prefill_q_len_2_is_one_padded_launch(monkeypatch):
+    """Mixed-warmup seed is one [1, 6], never [1, 4] or 65."""
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    shapes: list[torch.Size] = []
+
+    def _fake_launch(**launch_kwargs):
+        shapes.append(launch_kwargs["query"].shape)
+
+    monkeypatch.setattr(
+        fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
+    )
+    dummy = SimpleNamespace(
+        compress_ratio=1,
+        PREFILL_CHUNK_SIZE=4,
+        scale=1.0,
+        attn_sink=None,
+        kv_cache_torch_dtype=torch.bfloat16,
+        _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
+        _as_sparse_cache=DeepseekV4FlashInferSM120Attention._as_sparse_cache,
+    )
+    dummy._prepare_query = DeepseekV4FlashInferSM120Attention._prepare_query.__get__(
+        dummy
+    )
+    dummy._launch_per_request_decode = (
+        DeepseekV4FlashInferSM120Attention._launch_per_request_decode.__get__(dummy)
+    )
+    swa = SimpleNamespace(
+        num_prefills=1,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefill_tokens=2,
+        query_start_loc_cpu=torch.tensor([0, 2]),
+        prefill_swa_indices=torch.zeros(2, 16, dtype=torch.int32),
+        prefill_swa_lens=torch.ones(2, dtype=torch.int32),
+    )
+    q = torch.zeros(2, 8, 512, dtype=torch.bfloat16)
+    output = torch.zeros(2, 8, 512, dtype=torch.bfloat16)
+    DeepseekV4FlashInferSM120Attention._forward_prefill(
+        dummy, q, None, torch.zeros(1), output, None, swa
+    )
+    assert shapes == [torch.Size([1, 6, 8, 512])]
+    assert shapes[0][1] != 4
+    assert shapes[0] != torch.Size([65, 8, 512])
+
+
+def test_launch_per_request_prefill_pad_drops_c4a(monkeypatch):
+    """22:57 IMA: padded C4A extra_sparse into a live extra cache."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    extra_cache = torch.zeros(1)
+    extra_idx = torch.arange(16, dtype=torch.int32).view(2, 8)
+    extra_len = torch.ones(2, dtype=torch.int32)
+    launches = _launch_per_request(
+        monkeypatch,
+        2,
+        extra_cache=extra_cache,
+        extra_sparse_indices=extra_idx,
+        extra_sparse_lengths=extra_len,
+        is_prefill=True,
+    )
+    assert [launch["query"].shape for launch in launches] == [
+        torch.Size([1, 6, 8, 512])
+    ]
+    assert launches[0]["compressed_kv_cache"] is None
+    assert launches[0]["extra_sparse_indices"] is None
+    assert launches[0]["extra_sparse_topk_lens"] is None
+    assert launches[0]["query"].shape[1] != 4
+
+
+def test_launch_per_request_decode_pad_keeps_c4a(monkeypatch):
+    """DSpark decode 5→6 captured with C4A attached; do not drop it."""
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    extra_cache = torch.zeros(1)
+    extra_idx = torch.arange(40, dtype=torch.int32).view(5, 8)
+    extra_len = torch.ones(5, dtype=torch.int32)
+    launches = _launch_per_request(
+        monkeypatch,
+        5,
+        extra_cache=extra_cache,
+        extra_sparse_indices=extra_idx,
+        extra_sparse_lengths=extra_len,
+    )
+    assert [launch["query"].shape for launch in launches] == [
+        torch.Size([1, 6, 8, 512])
+    ]
+    assert launches[0]["compressed_kv_cache"] is extra_cache
+    assert launches[0]["extra_sparse_indices"] is not None
+    assert launches[0]["extra_sparse_indices"].shape == torch.Size([1, 6, 8])
+    assert launches[0]["extra_sparse_topk_lens"].shape == torch.Size([1, 6])
+
+
+def test_forward_prefill_c4a_q_len_2_is_one_padded_launch(monkeypatch):
+    """Spark mixed-warmup seed is C4A; SWA-only [1, 6], no topk kernel."""
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    shapes: list[torch.Size] = []
+    extras: list[torch.Tensor | None] = []
+    caches: list[torch.Tensor | None] = []
+    topk_calls = {"n": 0}
+
+    def _fake_launch(**launch_kwargs):
+        shapes.append(launch_kwargs["query"].shape)
+        extras.append(launch_kwargs["extra_sparse_indices"])
+        caches.append(launch_kwargs["compressed_kv_cache"])
+
+    def _fake_topk(*args, **kwargs):
+        topk_calls["n"] += 1
+        return (
+            torch.zeros(2, 8, dtype=torch.int32),
+            torch.ones(2, dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(
+        fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
+    )
+    monkeypatch.setattr(
+        fi_sparse,
+        "compute_global_topk_indices_and_lens",
+        _fake_topk,
+    )
+    dummy = SimpleNamespace(
+        compress_ratio=4,
+        PREFILL_CHUNK_SIZE=4,
+        scale=1.0,
+        attn_sink=None,
+        kv_cache_torch_dtype=torch.bfloat16,
+        topk_indices_buffer=torch.zeros(2, 8, dtype=torch.int32),
+        _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
+        _as_sparse_cache=DeepseekV4FlashInferSM120Attention._as_sparse_cache,
+    )
+    dummy._prepare_query = DeepseekV4FlashInferSM120Attention._prepare_query.__get__(
+        dummy
+    )
+    dummy._launch_per_request_decode = (
+        DeepseekV4FlashInferSM120Attention._launch_per_request_decode.__get__(dummy)
+    )
+    swa = SimpleNamespace(
+        num_prefills=1,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefill_tokens=2,
+        query_start_loc_cpu=torch.tensor([0, 2]),
+        prefill_swa_indices=torch.zeros(2, 16, dtype=torch.int32),
+        prefill_swa_lens=torch.ones(2, dtype=torch.int32),
+        token_to_req_indices=torch.zeros(2, dtype=torch.int32),
+        is_valid_token=torch.ones(2, dtype=torch.bool),
+    )
+    attn = SimpleNamespace(
+        block_table=torch.zeros(1, 4, dtype=torch.int32),
+        block_size=64,
+    )
+    q = torch.zeros(2, 8, 512, dtype=torch.bfloat16)
+    output = torch.zeros(2, 8, 512, dtype=torch.bfloat16)
+    DeepseekV4FlashInferSM120Attention._forward_prefill(
+        dummy, q, torch.zeros(1), torch.zeros(1), output, attn, swa
+    )
+    assert shapes == [torch.Size([1, 6, 8, 512])]
+    assert extras == [None]
+    assert caches == [None]
+    assert topk_calls["n"] == 0
+    assert shapes[0][1] != 4
+    assert shapes[0] != torch.Size([65, 8, 512])

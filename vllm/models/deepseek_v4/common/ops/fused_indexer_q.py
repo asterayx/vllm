@@ -3,9 +3,9 @@
 
 import torch
 
+from vllm.models.deepseek_v4.common.cutedsl import use_dsv4_cutedsl
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.import_utils import has_cutedsl
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
@@ -364,7 +364,7 @@ def fused_indexer_q_rope_quant(
             index_q_packed, index_q_scale, _ = output_buffers
         assert index_q_packed.shape == packed_shape
         assert index_q_scale.shape == scale_shape
-        if has_cutedsl():
+        if use_dsv4_cutedsl():
             # lazily import, otherwise some tests fail due to CUDA driver init failure.
             from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
                 fused_indexer_q_rope_quant_mxfp4_cutedsl,
@@ -437,7 +437,7 @@ def fused_indexer_q_rope_quant(
     else:
         index_q_fp8, _ = output_buffers
         assert index_q_fp8.shape == index_q.shape
-    if has_cutedsl():
+    if use_dsv4_cutedsl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
             fused_indexer_q_rope_quant_fp8_cutedsl,

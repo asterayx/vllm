@@ -154,11 +154,33 @@ flashinfer_trtllm_batch_decode_with_kv_cache_mla = _lazy_import_wrapper(
     "trtllm_batch_decode_with_kv_cache_mla",
     fallback_fn=_missing_sparse_mla,
 )
-flashinfer_trtllm_batch_decode_sparse_mla_dsv4 = _lazy_import_wrapper(
+_flashinfer_trtllm_batch_decode_sparse_mla_dsv4_impl = _lazy_import_wrapper(
     "flashinfer.decode",
     "trtllm_batch_decode_sparse_mla_dsv4",
     fallback_fn=_missing_sparse_mla,
 )
+
+
+def flashinfer_trtllm_batch_decode_sparse_mla_dsv4(*args: Any, **kwargs: Any):
+    """SM12x last line: refuse ``[1, 2]`` / ``[1, 3]``; drop SWA ``-1``."""
+    query = kwargs.get("query", args[0] if args else None)
+    if query is not None:
+        from vllm.utils.sm12x import reject_sm12x_unsafe_decode_query
+
+        reject_sm12x_unsafe_decode_query(query)
+    from vllm.utils.sm12x import sm12x_replace_swa_index_sentinels
+
+    if "sparse_indices" in kwargs:
+        kwargs["sparse_indices"] = sm12x_replace_swa_index_sentinels(
+            kwargs["sparse_indices"]
+        )
+    if kwargs.get("extra_sparse_indices") is not None:
+        kwargs["extra_sparse_indices"] = sm12x_replace_swa_index_sentinels(
+            kwargs["extra_sparse_indices"]
+        )
+    return _flashinfer_trtllm_batch_decode_sparse_mla_dsv4_impl(*args, **kwargs)
+
+
 flashinfer_xqa_batch_decode_with_kv_cache = _lazy_import_wrapper(
     "flashinfer.decode",
     "xqa_batch_decode_with_kv_cache",
@@ -237,6 +259,27 @@ def has_flashinfer_sparse_mla_sm120() -> bool:
     )
 
 
+_SM120_DSV4_SUPPORTED_Q_HEADS = (8, 16, 32, 64, 128)
+
+
+def _sm120_dsv4_dispatch() -> frozenset[tuple[int, int]] | None:
+    """Return FlashInfer's SM120 DSV4 ``(heads, top_k)`` decode table."""
+    if not has_flashinfer_sparse_mla_sm120():
+        return None
+    mod = _get_submodule("flashinfer.mla._sparse_mla_sm120")
+    dispatch = getattr(mod, "_DECODE_DSV4_DISPATCH", None) if mod else None
+    if dispatch is None:
+        return None
+    return frozenset((int(heads), int(top_k)) for heads, top_k in dispatch)
+
+
+def _pad_sm120_dsv4_q_heads(num_q_heads: int) -> int:
+    for supported in _SM120_DSV4_SUPPORTED_Q_HEADS:
+        if num_q_heads <= supported:
+            return supported
+    return int(num_q_heads)
+
+
 @functools.cache
 def has_flashinfer_sparse_mla_sm120_config(num_q_heads: int, top_k: int) -> bool:
     """Return whether FlashInfer ships an SM120 DSV4 decode specialization.
@@ -246,11 +289,30 @@ def has_flashinfer_sparse_mla_sm120_config(num_q_heads: int, top_k: int) -> bool
     valid vLLM configuration. Inspect FlashInfer's dispatch table until it
     exposes a public capability query.
     """
-    if not has_flashinfer_sparse_mla_sm120():
-        return False
-    mod = _get_submodule("flashinfer.mla._sparse_mla_sm120")
-    dispatch = getattr(mod, "_DECODE_DSV4_DISPATCH", None) if mod else None
+    dispatch = _sm120_dsv4_dispatch()
     return dispatch is not None and (int(num_q_heads), int(top_k)) in dispatch
+
+
+@functools.cache
+def resolve_sm120_dsv4_topk(
+    required_topk: int, num_q_heads: int | None = None
+) -> int | None:
+    """Smallest FlashInfer DSV4 decode ``top_k`` that covers ``required_topk``.
+
+    0.6.17 ships ``{128, 512, 1024}`` but not DSpark's aligned width 192.
+    Padding the SWA index list up to the next specialization keeps the
+    logical window unchanged and hits a real cubin.
+    """
+    dispatch = _sm120_dsv4_dispatch()
+    if not dispatch:
+        return None
+    if num_q_heads is None:
+        topks = {top_k for _, top_k in dispatch}
+    else:
+        heads = _pad_sm120_dsv4_q_heads(int(num_q_heads))
+        topks = {top_k for h, top_k in dispatch if h == heads}
+    candidates = [top_k for top_k in topks if top_k >= int(required_topk)]
+    return min(candidates) if candidates else None
 
 
 @functools.cache

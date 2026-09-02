@@ -95,8 +95,10 @@ def _compile_cutedsl_warmup_units(
 @instrument(span_name="CuTeDSL warmup")
 def cutedsl_warmup() -> None:
     """Run CuTeDSL compile providers before serving."""
-    if not current_platform.is_cuda():
-        logger.debug("Skipping CuTeDSL warmup on non-CUDA platform.")
+    from vllm.utils.cutedsl import cutedsl_jit_supported
+
+    if not current_platform.is_cuda() or not cutedsl_jit_supported():
+        logger.debug("Skipping CuTeDSL warmup (non-CUDA or SM12x cute-to-nvvm).")
         return
 
     compile_units = _collect_unique_compile_units(_iter_cutedsl_warmup_compile_units())
