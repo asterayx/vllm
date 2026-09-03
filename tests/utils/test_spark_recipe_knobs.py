@@ -21,12 +21,11 @@ def test_nvfp4_ds_mla_alias_normalizes_in_resolve_helper():
     assert resolve_kv_cache_dtype_string("auto", None) == "auto"
 
 
-def test_shm_spin_busy_loop_default_is_2ms(monkeypatch):
+def test_shm_spin_busy_loop_default_is_1s(monkeypatch):
     monkeypatch.delenv("VLLM_SHM_BROADCAST_BUSY_LOOP_S", raising=False)
-    # Force envs module to re-read after delete.
     import vllm.envs as envs
 
-    monkeypatch.setattr(envs, "VLLM_SHM_BROADCAST_BUSY_LOOP_S", 0.002, raising=False)
+    monkeypatch.setattr(envs, "VLLM_SHM_BROADCAST_BUSY_LOOP_S", 1.0, raising=False)
 
     class _DummySocket:
         def setsockopt(self, *args, **kwargs):
@@ -50,7 +49,7 @@ def test_shm_spin_busy_loop_default_is_2ms(monkeypatch):
         context=_DummyContext(),
         notify_address="inproc://test-spin-busy-loop",
     )
-    assert sc.busy_loop_s == 0.002
+    assert sc.busy_loop_s == 1.0
 
 
 def test_shm_spin_busy_loop_env_override(monkeypatch):

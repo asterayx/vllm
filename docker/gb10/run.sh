@@ -43,6 +43,16 @@ fi
 if [ -z "${SPECULATIVE_CONFIG+x}" ]; then
   SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'
 fi
+# Do not export VLLM_USE_BREAKABLE_CUDAGRAPH=0: DSv4 auto-enables
+# breakable graphs when the var is unset. Forcing 0 (Mia recipe)
+# blocked that and cost TPS on this stock SM12x stack.
+mia_env=()
+if [ -n "${VLLM_USE_BREAKABLE_CUDAGRAPH+x}" ]; then
+  mia_env+=(-e "VLLM_USE_BREAKABLE_CUDAGRAPH=${VLLM_USE_BREAKABLE_CUDAGRAPH}")
+fi
+if [ -n "${VLLM_SHM_BROADCAST_BUSY_LOOP_S+x}" ]; then
+  mia_env+=(-e "VLLM_SHM_BROADCAST_BUSY_LOOP_S=${VLLM_SHM_BROADCAST_BUSY_LOOP_S}")
+fi
 
 docker run -d --name "${NAME}" \
   --gpus all --ipc=host --network host --privileged \
@@ -59,6 +69,7 @@ docker run -d --name "${NAME}" \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
   "${pythonpath_args[@]}" \
+  "${mia_env[@]}" \
   -e MOUNT_VLLM_SRC="${MOUNT_VLLM_SRC}" \
   -e VLLM_HOST_IP="${VLLM_HOST_IP}" \
   -e VLLM_LOGGING_COLOR=1 \
@@ -69,8 +80,6 @@ docker run -d --name "${NAME}" \
   -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
   -e B12X_CUTE_COMPILE_CACHE_DIR=/root/.cache/b12x/cute_compile \
   -e B12X_PRINT_COMPILE_PROGRESS="${B12X_PRINT_COMPILE_PROGRESS:-1}" \
-  -e VLLM_USE_BREAKABLE_CUDAGRAPH="${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}" \
-  -e VLLM_SHM_BROADCAST_BUSY_LOOP_S="${VLLM_SHM_BROADCAST_BUSY_LOOP_S:-0.002}" \
   -e TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/root/.cache/huggingface/triton}" \
   -e TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR:-/root/.cache/huggingface/tilelang}" \
   -e NCCL_NET=IB \
@@ -205,8 +214,8 @@ PY
   --distributed-executor-backend mp \
   --nnodes 2 --node-rank "${NODE_RANK}" \
   --master-addr "${MASTER_ADDR}" --master-port "${MASTER_PORT:-29500}" \
-  --kv-cache-dtype "${KV_CACHE_DTYPE:-nvfp4_ds_mla}" --block-size 256 \
-  --max-model-len "${MAX_MODEL_LEN:-1048576}" \
+  --kv-cache-dtype "${KV_CACHE_DTYPE:-fp8_ds_mla}" --block-size 256 \
+  --max-model-len "${MAX_MODEL_LEN:-524288}" \
   --max-num-seqs "${MAX_NUM_SEQS:-6}" --max-num-batched-tokens 8192 \
   --max-cudagraph-capture-size "${MAX_CUGRAPH:-36}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.87}" \
@@ -227,7 +236,7 @@ echo "started ${NAME}; logs: docker logs -f ${NAME}"
 
 # Optional post-ready shape warmup on the head (non-fatal). Mia recipe parity:
 # materialize Triton BLOCK buckets before live traffic can JIT mid-serve.
-if [ "${NODE_RANK:-0}" = "0" ] && [ "${BOOT_SHAPE_WARMUP:-1}" = "1" ]; then
+if [ "${NODE_RANK:-0}" = "0" ] && [ "${BOOT_SHAPE_WARMUP:-0}" = "1" ]; then
   WARMUP_SCRIPT="$(cd "$(dirname "$0")" && pwd)/boot-shape-warmup.sh"
   if [ -x "${WARMUP_SCRIPT}" ] || [ -f "${WARMUP_SCRIPT}" ]; then
     (

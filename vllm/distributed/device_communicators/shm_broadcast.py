@@ -140,9 +140,8 @@ class SpinCondition:
             self.last_read = time.monotonic()
 
             # Time to keep busy-looping on the shm buffer before going idle.
-            # Default 2 ms (was 1 s): on Grace/Spark TP=2 the long spin burns
-            # P-cores; MiaAI #79 / Anemll hotfix. Override with
-            # VLLM_SHM_BROADCAST_BUSY_LOOP_S.
+            # Default 1 s (stock). Override with VLLM_SHM_BROADCAST_BUSY_LOOP_S
+            # (Mia uses 0.002 to save Grace P-cores; that adds decode latency).
             if busy_loop_s is None:
                 busy_loop_s = envs.VLLM_SHM_BROADCAST_BUSY_LOOP_S
             self.busy_loop_s = busy_loop_s
