@@ -11,85 +11,42 @@ codex_proxy = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(codex_proxy)
 
 
-def test_apply_codex_message_prefers_response_content_over_reasoning():
-    msg = codex_proxy.apply_codex_message(
-        {
-            "role": "assistant",
-            "content": "",
-            "response_content": "hello",
-            "reasoning_content": "thinking",
-        }
-    )
-    assert msg["content"] == "hello"
+def test_alias_copies_reasoning_to_reasoning_content():
+    obj = {"choices": [{"delta": {"reasoning": "think"}}]}
+    codex_proxy.alias(obj)
+    assert obj["choices"][0]["delta"]["reasoning_content"] == "think"
+    assert obj["choices"][0]["delta"]["reasoning"] == "think"
 
 
-def test_apply_codex_message_falls_back_to_reasoning():
-    msg = codex_proxy.apply_codex_message(
-        {"role": "assistant", "reasoning_content": "only-think"}
-    )
-    assert msg["content"] == "only-think"
+def test_alias_does_not_overwrite_existing_reasoning_content():
+    obj = {"reasoning": "new", "reasoning_content": "keep"}
+    codex_proxy.alias(obj)
+    assert obj["reasoning_content"] == "keep"
 
 
-def test_apply_codex_message_keeps_existing_content():
-    msg = codex_proxy.apply_codex_message(
-        {
-            "role": "assistant",
-            "content": "keep",
-            "response_content": "ignore",
-        }
-    )
-    assert msg["content"] == "keep"
+def test_alias_nested_list_and_message():
+    obj = {
+        "output": [
+            {"content": [{"reasoning": "a"}]},
+            {"message": {"reasoning": "b"}},
+        ]
+    }
+    codex_proxy.alias(obj)
+    assert obj["output"][0]["content"][0]["reasoning_content"] == "a"
+    assert obj["output"][1]["message"]["reasoning_content"] == "b"
 
 
-def test_transform_chat_completion_message_and_delta():
-    out = codex_proxy.transform_chat_completion(
-        {
-            "choices": [
-                {"message": {"content": None, "response_content": "ans"}},
-                {"delta": {"reasoning_content": "tok"}},
-            ]
-        }
-    )
-    assert out["choices"][0]["message"]["content"] == "ans"
-    assert out["choices"][1]["delta"]["content"] == "tok"
+def test_rewrite_sse_aliases_data_and_keeps_done():
+    line = 'data: {"choices":[{"delta":{"reasoning":"x"}}]}'
+    out = codex_proxy.rewrite_sse(line)
+    payload = out[len("data: ") :]
+    obj = __import__("json").loads(payload)
+    assert obj["choices"][0]["delta"]["reasoning_content"] == "x"
+    assert codex_proxy.rewrite_sse("data: [DONE]") == "data: [DONE]"
+    assert codex_proxy.rewrite_sse(": keep") == ": keep"
 
 
-def test_transform_responses_fills_output_text():
-    out = codex_proxy.transform_responses(
-        {
-            "output": [
-                {
-                    "type": "message",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": "",
-                            "response_content": "vis",
-                        }
-                    ],
-                }
-            ]
-        }
-    )
-    assert out["output"][0]["content"][0]["text"] == "vis"
-
-
-def test_transform_sse_rewrites_data_and_keeps_done():
-    body = (
-        'data: {"choices":[{"delta":{"response_content":"x"}}]}\n\n'
-        "data: [DONE]\n\n"
-    )
-    out = codex_proxy.transform_sse_body(body)
-    assert '"content":"x"' in out
-    assert "data: [DONE]" in out
-
-
-def test_transform_openai_json_dispatches():
-    chat = codex_proxy.transform_openai_json(
-        {"choices": [{"message": {"response_content": "a"}}]}
-    )
-    resp = codex_proxy.transform_openai_json(
-        {"output": [{"type": "message", "response_content": "b"}]}
-    )
-    assert chat["choices"][0]["message"]["content"] == "a"
-    assert resp["output"][0]["content"][0]["text"] == "b"
+def test_alias_json_bytes_roundtrip():
+    raw = b'{"reasoning":"z"}'
+    out = codex_proxy._alias_json_bytes(raw)
+    assert b'"reasoning_content": "z"' in out or b'"reasoning_content":"z"' in out
