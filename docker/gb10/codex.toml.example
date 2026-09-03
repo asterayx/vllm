@@ -1,9 +1,10 @@
-# Codex → Spark vLLM via the reasoning_content alias proxy.
-# The proxy must be running on the head:
-#   python3 docker/gb10/codex_proxy.py
-#   # 0.0.0.0:30000 -> http://127.0.0.1:30001
-#
-# Copy/merge into ~/.codex/config.toml
+# Codex CLI → Spark vLLM via spark-compat-proxy (:30000).
+# Canonical copies:
+#   docker/gb10/client-configs/codex.toml
+#   curl -fsS http://127.0.0.1:30000/configs/codex.toml
+# Grok Build / OpenCode:
+#   docker/gb10/client-configs/grok.toml
+#   docker/gb10/client-configs/opencode.json
 
 model = "deepseek-v4-flash-vision-exp"
 model_provider = "vllm"
@@ -13,3 +14,5 @@ name = "vLLM Spark"
 env_key = "VLLM_API_KEY"
 base_url = "http://127.0.0.1:30000/v1"
 wire_api = "responses"
+stream_idle_timeout_ms = 600000
+request_max_retries = 4

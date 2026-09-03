@@ -1,0 +1,21 @@
+# Grok Build → Spark vLLM (via spark-compat-proxy)
+# Merge the [model."dsv4-spark"] block into ~/.grok/config.toml
+#   mkdir -p ~/.grok
+#   curl -fsS http://127.0.0.1:30000/configs/grok.toml >> ~/.grok/config.toml
+#   export VLLM_API_KEY=dummy
+#   grok --model dsv4-spark
+#
+# Do not replace your existing [models] default unless you want Spark
+# for every new session. Uncomment below to do that.
+#
+# [models]
+# default = "dsv4-spark"
+
+[model."dsv4-spark"]
+model = "deepseek-v4-flash-vision-exp"
+base_url = "http://127.0.0.1:30000/v1"
+name = "DeepSeek-V4-Flash-Vision-Exp"
+description = "DeepSeek-V4-Flash on 2x DGX Spark"
+env_key = "VLLM_API_KEY"
+api_backend = "responses"
+context_window = 524288

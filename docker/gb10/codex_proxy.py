@@ -11,6 +11,8 @@ line-by-line.
 
     python3 docker/gb10/codex_proxy.py
     # 0.0.0.0:30000 -> http://127.0.0.1:30001
+
+Production deployment: ``docker/gb10/compat-proxy`` (Rust).
 """
 
 from __future__ import annotations

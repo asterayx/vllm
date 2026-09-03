@@ -1,0 +1,19 @@
+[Unit]
+Description=Spark OpenAI compat proxy (reasoning → reasoning_content)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=roccen
+ExecStart=/usr/local/bin/spark-compat-proxy --listen 0.0.0.0:30000 --upstream http://127.0.0.1:30001 --public-base http://127.0.0.1:30000
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+LimitNOFILE=65536
+# Long generations; do not kill on idle.
+TimeoutStopSec=15
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
