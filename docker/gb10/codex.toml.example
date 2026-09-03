@@ -1,0 +1,18 @@
+# Codex → Spark vLLM (DeepSeek-V4-Flash / Vision-Exp).
+# Copy to ~/.codex/config.toml (or merge the [model_providers.vllm] table).
+#
+# Serve is already started with --enable-auto-tool-choice
+# --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4.
+# Point Codex at the compatibility proxy, not :30001 directly:
+#   python3 docker/gb10/codex_proxy.py --upstream http://127.0.0.1:30001 --port 30002
+
+model = "deepseek-v4-flash-vision-exp"
+model_provider = "vllm"
+
+[model_providers.vllm]
+name = "vLLM Spark"
+env_key = "VLLM_API_KEY"
+base_url = "http://127.0.0.1:30002/v1"
+# chat: proxy copies response_content / reasoning_content → message.content
+# responses: proxy fills empty output_text the same way
+wire_api = "chat"

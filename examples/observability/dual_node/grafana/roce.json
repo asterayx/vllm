@@ -1,0 +1,362 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Sum of RoCE twin TX on spark-1. Near 200 Gbit/s means the DAC is saturated.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 80000000000 },
+              { "color": "red", "value": 160000000000 }
+            ]
+          },
+          "unit": "bps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum(irate(node_infiniband_port_data_transmitted_bytes_total{spark=\"spark-1\",device=~\"$roce_device\"}[10s])) * 8",
+          "legendFormat": "spark-1 TX",
+          "refId": "A"
+        }
+      ],
+      "title": "Spark-1 RoCE TX",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Sum of RoCE twin TX on spark-2. TP=2 should roughly match spark-1 RX.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 80000000000 },
+              { "color": "red", "value": 160000000000 }
+            ]
+          },
+          "unit": "bps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum(irate(node_infiniband_port_data_transmitted_bytes_total{spark=\"spark-2\",device=~\"$roce_device\"}[10s])) * 8",
+          "legendFormat": "spark-2 TX",
+          "refId": "A"
+        }
+      ],
+      "title": "Spark-2 RoCE TX",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Share of spark-1 TX on rocep1s0f1. Healthy dual-rail is ~0.4–0.6. Near 0 or 1 means NCCL_IB_HCA is missing a twin.",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0.35 },
+              { "color": "red", "value": 0.65 }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum(irate(node_infiniband_port_data_transmitted_bytes_total{spark=\"spark-1\",device=\"rocep1s0f1\"}[10s])) / clamp_min(sum(irate(node_infiniband_port_data_transmitted_bytes_total{spark=\"spark-1\",device=~\"$roce_device\"}[10s])), 1)",
+          "legendFormat": "twin0 share",
+          "refId": "A"
+        }
+      ],
+      "title": "Spark-1 twin0 share",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Negotiated link rate per RoCE device. Each f1 twin should be ~100 Gbit/s.",
+      "fieldConfig": {
+        "defaults": { "unit": "bps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "id": 4,
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "node_infiniband_rate_bytes_per_second{device=~\"$roce_device\"} * 8",
+          "legendFormat": "{{spark}} {{device}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Link rate",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Per-Spark aggregate RoCE bandwidth. TP=2 allreduce is bursty; peaks matter more than the average.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "never", "spanNulls": true },
+          "unit": "bps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "id": 5,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum by (spark) (irate(node_infiniband_port_data_transmitted_bytes_total{device=~\"$roce_device\"}[10s])) * 8",
+          "legendFormat": "{{spark}} TX",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum by (spark) (irate(node_infiniband_port_data_received_bytes_total{device=~\"$roce_device\"}[10s])) * 8",
+          "legendFormat": "{{spark}} RX",
+          "refId": "B"
+        }
+      ],
+      "title": "RoCE TX / RX by Spark",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Each physical QSFP is two ~100G twins (rocep1s0f1 and roceP2p1s0f1). Both must move traffic for ~200 Gbit/s.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "spanNulls": true },
+          "unit": "bps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "id": 6,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "irate(node_infiniband_port_data_transmitted_bytes_total{device=~\"$roce_device\"}[10s]) * 8",
+          "legendFormat": "{{spark}} {{device}} TX",
+          "refId": "A"
+        }
+      ],
+      "title": "Per-twin TX",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Fraction of TX on rocep1s0f1. Stay near 0.5 when both rails are in NCCL_IB_HCA.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "spanNulls": true },
+          "max": 1,
+          "min": 0,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "id": 7,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum by (spark) (irate(node_infiniband_port_data_transmitted_bytes_total{device=\"rocep1s0f1\"}[10s])) / clamp_min(sum by (spark) (irate(node_infiniband_port_data_transmitted_bytes_total{device=~\"$roce_device\"}[10s])), 1)",
+          "legendFormat": "{{spark}} rocep1s0f1 share",
+          "refId": "A"
+        }
+      ],
+      "title": "Twin balance (rocep1s0f1 share)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Port had data to send but could not. On a DAC this should stay near zero.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "spanNulls": true },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "id": 8,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum by (spark, device) (irate(node_infiniband_port_transmit_wait_total{device=~\"$roce_device\"}[1m]))",
+          "legendFormat": "{{spark}} {{device}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Transmit wait",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "RoCE adaptive retransmits. Persistent growth means congestion, bad DAC, or MTU mismatch.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "spanNulls": true },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "id": 9,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum by (spark, device) (irate(node_infiniband_roce_adp_retransmits_total{device=~\"$roce_device\"}[1m]))",
+          "legendFormat": "{{spark}} {{device}}",
+          "refId": "A"
+        }
+      ],
+      "title": "RoCE adaptive retransmits",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Ethernet netdev bytes on the same twins. Compare with InfiniBand counters; large gaps usually mean IP-only traffic on that interface.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never", "spanNulls": true },
+          "unit": "bps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 28 },
+      "id": 10,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "irate(node_network_transmit_bytes_total{device=~\"enp1s0f1np1|enP2p1s0f1np1\"}[10s]) * 8",
+          "legendFormat": "{{spark}} {{device}} TX",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "irate(node_network_receive_bytes_total{device=~\"enp1s0f1np1|enP2p1s0f1np1\"}[10s]) * 8",
+          "legendFormat": "{{spark}} {{device}} RX",
+          "refId": "B"
+        }
+      ],
+      "title": "Ethernet twins (netdev)",
+      "type": "timeseries"
+    }
+  ],
+  "preload": false,
+  "refresh": "2s",
+  "schemaVersion": 40,
+  "tags": ["vllm", "roce", "infiniband"],
+  "templating": {
+    "list": [
+      {
+        "current": { "text": "Prometheus", "value": "prometheus" },
+        "label": "datasource",
+        "name": "DS_PROMETHEUS",
+        "query": "prometheus",
+        "refresh": 1,
+        "type": "datasource"
+      },
+      {
+        "current": { "text": "rocep1s0f1|roceP2p1s0f1", "value": "rocep1s0f1|roceP2p1s0f1" },
+        "label": "RoCE devices",
+        "name": "roce_device",
+        "options": [
+          {
+            "selected": true,
+            "text": "rocep1s0f1|roceP2p1s0f1",
+            "value": "rocep1s0f1|roceP2p1s0f1"
+          }
+        ],
+        "query": "rocep1s0f1|roceP2p1s0f1",
+        "type": "custom"
+      }
+    ]
+  },
+  "time": { "from": "now-5m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "RoCE / Dual Spark",
+  "uid": "vllm-roce-dual-spark",
+  "version": 1
+}

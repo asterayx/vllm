@@ -38,6 +38,10 @@ Both platforms provide equivalent monitoring capabilities:
 | **Performance Statistics** | Tracks latency, throughput, and performance metrics |
 | **Query Statistics** | Monitors request volume, query performance, and KPIs |
 
+To bring up Prometheus, Grafana, and these dashboards on two bare-metal
+nodes (including DGX Spark + RoCE), use
+[`../dual_node/`](../dual_node).
+
 ## Quick Start
 
 First, navigate to this example's directory:
