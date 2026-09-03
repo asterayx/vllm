@@ -480,6 +480,58 @@ def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
     ]
 
 
+def test_sm12x_vision_k6_q_len_7_synthesizes_aligned_sizes(monkeypatch):
+    """Vision MTP=6 -> decode_query_len=7: no SAFE multiples; synthesize ladder.
+
+    Falling back to unaligned 1..48 caused:
+    ``assert num_tokens % self.decode_query_len == 0`` in V2 ``_dummy_run``
+    during SM12x FlashInfer DSpark decode autotune.
+    """
+    from contextlib import nullcontext
+
+    from vllm.model_executor.warmup import flashinfer_sparse_mla_warmup as fi_warmup
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    # Mia/recipe Vision capture ladder (cudagraph up to 48).
+    sizes = [1, 2, 4, 6, 8, 12, 16, 18, 24, 32, 36, 40, 48]
+    assert sm12x_dspark_capture_sizes(sizes, 7) == [7, 14, 21, 28, 35, 42]
+    assert sm12x_flashinfer_decode_tune_sizes(sizes, 7) == [
+        7,
+        14,
+        21,
+        28,
+        35,
+        42,
+    ]
+    for n in sm12x_flashinfer_decode_tune_sizes(sizes, 7):
+        assert n % 7 == 0
+        assert sm12x_allow_full_decode_capture(n, 7) is True
+    # Unaligned sizes must still be rejected.
+    assert sm12x_allow_full_decode_capture(1, 7) is False
+    assert sm12x_allow_full_decode_capture(48, 7) is False
+
+    seen: list[int] = []
+
+    class _Runner:
+        vllm_config = SimpleNamespace(
+            compilation_config=SimpleNamespace(cudagraph_capture_sizes=sizes)
+        )
+        decode_query_len = 7
+
+        def _dummy_run(self, num_tokens: int, **kwargs: object) -> None:
+            assert num_tokens % self.decode_query_len == 0
+            seen.append(num_tokens)
+
+    monkeypatch.setattr(fi_warmup, "flashinfer_autotune", lambda *a, **k: nullcontext())
+    fi_warmup._autotune_sm12x_decode_sizes(_Runner(), "/tmp/x", is_leader=True)
+    assert seen == [7, 14, 21, 28, 35, 42]
+
+
 def test_dspark_init_cudagraph_manager_copies_capture_sizes(monkeypatch):
     """Vision k=3 capture override must copy configs; missing import copy crashed."""
     from vllm.config.compilation import CUDAGraphMode

@@ -311,6 +311,8 @@ if TYPE_CHECKING:
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
+    VLLM_USE_SPINLOOP_EXT: bool = False
+    VLLM_SHM_BROADCAST_BUSY_LOOP_S: float = 1.0
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
@@ -2133,6 +2135,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.
     "VLLM_USE_SPINLOOP_EXT": lambda: bool(int(os.getenv("VLLM_USE_SPINLOOP_EXT", "0"))),
+    # Seconds MessageQueue readers busy-spin before falling back to zmq wait.
+    # Default 1.0 s (stock). 2 ms (Mia / Anemll) saves Grace P-cores but
+    # adds decode tail latency on 2× Spark; set VLLM_SHM_BROADCAST_BUSY_LOOP_S
+    # to 0.002 only if you are A/B testing that tradeoff.
+    "VLLM_SHM_BROADCAST_BUSY_LOOP_S": lambda: float(
+        os.getenv("VLLM_SHM_BROADCAST_BUSY_LOOP_S", "1.0")
+    ),
     # Comma-separated GPU_BDF=NIC_BDF pairs for RDMA NIC selection.
     # Must be set together with VLLM_NIC_SELECTION_VARS.
     "VLLM_GPU_NIC_PCIE_MAPPING": lambda: os.getenv("VLLM_GPU_NIC_PCIE_MAPPING", ""),

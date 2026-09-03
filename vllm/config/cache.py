@@ -25,6 +25,8 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
+    # Spark / Anemll recipe alias: same 584 B/token UE8M0 layout as fp8_ds_mla.
+    "nvfp4_ds_mla",
     "turboquant_k8v4",
     "turboquant_4bit_nc",
     "turboquant_k3v4_nc",
@@ -83,6 +85,9 @@ class CacheConfig:
     to fp8.
     "nvfp4_4over6" uses the NVFP4 layout and selects between max/6 and max/4
     scales per 16 values by minimizing squared reconstruction error.
+    "nvfp4_ds_mla" is accepted as an alias for DeepSeek sparse-MLA
+    ``fp8_ds_mla`` (same 584 B/token UE8M0 packed row); it is normalized
+    before backend selection.
     """
     is_attention_free: bool = False
     """Whether the model is attention-free. This is primarily set in
@@ -267,6 +272,19 @@ class CacheConfig:
         if self.mamba_block_size is not None:
             self.user_specified_mamba_block_size = True
         return self
+
+    @field_validator("cache_dtype", mode="before")
+    @classmethod
+    def _normalize_cache_dtype_aliases(cls, cache_dtype: Any) -> Any:
+        # Anemll / Mia Spark recipes advertise nvfp4_ds_mla; on stock vLLM
+        # that name is byte-identical to fp8_ds_mla (584 B/token UE8M0).
+        if cache_dtype == "nvfp4_ds_mla":
+            logger.info_once(
+                "Normalizing kv_cache_dtype alias nvfp4_ds_mla -> fp8_ds_mla "
+                "(same DeepSeek sparse-MLA UE8M0 layout)."
+            )
+            return "fp8_ds_mla"
+        return cache_dtype
 
     @field_validator("cache_dtype", mode="after")
     @classmethod

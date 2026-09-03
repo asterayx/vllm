@@ -71,17 +71,28 @@ def sm12x_mixed_warmup_prefill_len(requested_prefill: int) -> int:
     return requested_prefill
 
 
+def _sm12x_multiples_of_q_len(max_tokens: int, decode_query_len: int) -> list[int]:
+    """Token counts in ``[decode_query_len, max_tokens]`` divisible by q_len."""
+    if decode_query_len <= 1 or max_tokens < decode_query_len:
+        return []
+    return list(range(decode_query_len, max_tokens + 1, decode_query_len))
+
+
 def sm12x_dspark_capture_sizes(
     capture_sizes: list[int] | None,
     decode_query_len: int,
 ) -> list[int]:
     """Restrict SM12x DSpark FULL capture to proven token counts.
 
-    Off SM12x, or when no safe size is divisible by ``decode_query_len``,
-    return the original list.
+    Prefer the proven SM12x set when it packs into ``decode_query_len``.
+    If none fit (e.g. Vision k=6 → runner ``q_len=7``), keep only multiples
+    of ``decode_query_len`` — never fall back to unaligned raw capture sizes
+    (those trip ``uniform_decode`` dummy_run asserts).
     """
     sizes = list(capture_sizes or [])
     if not sizes or not current_platform.is_device_capability_family(120):
+        return sizes
+    if decode_query_len <= 1:
         return sizes
     max_cg = max(sizes)
     allow = [
@@ -89,7 +100,10 @@ def sm12x_dspark_capture_sizes(
         for n in SM12X_DSPARK_SAFE_CAPTURE_TOKENS
         if n <= max_cg and n % decode_query_len == 0
     ]
-    return allow or sizes
+    if allow:
+        return allow
+    aligned = [n for n in sizes if n % decode_query_len == 0]
+    return aligned or _sm12x_multiples_of_q_len(max_cg, decode_query_len)
 
 
 def sm12x_allow_full_decode_capture(num_tokens: int, decode_query_len: int) -> bool:
@@ -103,9 +117,14 @@ def sm12x_allow_full_decode_capture(num_tokens: int, decode_query_len: int) -> b
         return True
     if not current_platform.is_device_capability_family(120):
         return True
-    return (
-        num_tokens in SM12X_DSPARK_SAFE_CAPTURE_TOKENS
-        and num_tokens % decode_query_len == 0
+    if num_tokens % decode_query_len != 0:
+        return False
+    # Proven set first; synthesized multiples (Vision k=6 / q_len=7) are
+    # allowed only when the safe table has no packing for this q_len.
+    if num_tokens in SM12X_DSPARK_SAFE_CAPTURE_TOKENS:
+        return True
+    return not any(
+        n % decode_query_len == 0 for n in SM12X_DSPARK_SAFE_CAPTURE_TOKENS
     )
 
 
@@ -113,12 +132,19 @@ def sm12x_flashinfer_decode_tune_sizes(
     capture_sizes: list[int] | None,
     decode_query_len: int,
 ) -> list[int]:
-    """DSpark FULL token counts FlashInfer should autotune on SM12x."""
+    """DSpark FULL token counts FlashInfer should autotune on SM12x.
+
+    Every returned size is divisible by ``decode_query_len`` so V2
+    ``_dummy_run(..., uniform_decode=True)`` never asserts. Vision-Exp
+    k=6 uses runner ``decode_query_len=7`` (1+k), which has no overlap with
+    the proven 4/6-based safe table — synthesize a short multiple ladder.
+    """
     if decode_query_len <= 1:
         return []
     if not current_platform.is_device_capability_family(120):
         return []
-    return sm12x_dspark_capture_sizes(capture_sizes, decode_query_len)
+    sizes = sm12x_dspark_capture_sizes(capture_sizes, decode_query_len)
+    return [n for n in sizes if n % decode_query_len == 0]
 
 
 def sm12x_kernel_warmup_prefill_len(decode_query_len: int) -> int:
