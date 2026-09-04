@@ -94,6 +94,17 @@ def test_b12x_fp8_fallback_priority(
     assert names.index(before) < names.index(b12x) < names.index(after)
 
 
+def test_sm121_fp8_block_prefers_humming_before_triton() -> None:
+    """SM121 leftover W8A8: Humming before the untuned Triton default."""
+    names = [
+        kernel.__name__
+        for kernel in _POSSIBLE_FP8_BLOCK_KERNELS[PlatformEnum.CUDA]
+    ]
+    assert names.index("HummingFP8ScaledMMLinearKernel") < names.index(
+        "TritonFp8BlockScaledMMKernel"
+    )
+
+
 @torch.inference_mode()
 def test_b12x_backend_does_not_intercept_unquantized_bf16(
     default_vllm_config,

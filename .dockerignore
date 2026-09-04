@@ -39,6 +39,7 @@ share/python-wheels/
 MANIFEST
 rust/target/
 
-# Stamped in a later Dockerfile layer so a release bump does not
-# invalidate the vLLM compile cache.
+# Stamped / installed in a later Dockerfile layer so a release bump
+# or humming pin tweak does not invalidate the vLLM compile cache.
 docker/gb10/VERSION
+docker/gb10/install-humming.sh

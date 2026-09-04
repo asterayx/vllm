@@ -126,7 +126,7 @@ from pathlib import Path
 ver = (
     os.environ.get("VLLM_VERSION_OVERRIDE")
     or os.environ.get("VLLM_GB10_VERSION")
-    or "0.28.0+dsv4.spark.1"
+    or "0.28.0+dsv4.spark.2"
 )
 text = "Metadata-Version: 2.1\nName: vllm\nVersion: %s\n" % ver
 try:

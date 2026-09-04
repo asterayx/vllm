@@ -10,7 +10,7 @@
 #   source ~/.cargo/env
 #   SKIP_BUILD_EXT=1 ./docker/gb10/install-vllm.sh ~/.venvs/vllm028/bin/python
 # Then:
-#   VENV=~/.venvs/vllm028 INSTALL_B12X=1 ./docker/gb10/pack-venv.sh
+#   VENV=~/.venvs/vllm028 INSTALL_B12X=1 INSTALL_HUMMING=1 ./docker/gb10/pack-venv.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -34,6 +34,7 @@ fi
 VENV="${VENV:-${HOME}/.venvs/vllm028}"
 RECREATE="${RECREATE:-0}"
 INSTALL_B12X="${INSTALL_B12X:-1}"
+INSTALL_HUMMING="${INSTALL_HUMMING:-1}"
 export MAX_JOBS="${MAX_JOBS:-8}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.1a}"
 export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-12.1a}"
@@ -78,6 +79,9 @@ uv pip install --python "${PYTHON}" \
 if [[ "${INSTALL_B12X}" == "1" ]]; then
   "${ROOT}/docker/gb10/install-b12x.sh" "${PYTHON}"
 fi
+if [[ "${INSTALL_HUMMING}" == "1" ]]; then
+  "${ROOT}/docker/gb10/install-humming.sh" "${PYTHON}"
+fi
 
 echo "venv ready: ${VENV}"
-echo "pack image: VENV=${VENV} INSTALL_B12X=${INSTALL_B12X} ./docker/gb10/pack-venv.sh"
+echo "pack image: VENV=${VENV} INSTALL_B12X=${INSTALL_B12X} INSTALL_HUMMING=${INSTALL_HUMMING} ./docker/gb10/pack-venv.sh"

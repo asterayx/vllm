@@ -436,8 +436,10 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
         CutlassFp8BlockScaledMMKernel,
         B12xFp8BlockScaledMMKernel,
         MarlinFP8ScaledMMLinearKernel,
-        TritonFp8BlockScaledMMKernel,
+        # SM121: DeepGEMM/Cutlass/b12x block-FP8 are off; prefer Humming
+        # over the untuned Triton W8A8 default (matches later-main).
         HummingFP8ScaledMMLinearKernel,
+        TritonFp8BlockScaledMMKernel,
         BlockWiseTorchFP8ScaledMMLinearKernel,
     ],
     PlatformEnum.ROCM: [

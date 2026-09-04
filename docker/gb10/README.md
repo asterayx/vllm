@@ -40,15 +40,15 @@ Single source of truth: [`VERSION`](VERSION).
 
 | | Current |
 | --- | --- |
-| Package / serve banner | `0.28.0+dsv4.spark.1` |
+| Package / serve banner | `0.28.0+dsv4.spark.2` |
 | Family tag (moving latest) | `vllm-gb10:v0.28.0-dsv4-spark` |
-| Release tag (pin this publish) | `vllm-gb10:v0.28.0-dsv4-spark.1` |
+| Release tag (pin this publish) | `vllm-gb10:v0.28.0-dsv4-spark.2` |
 
 `build.sh` / `pack-venv.sh` apply **both** tags. `vllm --version`,
 `importlib.metadata.version("vllm")`, `vllm._version.__version__`, and
 the image label `org.opencontainers.image.version` all show the Spark
-version. Docker tags cannot contain `+`, so the image uses `.1` while
-Python uses `+dsv4.spark.1`.
+version. Docker tags cannot contain `+`, so the image uses `.2` while
+Python uses `+dsv4.spark.2`.
 
 ```bash
 ./docker/gb10/version.sh
@@ -56,12 +56,12 @@ Python uses `+dsv4.spark.1`.
 docker image inspect vllm-gb10:v0.28.0-dsv4-spark \
   --format '{{index .Config.Labels "org.opencontainers.image.version"}}'
 # pin a published cut:
-VLLM_GB10_IMAGE=vllm-gb10:v0.28.0-dsv4-spark.1 \
+VLLM_GB10_IMAGE=vllm-gb10:v0.28.0-dsv4-spark.2 \
   NODE_RANK=0 ./docker/gb10/run-vision-image.sh
 ```
 
-Next official image: edit `VERSION` to `0.28.0+dsv4.spark.2` and rebuild.
-Do not reuse `.1` for a different tree.
+Next official image: edit `VERSION` to `0.28.0+dsv4.spark.3` and rebuild.
+Do not reuse `.2` for a different tree.
 
 ## Layout and ports
 
@@ -112,7 +112,9 @@ Default family tag: `vllm-gb10:v0.28.0-dsv4-spark`
 
 Pins inside `docker/Dockerfile.gb10`: CUDA 13.0 devel Ubuntu 24.04,
 PyTorch cu130, FlashInfer **0.6.18**, official **b12x==1.2.6**,
-`TORCH_CUDA_ARCH_LIST=12.1a`.
+**humming-kernels[cu13]==0.1.12**, `TORCH_CUDA_ARCH_LIST=12.1a`.
+On SM121 the leftover W8A8 block-FP8 list is Humming before Triton
+(DeepGEMM / Cutlass / b12x block-FP8 are off).
 
 ### From-scratch (recommended for a publishable image)
 
@@ -121,7 +123,7 @@ Compiles vLLM in Docker. Rebuilds reuse the BuildKit uv cache.
 ```bash
 # on the head Spark, this tree
 ./docker/gb10/build.sh
-# tags vllm-gb10:v0.28.0-dsv4-spark and vllm-gb10:v0.28.0-dsv4-spark.1
+# tags vllm-gb10:v0.28.0-dsv4-spark and vllm-gb10:v0.28.0-dsv4-spark.2
 #   VLLM_GB10_IMAGE=vllm-gb10:v0.28.0-dsv4-spark MAX_JOBS=8 ./docker/gb10/build.sh
 ```
 
@@ -136,7 +138,7 @@ Only if the venv was compiled from **this** v0.28 tree
 ```bash
 source ~/.cargo/env
 ./docker/gb10/build-venv.sh
-VENV=~/.venvs/vllm028 INSTALL_B12X=1 ./docker/gb10/pack-venv.sh
+VENV=~/.venvs/vllm028 INSTALL_B12X=1 INSTALL_HUMMING=1 ./docker/gb10/pack-venv.sh
 ```
 
 `pack-venv.sh` refuses a venv that cannot import `_C_stable_libtorch`.
@@ -502,6 +504,7 @@ curl -fsSI https://token.asterayx.com/dash | head
 | `build.sh` | From-scratch official image on Spark |
 | `build-venv.sh` / `install-vllm.sh` | Host compile into a uv venv |
 | `pack-venv.sh` | Pack that venv into the same image tag (no compile) |
+| `pack-humming.sh` | Inject `humming-kernels` into an existing image |
 | `sync-image.sh` | `docker save \| ssh docker load` over ConnectX |
 | `run-vision-image.sh` / `run-image.sh` | Official serve (no source mount) |
 | `run-vision.sh` / `run.sh` | Dev serve (bind-mount host tree) |

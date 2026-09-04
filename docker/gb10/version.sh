@@ -13,7 +13,7 @@ if [[ -f "${_ver_file}" ]]; then
   VLLM_SPARK_VERSION="$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "${_ver_file}" | head -1 | tr -d '[:space:]')"
 else
   # Dockerfile.gb10 dockerignores VERSION during the compile RUN.
-  VLLM_SPARK_VERSION="${VLLM_SPARK_VERSION:-0.28.0+dsv4.spark.1}"
+  VLLM_SPARK_VERSION="${VLLM_SPARK_VERSION:-0.28.0+dsv4.spark.2}"
   echo "WARN: ${_ver_file} missing; VLLM_SPARK_VERSION=${VLLM_SPARK_VERSION}" >&2
 fi
 if [[ ! "${VLLM_SPARK_VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\+dsv4\.spark\.([0-9]+)$ ]]; then

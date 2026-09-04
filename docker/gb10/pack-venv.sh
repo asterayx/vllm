@@ -7,7 +7,7 @@
 #
 #   VENV=/home/roccen/.venvs/vllm028 ./docker/gb10/pack-venv.sh
 #   INSTALL_FLASHINFER=1 VENV=... ./docker/gb10/pack-venv.sh
-#   INSTALL_B12X=1 VENV=... ./docker/gb10/pack-venv.sh
+#   INSTALL_B12X=1 INSTALL_HUMMING=1 VENV=... ./docker/gb10/pack-venv.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -33,6 +33,9 @@ source "$(dirname "$0")/version.sh"
 IMAGE="${VLLM_GB10_IMAGE}"
 INSTALL_FLASHINFER="${INSTALL_FLASHINFER:-0}"
 INSTALL_B12X="${INSTALL_B12X:-0}"
+# Default 1 so a venv packed from an older image still gets humming
+# (SM121 leftover W8A8, before Triton). Set INSTALL_HUMMING=0 to skip.
+INSTALL_HUMMING="${INSTALL_HUMMING:-1}"
 
 if [[ ! -x "${VENV}/bin/python" ]]; then
   echo "No venv at ${VENV}. Build one on this tree first, or use build.sh." >&2
@@ -62,6 +65,7 @@ rsync -a --delete \
 cp docker/gb10/relocate-venv.sh "${STAGE}/relocate-venv.sh"
 cp docker/gb10/install-ibverbs.sh "${STAGE}/install-ibverbs.sh"
 cp docker/gb10/install-b12x.sh "${STAGE}/install-b12x.sh"
+cp docker/gb10/install-humming.sh "${STAGE}/install-humming.sh"
 cp docker/gb10/check-extensions.py "${STAGE}/check-extensions.py"
 cp docker/Dockerfile.gb10-venv "${STAGE}/Dockerfile"
 ./docker/gb10/collect-ibverbs.sh "${STAGE}/ibverbs"
@@ -74,6 +78,7 @@ docker build \
   --build-arg OLD_SRC="$(pwd)" \
   --build-arg INSTALL_FLASHINFER="${INSTALL_FLASHINFER}" \
   --build-arg INSTALL_B12X="${INSTALL_B12X}" \
+  --build-arg INSTALL_HUMMING="${INSTALL_HUMMING}" \
   --build-arg VLLM_SPARK_VERSION="${VLLM_SPARK_VERSION}" \
   -t "${IMAGE}" \
   -t "${VLLM_GB10_IMAGE_RELEASE}" \
