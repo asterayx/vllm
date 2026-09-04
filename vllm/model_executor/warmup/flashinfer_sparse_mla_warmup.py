@@ -15,7 +15,10 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import autotune as flashinfer_autotune
 from vllm.utils.flashinfer import has_flashinfer
-from vllm.utils.sm12x import sm12x_flashinfer_decode_tune_sizes
+from vllm.utils.sm12x import (
+    sm12x_flashinfer_autotune_query_lens,
+    sm12x_flashinfer_decode_tune_sizes,
+)
 from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
 
 if TYPE_CHECKING:
@@ -94,10 +97,15 @@ def _autotune_sm12x_decode_sizes(
     is_leader: bool,
 ) -> None:
     """Dummy-run DSpark FULL sizes so FlashInfer records those decode shapes."""
-    sizes = sm12x_flashinfer_decode_tune_sizes(
-        list(runner.vllm_config.compilation_config.cudagraph_capture_sizes or []),
-        _runner_decode_query_len(runner),
-    )
+    capture = list(runner.vllm_config.compilation_config.cudagraph_capture_sizes or [])
+    sizes: list[int] = []
+    seen: set[int] = set()
+    for q_len in sm12x_flashinfer_autotune_query_lens(_runner_decode_query_len(runner)):
+        for num_tokens in sm12x_flashinfer_decode_tune_sizes(capture, q_len):
+            if num_tokens in seen:
+                continue
+            seen.add(num_tokens)
+            sizes.append(num_tokens)
     if not sizes:
         return
     if is_leader:

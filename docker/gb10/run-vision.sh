@@ -3,7 +3,9 @@
 # Same stack as docker/gb10/run.sh (b12x, SM12x graphs) but DSpark k=3:
 # Vision-Exp ships num_nextn_predict_layers=3; k=5 held ~68% accept on
 # the first 10s then fell to ~27% on long text CoT (pos 4/5 ~0.11/0.03).
-# k=3 is next_n=4, a native SM12x decode width (no 5→6 pad).
+# DSpark sample_from_anchor uses q_len=k (not k+1). k=3 is q=3 which
+# SM12x snaps to 6; FlashInfer must autotune q=6 or it falls to tactic=-1.
+# Compare speed with main 0731 via ./docker/gb10/run.sh (k=5, q=5→6).
 # 6 seqs * 4 = 24.
 #
 # Download the checkpoint on both nodes first, e.g.:

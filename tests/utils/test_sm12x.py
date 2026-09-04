@@ -20,6 +20,7 @@ from vllm.utils.sm12x import (
     sm12x_disable_eager_scratch_pool,
     sm12x_dspark_capture_sizes,
     sm12x_extend_prefill_slots,
+    sm12x_flashinfer_autotune_query_lens,
     sm12x_flashinfer_decode_tune_sizes,
     sm12x_kernel_warmup_prefill_len,
     sm12x_mixed_warmup_decode_prompt_len,
@@ -422,10 +423,14 @@ def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
     sizes = [1, 2, 4, 8, 16, 24, 32, 36]
     assert sm12x_dspark_capture_sizes(sizes, aligned) == [6, 12, 18, 24, 36]
     assert 25 not in sm12x_dspark_capture_sizes(sizes, aligned)
-    # Vision-Exp k=3 is native q_len=4; 0731 k=5 set must stay 6/12/18/24/36.
+    # Vision-Exp k=3 is DSpark q_len=3 (sample_from_anchor), not k+1=4.
+    # 3 snaps to 6. Autotune must cover both runner q=4 and aligned q=6.
     vision_sizes = [1, 2, 4, 8, 12, 16, 24]
+    assert sm12x_align_decode_q_len(3) == 6
     assert sm12x_align_decode_q_len(4) == 4
+    assert sm12x_flashinfer_autotune_query_lens(4) == [4, 6]
     assert sm12x_dspark_capture_sizes(vision_sizes, 4) == [4, 8, 12, 16, 24]
+    assert sm12x_dspark_capture_sizes(vision_sizes, 6) == [6, 12, 18, 24]
     assert sm12x_dspark_capture_sizes(sizes, 6) == [6, 12, 18, 24, 36]
     assert sm12x_allow_full_decode_capture(36, aligned) is True
     assert sm12x_allow_full_decode_capture(24, aligned) is True
@@ -478,6 +483,24 @@ def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
         (24, True),
         (36, True),
     ]
+
+    seen.clear()
+
+    class _VisionRunner:
+        vllm_config = SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                cudagraph_capture_sizes=[1, 2, 4, 8, 12, 16, 24]
+            )
+        )
+        decode_query_len = 4
+
+        def _dummy_run(self, num_tokens: int, **kwargs: object) -> None:
+            seen.append((num_tokens, bool(kwargs.get("uniform_decode"))))
+
+    fi_warmup._autotune_sm12x_decode_sizes(_VisionRunner(), "/tmp/x", is_leader=True)
+    tokens = [n for n, _ in seen]
+    assert 6 in tokens
+    assert 4 in tokens
 
 
 def test_dspark_init_cudagraph_manager_copies_capture_sizes(monkeypatch):
