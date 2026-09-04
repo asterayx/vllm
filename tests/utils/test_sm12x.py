@@ -22,6 +22,7 @@ from vllm.utils.sm12x import (
     sm12x_extend_prefill_slots,
     sm12x_flashinfer_autotune_query_lens,
     sm12x_flashinfer_decode_tune_sizes,
+    sm12x_flashinfer_dummy_tune_sizes,
     sm12x_kernel_warmup_prefill_len,
     sm12x_mixed_warmup_decode_prompt_len,
     sm12x_mixed_warmup_prefill_len,
@@ -431,6 +432,15 @@ def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
     assert sm12x_flashinfer_autotune_query_lens(4) == [4, 6]
     assert sm12x_dspark_capture_sizes(vision_sizes, 4) == [4, 8, 12, 16, 24]
     assert sm12x_dspark_capture_sizes(vision_sizes, 6) == [6, 12, 18, 24]
+    # 6 and 18 are not multiples of runner decode_query_len=4.
+    assert sm12x_flashinfer_dummy_tune_sizes(vision_sizes, 4) == [
+        4,
+        8,
+        12,
+        16,
+        24,
+    ]
+    assert all(n % 4 == 0 for n in sm12x_flashinfer_dummy_tune_sizes(vision_sizes, 4))
     assert sm12x_dspark_capture_sizes(sizes, 6) == [6, 12, 18, 24, 36]
     assert sm12x_allow_full_decode_capture(36, aligned) is True
     assert sm12x_allow_full_decode_capture(24, aligned) is True
@@ -499,8 +509,10 @@ def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
 
     fi_warmup._autotune_sm12x_decode_sizes(_VisionRunner(), "/tmp/x", is_leader=True)
     tokens = [n for n, _ in seen]
-    assert 6 in tokens
-    assert 4 in tokens
+    assert 6 not in tokens
+    assert 18 not in tokens
+    assert tokens == [4, 8, 12, 16, 24]
+    assert all(n % 4 == 0 for n in tokens)
 
 
 def test_dspark_init_cudagraph_manager_copies_capture_sizes(monkeypatch):
