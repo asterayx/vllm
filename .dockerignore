@@ -38,3 +38,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 rust/target/
+
+# Stamped in a later Dockerfile layer so a release bump does not
+# invalidate the vLLM compile cache.
+docker/gb10/VERSION

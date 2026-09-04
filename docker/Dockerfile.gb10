@@ -87,6 +87,19 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && /opt/vllm/docker/gb10/install-b12x.sh /opt/venv/bin/python \
     && rm -rf /root/.cache/flashinfer
 
+# Own Spark release (docker/gb10/VERSION). Copied after compile so bumping
+# 0.28.0+dsv4.spark.N does not rebuild CUDA extensions.
+COPY docker/gb10/VERSION /opt/vllm/docker/gb10/VERSION
+ARG VLLM_SPARK_VERSION=0.28.0+dsv4.spark.1
+ENV VLLM_SPARK_VERSION=${VLLM_SPARK_VERSION} \
+    VLLM_VERSION_OVERRIDE=${VLLM_SPARK_VERSION} \
+    SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_SPARK_VERSION} \
+    VLLM_GB10_VERSION=${VLLM_SPARK_VERSION}
+LABEL org.opencontainers.image.version="${VLLM_SPARK_VERSION}" \
+      org.opencontainers.image.title="vLLM GB10 Spark DSv4"
+RUN /opt/venv/bin/python /opt/vllm/docker/gb10/stamp-version.py \
+        "${VLLM_SPARK_VERSION}" --root /opt/vllm
+
 EXPOSE 8000
 ENTRYPOINT ["/opt/vllm/docker/gb10/entrypoint.sh"]
 CMD ["vllm", "--help"]

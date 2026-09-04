@@ -3,7 +3,7 @@
 # Build that venv first:
 #   ./docker/gb10/build-venv.sh
 # The venv must be from THIS v0.28.0 tree (vllm._C_stable_libtorch present).
-# Do not pack later-main ~/.venvs/vllm028 onto vllm-gb10:v0.28.0-dsv4-spark.
+# Do not pack later-main ~/.venvs/vllm028 onto this Spark image line.
 #
 #   VENV=/home/roccen/.venvs/vllm028 ./docker/gb10/pack-venv.sh
 #   INSTALL_FLASHINFER=1 VENV=... ./docker/gb10/pack-venv.sh
@@ -28,7 +28,9 @@ if [[ -z "${VENV:-}" ]]; then
   done
 fi
 VENV="${VENV:-${HOME}/.venvs/vllm-gb10-v0280}"
-IMAGE="${VLLM_GB10_IMAGE:-vllm-gb10:v0.28.0-dsv4-spark}"
+# shellcheck source=version.sh
+source "$(dirname "$0")/version.sh"
+IMAGE="${VLLM_GB10_IMAGE}"
 INSTALL_FLASHINFER="${INSTALL_FLASHINFER:-0}"
 INSTALL_B12X="${INSTALL_B12X:-0}"
 
@@ -64,7 +66,7 @@ cp docker/gb10/check-extensions.py "${STAGE}/check-extensions.py"
 cp docker/Dockerfile.gb10-venv "${STAGE}/Dockerfile"
 ./docker/gb10/collect-ibverbs.sh "${STAGE}/ibverbs"
 
-echo "Packing ${VENV} + host ibverbs + $(pwd) -> ${IMAGE} (no vLLM compile)"
+echo "Packing ${VENV} + host ibverbs + $(pwd) -> ${IMAGE} (${VLLM_SPARK_VERSION})"
 docker build \
   --platform linux/arm64 \
   -f "${STAGE}/Dockerfile" \
@@ -72,5 +74,8 @@ docker build \
   --build-arg OLD_SRC="$(pwd)" \
   --build-arg INSTALL_FLASHINFER="${INSTALL_FLASHINFER}" \
   --build-arg INSTALL_B12X="${INSTALL_B12X}" \
+  --build-arg VLLM_SPARK_VERSION="${VLLM_SPARK_VERSION}" \
   -t "${IMAGE}" \
+  -t "${VLLM_GB10_IMAGE_RELEASE}" \
   "${STAGE}"
+echo "tagged ${IMAGE} and ${VLLM_GB10_IMAGE_RELEASE}"

@@ -85,5 +85,14 @@ RUN if [ "${INSTALL_B12X}" = "1" ]; then \
     && rm -f /tmp/install-b12x.sh
 
 WORKDIR /opt/vllm
+ARG VLLM_SPARK_VERSION=0.28.0+dsv4.spark.1
+ENV VLLM_SPARK_VERSION=${VLLM_SPARK_VERSION} \
+    VLLM_VERSION_OVERRIDE=${VLLM_SPARK_VERSION} \
+    SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_SPARK_VERSION} \
+    VLLM_GB10_VERSION=${VLLM_SPARK_VERSION}
+LABEL org.opencontainers.image.version="${VLLM_SPARK_VERSION}" \
+      org.opencontainers.image.title="vLLM GB10 Spark DSv4"
+RUN /opt/venv/bin/python /opt/vllm/docker/gb10/stamp-version.py \
+        "${VLLM_SPARK_VERSION}" --root /opt/vllm
 ENTRYPOINT ["/opt/vllm/docker/gb10/entrypoint.sh"]
 CMD ["vllm", "--help"]

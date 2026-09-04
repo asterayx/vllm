@@ -5,7 +5,10 @@
 # Release (baked /opt/vllm, no source mount): ./docker/gb10/run-image.sh
 set -euo pipefail
 
-IMAGE="${VLLM_GB10_IMAGE:-vllm-gb10:v0.28.0-dsv4-spark}"
+# shellcheck source=version.sh
+source "$(cd "$(dirname "$0")" && pwd)/version.sh"
+IMAGE="${VLLM_GB10_IMAGE}"
+VLLM_VERSION_OVERRIDE="${VLLM_VERSION_OVERRIDE:-${VLLM_SPARK_VERSION}}"
 MODEL_HOST="${MODEL_HOST:-${HOME}/models/DeepSeek-V4-Flash-0731}"
 MODEL_PATH="${MODEL_PATH:-/models/DeepSeek-V4-Flash-0731}"
 MOUNT_VLLM_SRC="${MOUNT_VLLM_SRC:-1}"
@@ -58,6 +61,9 @@ docker run -d --name "${NAME}" \
   -v "${B12X_CACHE}:/root/.cache/b12x" \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
+  -e VLLM_VERSION_OVERRIDE="${VLLM_VERSION_OVERRIDE}" \
+  -e VLLM_SPARK_VERSION="${VLLM_SPARK_VERSION}" \
+  -e VLLM_GB10_VERSION="${VLLM_SPARK_VERSION}" \
   "${pythonpath_args[@]}" \
   -e MOUNT_VLLM_SRC="${MOUNT_VLLM_SRC}" \
   -e VLLM_HOST_IP="${VLLM_HOST_IP}" \
@@ -117,7 +123,11 @@ import importlib.metadata as m
 import os
 from pathlib import Path
 
-ver = os.environ.get("VLLM_VERSION_OVERRIDE", "0.28.0")
+ver = (
+    os.environ.get("VLLM_VERSION_OVERRIDE")
+    or os.environ.get("VLLM_GB10_VERSION")
+    or "0.28.0+dsv4.spark.1"
+)
 text = "Metadata-Version: 2.1\nName: vllm\nVersion: %s\n" % ver
 try:
     print("vllm metadata", m.version("vllm"), flush=True)
@@ -188,7 +198,7 @@ for name in names:
     except OSError as e:
         print("could not link", dst, e, flush=True)
 PY
-       if [ -d /tmp/vllm-0.28.0.dist-info ] || [ -d /tmp/vllm-"${VLLM_VERSION_OVERRIDE:-0.28.0}".dist-info ]; then
+       if [ -d /tmp/vllm-"${VLLM_VERSION_OVERRIDE}".dist-info ]; then
          export PYTHONPATH="/tmp${PYTHONPATH:+:$PYTHONPATH}"
        fi
        exec /opt/venv/bin/python -m vllm.entrypoints.cli.main "$@"' \

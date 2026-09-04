@@ -42,7 +42,11 @@ import importlib.metadata as m
 import os
 from pathlib import Path
 
-ver = os.environ.get("VLLM_VERSION_OVERRIDE", "0.28.0")
+ver = (
+    os.environ.get("VLLM_VERSION_OVERRIDE")
+    or os.environ.get("VLLM_GB10_VERSION")
+    or "0.28.0+dsv4.spark.1"
+)
 text = "Metadata-Version: 2.1\nName: vllm\nVersion: %s\n" % ver
 try:
     print("vllm metadata", m.version("vllm"), flush=True)
@@ -112,8 +116,7 @@ for name in names:
         print("could not link", dst, e, flush=True)
 PY
 
-if [ -d /tmp/vllm-0.28.0.dist-info ] \
-   || [ -d /tmp/vllm-"${VLLM_VERSION_OVERRIDE:-0.28.0}".dist-info ]; then
+if [ -d /tmp/vllm-"${VLLM_VERSION_OVERRIDE:-${VLLM_GB10_VERSION:-0.28.0+dsv4.spark.1}}".dist-info ]; then
   export PYTHONPATH="/tmp${PYTHONPATH:+:${PYTHONPATH}}"
 fi
 

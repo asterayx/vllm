@@ -11,8 +11,8 @@ on fork `main`. Do not merge this line with `main`.
 | | Official (this tree) | Older fork `main` |
 | --- | --- | --- |
 | Git | `v0.28.0` + Spark patches | `v0.26.1rc0` + early Spark PRs |
-| Default image | `vllm-gb10:v0.28.0-dsv4-spark` | `vllm-gb10:dspark` (tag name only) |
-| Banner | `0.28.0+dsv4.spark` | leftover `_version.py` can lie |
+| Default image | `vllm-gb10:v0.28.0-dsv4-spark` (+ `.N` release) | `vllm-gb10:dspark` (tag name only) |
+| Banner | `0.28.0+dsv4.spark.N` (`docker/gb10/VERSION`) | leftover `_version.py` can lie |
 | Serve | `run-*-image.sh` (baked `/opt/vllm`) | often bind-mounts `~/src/vllm` |
 
 `vllm-gb10:dspark` is **not** the official v0.28 image unless you rebuilt
@@ -20,17 +20,48 @@ that tag from this tree. Set `VLLM_GB10_IMAGE` explicitly if you reuse it.
 
 ## Contents
 
-1. [Layout and ports](#layout-and-ports)
-2. [Checkout](#checkout)
-3. [Build the official image](#build-the-official-image)
-4. [Copy the image to the worker](#copy-the-image-to-the-worker)
-5. [Weights](#weights)
-6. [Serve vLLM](#serve-vllm)
-7. [Compat proxy + Codex / Grok / OpenCode](#compat-proxy--codex--grok--opencode)
-8. [Prometheus + Grafana](#prometheus--grafana)
-9. [Cloudflare Tunnel (create and /dash)](#cloudflare-tunnel-create-and-dash)
-10. [Verify](#verify)
-11. [Scripts](#scripts)
+1. [Spark version](#spark-version)
+2. [Layout and ports](#layout-and-ports)
+3. [Checkout](#checkout)
+4. [Build the official image](#build-the-official-image)
+5. [Copy the image to the worker](#copy-the-image-to-the-worker)
+6. [Weights](#weights)
+7. [Serve vLLM](#serve-vllm)
+8. [Compat proxy + Codex / Grok / OpenCode](#compat-proxy--codex--grok--opencode)
+9. [Prometheus + Grafana](#prometheus--grafana)
+10. [Cloudflare Tunnel (create and /dash)](#cloudflare-tunnel-create-and-dash)
+11. [Verify](#verify)
+12. [Scripts](#scripts)
+
+## Spark version
+
+This line keeps upstream `v0.28.0` and adds **our** release on top.
+Single source of truth: [`VERSION`](VERSION).
+
+| | Current |
+| --- | --- |
+| Package / serve banner | `0.28.0+dsv4.spark.1` |
+| Family tag (moving latest) | `vllm-gb10:v0.28.0-dsv4-spark` |
+| Release tag (pin this publish) | `vllm-gb10:v0.28.0-dsv4-spark.1` |
+
+`build.sh` / `pack-venv.sh` apply **both** tags. `vllm --version`,
+`importlib.metadata.version("vllm")`, `vllm._version.__version__`, and
+the image label `org.opencontainers.image.version` all show the Spark
+version. Docker tags cannot contain `+`, so the image uses `.1` while
+Python uses `+dsv4.spark.1`.
+
+```bash
+./docker/gb10/version.sh
+# after a build:
+docker image inspect vllm-gb10:v0.28.0-dsv4-spark \
+  --format '{{index .Config.Labels "org.opencontainers.image.version"}}'
+# pin a published cut:
+VLLM_GB10_IMAGE=vllm-gb10:v0.28.0-dsv4-spark.1 \
+  NODE_RANK=0 ./docker/gb10/run-vision-image.sh
+```
+
+Next official image: edit `VERSION` to `0.28.0+dsv4.spark.2` and rebuild.
+Do not reuse `.1` for a different tree.
 
 ## Layout and ports
 
@@ -75,8 +106,9 @@ Expect tip on this branch to sit on `285a71df4`
 
 Build **on a Spark** (`aarch64` + GPU). Do not cross-build from x86.
 
-Default tag: `vllm-gb10:v0.28.0-dsv4-spark`
-(override with `VLLM_GB10_IMAGE`).
+Default family tag: `vllm-gb10:v0.28.0-dsv4-spark`
+(override with `VLLM_GB10_IMAGE`). The same build also tags
+`vllm-gb10:v0.28.0-dsv4-spark.N` from [`VERSION`](VERSION).
 
 Pins inside `docker/Dockerfile.gb10`: CUDA 13.0 devel Ubuntu 24.04,
 PyTorch cu130, FlashInfer **0.6.18**, official **b12x==1.2.6**,
@@ -89,7 +121,7 @@ Compiles vLLM in Docker. Rebuilds reuse the BuildKit uv cache.
 ```bash
 # on the head Spark, this tree
 ./docker/gb10/build.sh
-# equivalent:
+# tags vllm-gb10:v0.28.0-dsv4-spark and vllm-gb10:v0.28.0-dsv4-spark.1
 #   VLLM_GB10_IMAGE=vllm-gb10:v0.28.0-dsv4-spark MAX_JOBS=8 ./docker/gb10/build.sh
 ```
 
@@ -112,7 +144,9 @@ VENV=~/.venvs/vllm028 INSTALL_B12X=1 ./docker/gb10/pack-venv.sh
 ### Confirm the tag
 
 ```bash
-docker image inspect vllm-gb10:v0.28.0-dsv4-spark --format '{{.Id}} {{.Created}}'
+docker image inspect vllm-gb10:v0.28.0-dsv4-spark \
+  --format '{{.Id}} {{.Created}} {{index .Config.Labels "org.opencontainers.image.version"}}'
+docker image ls 'vllm-gb10:v0.28.0-dsv4-spark*'
 ```
 
 ## Copy the image to the worker
@@ -464,6 +498,7 @@ curl -fsSI https://token.asterayx.com/dash | head
 
 | Script | What it does |
 | --- | --- |
+| `VERSION` / `version.sh` | Spark release `0.28.0+dsv4.spark.N` + image tags |
 | `build.sh` | From-scratch official image on Spark |
 | `build-venv.sh` / `install-vllm.sh` | Host compile into a uv venv |
 | `pack-venv.sh` | Pack that venv into the same image tag (no compile) |
