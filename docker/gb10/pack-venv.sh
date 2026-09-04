@@ -42,11 +42,9 @@ if [[ ! -x "${VENV}/bin/python" ]]; then
   exit 1
 fi
 HOST_PY="$(readlink -f "${VENV}/bin/python" || true)"
-echo "host venv python: ${VENV}/bin/python -> ${HOST_PY}"
-if [[ "${HOST_PY}" == *"/.local/share/uv/python/"* ]]; then
-  echo "note: uv-managed CPython is not copied into the image;"
-  echo "      relocate-venv.sh retargets bin/python to /usr/bin/python3.12"
-fi
+HOST_PY_LINK="$(readlink "${VENV}/bin/python" || true)"
+echo "host venv python: ${VENV}/bin/python -> ${HOST_PY_LINK} (${HOST_PY})"
+echo "note: relocate-venv.sh retargets bin/python to /usr/bin/python3.12"
 
 if ! PYTHONPATH="$(pwd)" "${VENV}/bin/python" -c \
     "import importlib; importlib.import_module('vllm._C_stable_libtorch')"; then

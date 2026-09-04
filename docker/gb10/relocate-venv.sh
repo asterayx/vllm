@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Rewrite shebangs and editable install metadata after COPY into
-# /opt/venv + /opt/vllm. Host venvs are typically `uv venv` + editable
-# install. uv points bin/python at a host-managed CPython that is not
-# copied into the image — retarget those links at IMAGE_PYTHON
-# (/usr/bin/python3.12). PEP 660 finders live in *.py (not just *.pth);
-# a leftover host path makes `import vllm` fail even when /opt/vllm is
-# on PYTHONPATH.
+# /opt/venv + /opt/vllm. Host `uv venv` bin/python is usually one of:
+#   /usr/bin/python3          (Spark; image used to omit this link)
+#   ~/.local/share/uv/python  (standalone uv CPython)
+# COPY keeps the symlink. Retarget at IMAGE_PYTHON (/usr/bin/python3.12).
+# PEP 660 finders live in *.py (not just *.pth); a leftover host path
+# makes `import vllm` fail even when /opt/vllm is on PYTHONPATH.
 set -euo pipefail
 
 NEW_VENV="$1"
@@ -27,9 +27,9 @@ if [[ -f "${NEW_VENV}/pyvenv.cfg" ]]; then
     "${NEW_VENV}/pyvenv.cfg"
 fi
 
-# uv venvs symlink bin/python at a host-managed CPython
-# (~/.local/share/uv/python/...). COPY keeps the symlink; the target is
-# not in the image, so /opt/venv/bin/python is dangling (exit 127).
+# COPY keeps host interpreter symlinks. /usr/bin/python3 is missing
+# unless the image installed the python3 metapackage; a uv CPython
+# path is never in the image. Either way bin/python is dangling.
 mkdir -p "${NEW_VENV}/bin"
 ln -sfn "${IMAGE_PYTHON}" "${NEW_VENV}/bin/python3.12"
 ln -sfn python3.12 "${NEW_VENV}/bin/python3"

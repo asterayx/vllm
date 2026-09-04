@@ -53,8 +53,12 @@ def test_relocate_retargets_dangling_uv_python(tmp_path: Path):
     (src / "vllm" / "__init__.py").write_text("__version__ = 'test'\n")
     (src / "docker" / "gb10").mkdir(parents=True)
     (src / "docker" / "gb10" / "entrypoint.sh").write_text("#!/bin/sh\n")
+    uv_home = (
+        "/home/roccen/.local/share/uv/python/"
+        "cpython-3.12.12-linux-aarch64-gnu/bin"
+    )
     (venv / "pyvenv.cfg").write_text(
-        "home = /home/roccen/.local/share/uv/python/cpython-3.12.12-linux-aarch64-gnu/bin\n"
+        f"home = {uv_home}\n"
         f"executable = {uv_py}\n"
         f"command = {uv_py} -m venv {old_venv}\n"
     )
@@ -82,6 +86,23 @@ def test_relocate_retargets_dangling_uv_python(tmp_path: Path):
     assert pip.read_text().startswith(f"#!{venv}/bin/python\n")
     assert not list(site.glob("__editable__.vllm*"))
     assert (site / "_vllm_relocated.pth").read_text() == f"{src}\n"
+
+
+def test_relocate_retargets_usr_bin_python3(tmp_path: Path):
+    """Spark host venv: bin/python -> /usr/bin/python3 (not python3.12)."""
+    venv = tmp_path / "opt" / "venv"
+    src = tmp_path / "opt" / "vllm"
+    (venv / "bin").mkdir(parents=True)
+    (src / "vllm").mkdir(parents=True)
+    (src / "vllm" / "__init__.py").write_text("__version__ = 'test'\n")
+    (src / "docker" / "gb10").mkdir(parents=True)
+    (src / "docker" / "gb10" / "entrypoint.sh").write_text("#!/bin/sh\n")
+    (venv / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to("/usr/bin/python3")
+    (venv / "bin" / "python3").symlink_to("/usr/bin/python3")
+
+    _run_relocate(venv, src, "/home/roccen/.venvs/vllm028", "/home/roccen/src/vllm")
+    assert (venv / "bin" / "python").resolve() == Path(_image_python()).resolve()
 
 
 def test_relocate_creates_python_when_copy_dropped_dangling_link(tmp_path: Path):

@@ -142,8 +142,11 @@ VENV=~/.venvs/vllm028 INSTALL_B12X=1 INSTALL_HUMMING=1 ./docker/gb10/pack-venv.s
 ```
 
 `pack-venv.sh` refuses a venv that cannot import `_C_stable_libtorch`.
-`uv venv` often points `bin/python` at `~/.local/share/uv/python/...`;
-`relocate-venv.sh` retargets that link to the image `/usr/bin/python3.12`.
+Host `uv venv` often has `bin/python -> /usr/bin/python3` (or a uv
+CPython under `~/.local/share/uv/python`). The pack image used to
+install only `python3.12`, so that symlink was dangling. The image now
+provides `/usr/bin/python3`, and `relocate-venv.sh` retargets
+`bin/python` at `/usr/bin/python3.12`.
 
 To inject humming into an **already packed** official image without
 recompiling (wheel + leftover kernel order + `VERSION` stamp):

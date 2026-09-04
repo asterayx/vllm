@@ -28,6 +28,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VLLM_USE_DEEP_GEMM=0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 \
         python3.12 \
         python3.12-venv \
         python3.12-dev \
@@ -40,7 +41,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         librdmacm1 \
         rdma-core \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.12 /usr/local/bin/python
+    && ln -sfn python3.12 /usr/bin/python3 \
+    && ln -sfn /usr/bin/python3.12 /usr/local/bin/python
 
 # Host mlx5/verbs overlay (collected by pack-venv.sh) so NCCL_NET=IB
 # matches the Spark driver instead of only Ubuntu's libibverbs1.
