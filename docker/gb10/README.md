@@ -143,6 +143,20 @@ VENV=~/.venvs/vllm028 INSTALL_B12X=1 INSTALL_HUMMING=1 ./docker/gb10/pack-venv.s
 
 `pack-venv.sh` refuses a venv that cannot import `_C_stable_libtorch`.
 
+To inject humming into an **already packed** official image without
+recompiling (wheel + leftover kernel order + `VERSION` stamp):
+
+```bash
+./docker/gb10/pack-humming.sh
+./docker/gb10/sync-image.sh roccen@192.168.100.11
+```
+
+After restart, worker logs should show
+`Selected HummingFP8ScaledMMLinearKernel for FP8 block-scaled linear`
+and **no** `NVIDIA_GB10` W8A8 Block FP8 config warnings. `pack-humming.sh`
+must overlay `kernels/linear/__init__.py`; installing the wheel alone
+leaves baked `/opt/vllm` on the old Triton-first order.
+
 ### Confirm the tag
 
 ```bash

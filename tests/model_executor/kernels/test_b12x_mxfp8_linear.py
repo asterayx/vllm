@@ -14,6 +14,7 @@ from vllm.model_executor.kernels.linear import (
     _POSSIBLE_FP8_BLOCK_KERNELS,
     _POSSIBLE_FP8_KERNELS,
     _POSSIBLE_MXFP8_KERNELS,
+    _prefer_humming_before_triton,
     init_fp8_linear_kernel,
     init_mxfp8_linear_kernel,
 )
@@ -101,6 +102,21 @@ def test_sm121_fp8_block_prefers_humming_before_triton() -> None:
     ]
     assert names.index("HummingFP8ScaledMMLinearKernel") < names.index(
         "TritonFp8BlockScaledMMKernel"
+    )
+
+
+def test_prefer_humming_before_triton_reorders_old_image_order() -> None:
+    from vllm.model_executor.kernels.linear.scaled_mm.humming import (
+        HummingFP8ScaledMMLinearKernel,
+    )
+    from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+        TritonFp8BlockScaledMMKernel,
+    )
+
+    old = [TritonFp8BlockScaledMMKernel, HummingFP8ScaledMMLinearKernel]
+    out = _prefer_humming_before_triton(old)
+    assert out.index(HummingFP8ScaledMMLinearKernel) < out.index(
+        TritonFp8BlockScaledMMKernel
     )
 
 

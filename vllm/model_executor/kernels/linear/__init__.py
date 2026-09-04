@@ -575,6 +575,26 @@ _KernelT = TypeVar("_KernelT", bound=ScaledMMLinearKernel | MMLinearKernel)
 _KernelConfigT = TypeVar("_KernelConfigT", bound=MMLinearLayerConfig)
 
 
+def _prefer_humming_before_triton(
+    kernels: list[type[_KernelT]],
+) -> list[type[_KernelT]]:
+    """Put Humming immediately before Triton when both are candidates.
+
+    SM12x leftover W8A8 otherwise hits the untuned Triton GB10 json warning.
+    Safe on other GPUs: DeepGEMM / Cutlass still sit earlier in the list.
+    """
+    try:
+        humming_i = kernels.index(HummingFP8ScaledMMLinearKernel)  # type: ignore[arg-type]
+        triton_i = kernels.index(TritonFp8BlockScaledMMKernel)  # type: ignore[arg-type]
+    except ValueError:
+        return kernels
+    if humming_i < triton_i:
+        return kernels
+    out = [k for k in kernels if k is not HummingFP8ScaledMMLinearKernel]
+    out.insert(out.index(TritonFp8BlockScaledMMKernel), HummingFP8ScaledMMLinearKernel)
+    return out
+
+
 def is_supported_and_can_implement_kernel(
     kernel: type[_KernelT], config: _KernelConfigT, compute_capability: int | None
 ) -> tuple[bool, str]:
@@ -650,7 +670,9 @@ def choose_scaled_mm_linear_kernel(
             scope="global",
         )
 
-    platform_kernels = possible_kernels.get(current_platform._enum, [])
+    platform_kernels = _prefer_humming_before_triton(
+        list(possible_kernels.get(current_platform._enum, []))
+    )
 
     # Apply --linear-backend filtering when set.
     candidates = _resolve_backend_kernels(platform_kernels, "scaled-mm")
@@ -712,11 +734,19 @@ def init_fp8_linear_kernel(
             possible_kernels=_POSSIBLE_FP8_BLOCK_KERNELS,  # type: ignore[misc]
             force_kernel=force_kernel,
         )
-        if module_name:
-            logger.info_once(
-                "Selected %s for %s",
-                kernel_type.__name__,
-                module_name,
+        logger.info_once(
+            "Selected %s for FP8 block-scaled linear%s",
+            kernel_type.__name__,
+            f" ({module_name})" if module_name else "",
+            scope="global",
+        )
+        if kernel_type is TritonFp8BlockScaledMMKernel and (
+            current_platform.is_device_capability_family(120)
+        ):
+            logger.warning_once(
+                "SM12x selected Triton for leftover W8A8 block-FP8; "
+                "GB10 has no tuned Triton configs. Install "
+                "humming-kernels[cu13]==0.1.12 and confirm has_humming().",
                 scope="global",
             )
 
