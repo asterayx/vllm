@@ -97,8 +97,7 @@ def test_b12x_fp8_fallback_priority(
 def test_sm121_fp8_block_prefers_humming_before_triton() -> None:
     """SM121 leftover W8A8: Humming before the untuned Triton default."""
     names = [
-        kernel.__name__
-        for kernel in _POSSIBLE_FP8_BLOCK_KERNELS[PlatformEnum.CUDA]
+        kernel.__name__ for kernel in _POSSIBLE_FP8_BLOCK_KERNELS[PlatformEnum.CUDA]
     ]
     assert names.index("HummingFP8ScaledMMLinearKernel") < names.index(
         "TritonFp8BlockScaledMMKernel"
