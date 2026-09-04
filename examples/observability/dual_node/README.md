@@ -1,5 +1,8 @@
 # Dual-node Prometheus + Grafana (DGX Spark / bare metal)
 
+Full operator path (official image, serve, proxy, Grafana, Cloudflare
+tunnel from scratch): [`docker/gb10/README.md`](../../../docker/gb10/README.md).
+
 Ported onto `cursor/spark-v0280-dsv4-df88`. Serve defaults still match
 `docker/gb10/run.sh` / `run-vision.sh` (`VLLM_METRICS_TARGET=127.0.0.1:30001`).
 
@@ -74,6 +77,11 @@ the RoCE board. The official Performance Statistics board defaults to
 Serving board instead (All by default).
 
 ## Cloudflare Tunnel (`/dash`)
+
+Creating a **new** tunnel (`login` / `tunnel create` / `route dns` /
+systemd) is in
+[`docker/gb10/README.md`](../../../docker/gb10/README.md#cloudflare-tunnel-create-and-dash).
+This section is the Grafana `/dash` ingress only.
 
 On the head (`192.168.100.10`), publish Grafana at
 `https://token.asterayx.com/dash`. This is the only observability

@@ -1,5 +1,8 @@
 # spark-compat-proxy
 
+Full Spark operator guide (image, serve, Grafana, Cloudflare):
+[`../README.md`](../README.md).
+
 Production OpenAI-compat sidecar for 2× DGX Spark. Listens on **:30000**,
 forwards to vLLM **:30001**, and copies v0.28 `reasoning` onto
 `reasoning_content` (JSON + SSE). Connection-pooled, keep-alive, 600s
