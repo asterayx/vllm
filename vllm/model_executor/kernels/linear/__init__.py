@@ -595,6 +595,18 @@ def _prefer_humming_before_triton(
     return out
 
 
+def _front_load_humming_fp8(
+    platform_kernels: list[type[_KernelT]],
+    candidates: list[type[_KernelT]],
+) -> list[type[_KernelT]]:
+    """Try Humming before --linear-backend b12x on leftover W8A8 lists."""
+    if HummingFP8ScaledMMLinearKernel not in platform_kernels:
+        return candidates
+    if HummingFP8ScaledMMLinearKernel in candidates:
+        return candidates
+    return [HummingFP8ScaledMMLinearKernel, *candidates]
+
+
 def is_supported_and_can_implement_kernel(
     kernel: type[_KernelT], config: _KernelConfigT, compute_capability: int | None
 ) -> tuple[bool, str]:
@@ -676,6 +688,10 @@ def choose_scaled_mm_linear_kernel(
 
     # Apply --linear-backend filtering when set.
     candidates = _resolve_backend_kernels(platform_kernels, "scaled-mm")
+    # SM12x: b12x block-FP8 is off. Try Humming in the first pass so an
+    # installed humming wheel wins before leftover Triton.
+    if current_platform.is_cuda() and current_platform.is_device_capability_family(120):
+        candidates = _front_load_humming_fp8(platform_kernels, candidates)
 
     def _pick(kernels: list[type[_KernelT]]) -> type[_KernelT] | None:
         for kernel in kernels:

@@ -201,6 +201,9 @@ PY
        if [ -d /tmp/vllm-"${VLLM_VERSION_OVERRIDE}".dist-info ]; then
          export PYTHONPATH="/tmp${PYTHONPATH:+:$PYTHONPATH}"
        fi
+       if [ -x /opt/vllm/docker/gb10/ensure-humming.sh ]; then
+         /opt/vllm/docker/gb10/ensure-humming.sh /opt/venv/bin/python || true
+       fi
        exec /opt/venv/bin/python -m vllm.entrypoints.cli.main "$@"' \
   vllm \
   serve "${MODEL_PATH}" \

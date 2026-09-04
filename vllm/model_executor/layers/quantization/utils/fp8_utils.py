@@ -848,12 +848,19 @@ def get_w8a8_block_fp8_configs(
             return {int(key): val for key, val in json.load(f).items()}
 
     # If no optimized configuration is available, we will use the default
-    # configuration
-    logger.warning(
-        "Using default W8A8 Block FP8 kernel config. Performance might "
-        "be sub-optimal! Config file not found at %s",
-        config_file_path,
-    )
+    # configuration. GB10 has no tuned files in-tree; do not WARNING-spam
+    # leftover W8A8 while Humming is the intended SM12x kernel.
+    if device_name == "NVIDIA_GB10":
+        logger.debug(
+            "No tuned W8A8 Block FP8 config for GB10 at %s; using default.",
+            config_file_path,
+        )
+    else:
+        logger.warning(
+            "Using default W8A8 Block FP8 kernel config. Performance might "
+            "be sub-optimal! Config file not found at %s",
+            config_file_path,
+        )
     return None
 
 

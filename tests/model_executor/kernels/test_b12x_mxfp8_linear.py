@@ -14,6 +14,7 @@ from vllm.model_executor.kernels.linear import (
     _POSSIBLE_FP8_BLOCK_KERNELS,
     _POSSIBLE_FP8_KERNELS,
     _POSSIBLE_MXFP8_KERNELS,
+    _front_load_humming_fp8,
     _prefer_humming_before_triton,
     init_fp8_linear_kernel,
     init_mxfp8_linear_kernel,
@@ -118,6 +119,28 @@ def test_prefer_humming_before_triton_reorders_old_image_order() -> None:
     assert out.index(HummingFP8ScaledMMLinearKernel) < out.index(
         TritonFp8BlockScaledMMKernel
     )
+
+
+def test_front_load_humming_before_b12x_first_pass() -> None:
+    from vllm.model_executor.kernels.linear.scaled_mm.b12x_block import (
+        B12xFp8BlockScaledMMKernel,
+    )
+    from vllm.model_executor.kernels.linear.scaled_mm.humming import (
+        HummingFP8ScaledMMLinearKernel,
+    )
+    from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+        TritonFp8BlockScaledMMKernel,
+    )
+
+    platform = [
+        B12xFp8BlockScaledMMKernel,
+        HummingFP8ScaledMMLinearKernel,
+        TritonFp8BlockScaledMMKernel,
+    ]
+    b12x_only = [B12xFp8BlockScaledMMKernel]
+    out = _front_load_humming_fp8(platform, b12x_only)
+    assert out[0] is HummingFP8ScaledMMLinearKernel
+    assert out[1] is B12xFp8BlockScaledMMKernel
 
 
 @torch.inference_mode()

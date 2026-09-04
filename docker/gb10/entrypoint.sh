@@ -120,6 +120,11 @@ if [ -d /tmp/vllm-"${VLLM_VERSION_OVERRIDE:-${VLLM_GB10_VERSION:-0.28.0+dsv4.spa
   export PYTHONPATH="/tmp${PYTHONPATH:+:${PYTHONPATH}}"
 fi
 
+# Bind-mount leftover order is useless until humming is in the venv.
+if [[ -x /opt/vllm/docker/gb10/ensure-humming.sh ]]; then
+  /opt/vllm/docker/gb10/ensure-humming.sh /opt/venv/bin/python || true
+fi
+
 # WORKDIR is /opt/vllm; a bare `vllm` hits the package directory.
 if [[ "${1:-}" == "vllm" ]]; then
   shift
