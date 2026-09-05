@@ -3,11 +3,11 @@
 # Build that venv first:
 #   ./docker/gb10/build-venv.sh
 # The venv must be from THIS v0.28.0 tree (vllm._C_stable_libtorch present).
-# Do not pack later-main ~/.venvs/vllm028 onto vllm-gb10:v0.28.0-dsv4-spark.
+# Do not pack later-main ~/.venvs/vllm028 onto this Spark image line.
 #
 #   VENV=/home/roccen/.venvs/vllm028 ./docker/gb10/pack-venv.sh
 #   INSTALL_FLASHINFER=1 VENV=... ./docker/gb10/pack-venv.sh
-#   INSTALL_B12X=1 VENV=... ./docker/gb10/pack-venv.sh
+#   INSTALL_B12X=1 INSTALL_HUMMING=1 VENV=... ./docker/gb10/pack-venv.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -28,14 +28,23 @@ if [[ -z "${VENV:-}" ]]; then
   done
 fi
 VENV="${VENV:-${HOME}/.venvs/vllm-gb10-v0280}"
-IMAGE="${VLLM_GB10_IMAGE:-vllm-gb10:v0.28.0-dsv4-spark}"
+# shellcheck source=version.sh
+source "$(dirname "$0")/version.sh"
+IMAGE="${VLLM_GB10_IMAGE}"
 INSTALL_FLASHINFER="${INSTALL_FLASHINFER:-0}"
 INSTALL_B12X="${INSTALL_B12X:-0}"
+# Default 1 so a venv packed from an older image still gets humming
+# (SM121 leftover W8A8, before Triton). Set INSTALL_HUMMING=0 to skip.
+INSTALL_HUMMING="${INSTALL_HUMMING:-1}"
 
 if [[ ! -x "${VENV}/bin/python" ]]; then
   echo "No venv at ${VENV}. Build one on this tree first, or use build.sh." >&2
   exit 1
 fi
+HOST_PY="$(readlink -f "${VENV}/bin/python" || true)"
+HOST_PY_LINK="$(readlink "${VENV}/bin/python" || true)"
+echo "host venv python: ${VENV}/bin/python -> ${HOST_PY_LINK} (${HOST_PY})"
+echo "note: relocate-venv.sh retargets bin/python to /usr/bin/python3.12"
 
 if ! PYTHONPATH="$(pwd)" "${VENV}/bin/python" -c \
     "import importlib; importlib.import_module('vllm._C_stable_libtorch')"; then
@@ -60,11 +69,12 @@ rsync -a --delete \
 cp docker/gb10/relocate-venv.sh "${STAGE}/relocate-venv.sh"
 cp docker/gb10/install-ibverbs.sh "${STAGE}/install-ibverbs.sh"
 cp docker/gb10/install-b12x.sh "${STAGE}/install-b12x.sh"
+cp docker/gb10/install-humming.sh "${STAGE}/install-humming.sh"
 cp docker/gb10/check-extensions.py "${STAGE}/check-extensions.py"
 cp docker/Dockerfile.gb10-venv "${STAGE}/Dockerfile"
 ./docker/gb10/collect-ibverbs.sh "${STAGE}/ibverbs"
 
-echo "Packing ${VENV} + host ibverbs + $(pwd) -> ${IMAGE} (no vLLM compile)"
+echo "Packing ${VENV} + host ibverbs + $(pwd) -> ${IMAGE} (${VLLM_SPARK_VERSION})"
 docker build \
   --platform linux/arm64 \
   -f "${STAGE}/Dockerfile" \
@@ -72,5 +82,9 @@ docker build \
   --build-arg OLD_SRC="$(pwd)" \
   --build-arg INSTALL_FLASHINFER="${INSTALL_FLASHINFER}" \
   --build-arg INSTALL_B12X="${INSTALL_B12X}" \
+  --build-arg INSTALL_HUMMING="${INSTALL_HUMMING}" \
+  --build-arg VLLM_SPARK_VERSION="${VLLM_SPARK_VERSION}" \
   -t "${IMAGE}" \
+  -t "${VLLM_GB10_IMAGE_RELEASE}" \
   "${STAGE}"
+echo "tagged ${IMAGE} and ${VLLM_GB10_IMAGE_RELEASE}"

@@ -14,6 +14,8 @@ from vllm.model_executor.kernels.linear import (
     _POSSIBLE_FP8_BLOCK_KERNELS,
     _POSSIBLE_FP8_KERNELS,
     _POSSIBLE_MXFP8_KERNELS,
+    _front_load_humming_fp8,
+    _prefer_humming_before_triton,
     init_fp8_linear_kernel,
     init_mxfp8_linear_kernel,
 )
@@ -92,6 +94,53 @@ def test_b12x_fp8_fallback_priority(
     names = [kernel.__name__ for kernel in kernels]
 
     assert names.index(before) < names.index(b12x) < names.index(after)
+
+
+def test_sm121_fp8_block_prefers_humming_before_triton() -> None:
+    """SM121 leftover W8A8: Humming before the untuned Triton default."""
+    names = [
+        kernel.__name__ for kernel in _POSSIBLE_FP8_BLOCK_KERNELS[PlatformEnum.CUDA]
+    ]
+    assert names.index("HummingFP8ScaledMMLinearKernel") < names.index(
+        "TritonFp8BlockScaledMMKernel"
+    )
+
+
+def test_prefer_humming_before_triton_reorders_old_image_order() -> None:
+    from vllm.model_executor.kernels.linear.scaled_mm.humming import (
+        HummingFP8ScaledMMLinearKernel,
+    )
+    from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+        TritonFp8BlockScaledMMKernel,
+    )
+
+    old = [TritonFp8BlockScaledMMKernel, HummingFP8ScaledMMLinearKernel]
+    out = _prefer_humming_before_triton(old)
+    assert out.index(HummingFP8ScaledMMLinearKernel) < out.index(
+        TritonFp8BlockScaledMMKernel
+    )
+
+
+def test_front_load_humming_before_b12x_first_pass() -> None:
+    from vllm.model_executor.kernels.linear.scaled_mm.b12x_block import (
+        B12xFp8BlockScaledMMKernel,
+    )
+    from vllm.model_executor.kernels.linear.scaled_mm.humming import (
+        HummingFP8ScaledMMLinearKernel,
+    )
+    from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+        TritonFp8BlockScaledMMKernel,
+    )
+
+    platform = [
+        B12xFp8BlockScaledMMKernel,
+        HummingFP8ScaledMMLinearKernel,
+        TritonFp8BlockScaledMMKernel,
+    ]
+    b12x_only = [B12xFp8BlockScaledMMKernel]
+    out = _front_load_humming_fp8(platform, b12x_only)
+    assert out[0] is HummingFP8ScaledMMLinearKernel
+    assert out[1] is B12xFp8BlockScaledMMKernel
 
 
 @torch.inference_mode()

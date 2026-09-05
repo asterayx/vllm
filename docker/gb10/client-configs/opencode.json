@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "spark/deepseek-v4-flash-vision-exp",
+  "provider": {
+    "spark": {
+      "api": "http://127.0.0.1:30000/v1",
+      "models": {
+        "deepseek-v4-flash-vision-exp": {
+          "limit": {
+            "context": 524288
+          },
+          "name": "DeepSeek-V4-Flash-Vision-Exp",
+          "reasoning": true
+        }
+      },
+      "name": "DeepSeek-V4-Flash-Vision-Exp",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "apiKey": "dummy",
+        "baseURL": "http://127.0.0.1:30000/v1"
+      }
+    }
+  }
+}

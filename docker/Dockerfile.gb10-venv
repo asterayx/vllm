@@ -11,6 +11,8 @@
 #   INSTALL_FLASHINFER=1 ./docker/gb10/pack-venv.sh
 # Optional official b12x extra (stock --moe-backend b12x, not flashinfer_b12x):
 #   INSTALL_B12X=1 ./docker/gb10/pack-venv.sh
+# Humming leftover W8A8 (default on):
+#   INSTALL_HUMMING=1 ./docker/gb10/pack-venv.sh
 
 ARG CUDA_VERSION=13.0.1
 ARG UBUNTU_VERSION=24.04
@@ -26,6 +28,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     VLLM_USE_DEEP_GEMM=0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 \
         python3.12 \
         python3.12-venv \
         python3.12-dev \
@@ -38,7 +41,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         librdmacm1 \
         rdma-core \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.12 /usr/local/bin/python
+    && ln -sfn python3.12 /usr/bin/python3 \
+    && ln -sfn /usr/bin/python3.12 /usr/local/bin/python
 
 # Host mlx5/verbs overlay (collected by pack-venv.sh) so NCCL_NET=IB
 # matches the Spark driver instead of only Ubuntu's libibverbs1.
@@ -52,6 +56,7 @@ COPY venv /opt/venv
 COPY src /opt/vllm
 COPY relocate-venv.sh /tmp/relocate-venv.sh
 COPY install-b12x.sh /tmp/install-b12x.sh
+COPY install-humming.sh /tmp/install-humming.sh
 COPY check-extensions.py /tmp/check-extensions.py
 
 ARG OLD_VENV
@@ -84,6 +89,29 @@ RUN if [ "${INSTALL_B12X}" = "1" ]; then \
     fi \
     && rm -f /tmp/install-b12x.sh
 
+# Default on: older packed venvs may have missed humming-kernels even
+# though requirements/cuda.txt pins it. SM121 leftover W8A8 uses it
+# before the untuned Triton default.
+ARG INSTALL_HUMMING=1
+RUN if [ "${INSTALL_HUMMING}" = "1" ]; then \
+      if [ ! -x /root/.local/bin/uv ]; then \
+        curl -LsSf https://astral.sh/uv/install.sh | sh; \
+      fi \
+      && export PATH="/root/.local/bin:${PATH}" \
+      && chmod +x /tmp/install-humming.sh \
+      && /tmp/install-humming.sh /opt/venv/bin/python; \
+    fi \
+    && rm -f /tmp/install-humming.sh
+
 WORKDIR /opt/vllm
+ARG VLLM_SPARK_VERSION=0.28.0+dsv4.spark.2
+ENV VLLM_SPARK_VERSION=${VLLM_SPARK_VERSION} \
+    VLLM_VERSION_OVERRIDE=${VLLM_SPARK_VERSION} \
+    SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_SPARK_VERSION} \
+    VLLM_GB10_VERSION=${VLLM_SPARK_VERSION}
+LABEL org.opencontainers.image.version="${VLLM_SPARK_VERSION}" \
+      org.opencontainers.image.title="vLLM GB10 Spark DSv4"
+RUN /opt/venv/bin/python /opt/vllm/docker/gb10/stamp-version.py \
+        "${VLLM_SPARK_VERSION}" --root /opt/vllm
 ENTRYPOINT ["/opt/vllm/docker/gb10/entrypoint.sh"]
 CMD ["vllm", "--help"]

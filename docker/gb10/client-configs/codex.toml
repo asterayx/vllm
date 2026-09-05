@@ -1,0 +1,19 @@
+# Codex CLI → Spark vLLM (via spark-compat-proxy)
+# Install:
+#   mkdir -p ~/.codex
+#   curl -fsS http://127.0.0.1:30000/configs/codex.toml -o ~/.codex/config.toml
+#   export VLLM_API_KEY=dummy
+#
+# Codex only accepts wire_api = "responses" (chat was removed Feb 2026).
+
+model = "deepseek-v4-flash-vision-exp"
+model_provider = "vllm"
+
+[model_providers.vllm]
+name = "vLLM Spark"
+env_key = "VLLM_API_KEY"
+base_url = "http://127.0.0.1:30000/v1"
+wire_api = "responses"
+# Long DSv4 generations; default 300s is too short.
+stream_idle_timeout_ms = 600000
+request_max_retries = 4

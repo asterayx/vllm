@@ -13,13 +13,18 @@ if [[ "$(uname -m)" != "aarch64" ]]; then
   exit 1
 fi
 
-IMAGE="${VLLM_GB10_IMAGE:-vllm-gb10:v0.28.0-dsv4-spark}"
+# shellcheck source=version.sh
+source "$(dirname "$0")/version.sh"
+IMAGE="${VLLM_GB10_IMAGE}"
 MAX_JOBS="${MAX_JOBS:-8}"
 
 export DOCKER_BUILDKIT=1
-exec docker build \
+docker build \
   --platform linux/arm64 \
   -f docker/Dockerfile.gb10 \
   --build-arg MAX_JOBS="${MAX_JOBS}" \
+  --build-arg VLLM_SPARK_VERSION="${VLLM_SPARK_VERSION}" \
   -t "${IMAGE}" \
+  -t "${VLLM_GB10_IMAGE_RELEASE}" \
   .
+echo "tagged ${IMAGE} and ${VLLM_GB10_IMAGE_RELEASE} (${VLLM_SPARK_VERSION})"

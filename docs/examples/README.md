@@ -15,4 +15,4 @@ vLLM's examples are organized into the following categories:
 - **[`ray_serving/`](../../examples/ray_serving)** – Scalable serving using Ray.
 - **[`disaggregated/`](../../examples/disaggregated)** – Examples for Disaggregated P/D (Prefill/Decoding) inference, including various kv cache connectors (LMCache, Mooncake, FlexKV, P2P NCCL) and failure recovery.
 - **[`scale_out/`](../../examples/scale_out)** – Examples for Token In <> Token Out API Server.
-- **[`observability/`](../../examples/observability)** – Metrics, logging, tracing (OpenTelemetry), and dashboards (Grafana, Perses).
+- **[`observability/`](../../examples/observability)** – Metrics, logging, tracing (OpenTelemetry), and dashboards (Grafana, Perses). For a two-node / DGX Spark host install (Prometheus + Grafana + RoCE), see [`observability/dual_node/`](../../examples/observability/dual_node).

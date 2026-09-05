@@ -1,6 +1,7 @@
 # DGX Spark / ASUS GX10 (GB10, SM121, aarch64) image.
 # Baseline: official vLLM v0.28.0 + Spark DSv4-Flash patches.
-# Pins: FlashInfer 0.6.18 (requirements/cuda.txt), official b12x==1.2.6.
+# Pins: FlashInfer 0.6.18 (requirements/cuda.txt), official b12x==1.2.6,
+# humming-kernels[cu13]==0.1.12 (SM121 leftover W8A8 before Triton).
 # Build ON a Spark (linux/arm64 + GPU). Do not cross-build from x86.
 #
 #   docker/gb10/build.sh
@@ -86,6 +87,30 @@ RUN --mount=type=cache,target=/root/.cache/uv \
                /opt/vllm/docker/gb10/install-b12x.sh \
     && /opt/vllm/docker/gb10/install-b12x.sh /opt/venv/bin/python \
     && rm -rf /root/.cache/flashinfer
+
+# Humming after compile so a pin tweak does not rebuild CUDA extensions.
+# cuda.txt already pins it; re-run so a cache hit still has it, and so
+# has_humming() is asserted against the baked tree. SM121 leftover W8A8
+# prefers Humming over the untuned Triton default.
+COPY docker/gb10/install-humming.sh /opt/vllm/docker/gb10/install-humming.sh
+ARG INSTALL_HUMMING=1
+RUN --mount=type=cache,target=/root/.cache/uv \
+    chmod +x /opt/vllm/docker/gb10/install-humming.sh \
+    && INSTALL_HUMMING=${INSTALL_HUMMING} \
+        /opt/vllm/docker/gb10/install-humming.sh /opt/venv/bin/python
+
+# Own Spark release (docker/gb10/VERSION). Copied after compile so bumping
+# 0.28.0+dsv4.spark.N does not rebuild CUDA extensions or humming.
+COPY docker/gb10/VERSION /opt/vllm/docker/gb10/VERSION
+ARG VLLM_SPARK_VERSION=0.28.0+dsv4.spark.2
+ENV VLLM_SPARK_VERSION=${VLLM_SPARK_VERSION} \
+    VLLM_VERSION_OVERRIDE=${VLLM_SPARK_VERSION} \
+    SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_SPARK_VERSION} \
+    VLLM_GB10_VERSION=${VLLM_SPARK_VERSION}
+LABEL org.opencontainers.image.version="${VLLM_SPARK_VERSION}" \
+      org.opencontainers.image.title="vLLM GB10 Spark DSv4"
+RUN /opt/venv/bin/python /opt/vllm/docker/gb10/stamp-version.py \
+        "${VLLM_SPARK_VERSION}" --root /opt/vllm
 
 EXPOSE 8000
 ENTRYPOINT ["/opt/vllm/docker/gb10/entrypoint.sh"]

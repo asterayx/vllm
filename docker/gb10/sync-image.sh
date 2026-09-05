@@ -5,7 +5,8 @@
 # on the CPU and is slower on 100GbE. This script does not use -C.
 #
 #   ./docker/gb10/sync-image.sh roccen@192.168.100.11
-#   ./docker/gb10/sync-image.sh roccen@192.168.100.11 vllm-gb10:v0.28.0-dsv4-spark
+#   ./docker/gb10/sync-image.sh roccen@192.168.100.11
+#   ./docker/gb10/sync-image.sh roccen@192.168.100.11 vllm-gb10:v0.28.0-dsv4-spark.1
 #
 # Faster on a trusted ConnectX link (two terminals, no SSH crypto):
 #   # worker
@@ -14,13 +15,17 @@
 #   docker save vllm-gb10:v0.28.0-dsv4-spark | nc -N 192.168.100.11 18765
 set -euo pipefail
 
+# shellcheck source=version.sh
+source "$(dirname "$0")/version.sh"
+
 if [[ $# -lt 1 ]]; then
   echo "usage: $0 user@<other-spark-connectx-ip> [image]" >&2
+  echo "default image: ${VLLM_GB10_IMAGE}  (also ${VLLM_GB10_IMAGE_RELEASE})" >&2
   exit 1
 fi
 
 REMOTE="$1"
-IMAGE="${2:-${VLLM_GB10_IMAGE:-vllm-gb10:v0.28.0-dsv4-spark}}"
+IMAGE="${2:-${VLLM_GB10_IMAGE}}"
 
 if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
   echo "No local image ${IMAGE}." >&2

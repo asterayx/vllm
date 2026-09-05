@@ -38,3 +38,8 @@ share/python-wheels/
 *.egg
 MANIFEST
 rust/target/
+
+# Stamped / installed in a later Dockerfile layer so a release bump
+# or humming pin tweak does not invalidate the vLLM compile cache.
+docker/gb10/VERSION
+docker/gb10/install-humming.sh

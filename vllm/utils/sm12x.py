@@ -121,6 +121,49 @@ def sm12x_flashinfer_decode_tune_sizes(
     return sm12x_dspark_capture_sizes(capture_sizes, decode_query_len)
 
 
+def sm12x_flashinfer_autotune_query_lens(decode_query_len: int) -> list[int]:
+    """FlashInfer dummy-run q_lens for SM12x DSpark.
+
+    The target runner's ``decode_query_len`` is ``k + 1``. DSpark
+    ``sample_from_anchor`` uses ``q_len = k``. Vision ``k=3`` therefore
+    launches ``q=3`` which snaps to 6, while the runner reports 4.
+    Autotuning only 4 misses the hot ``q=6`` decode (tactic=-1).
+    """
+    if decode_query_len <= 0:
+        return []
+    if decode_query_len <= 1 or not current_platform.is_device_capability_family(120):
+        return [decode_query_len]
+    qs = {
+        decode_query_len,
+        sm12x_align_decode_q_len(decode_query_len),
+        sm12x_align_decode_q_len(decode_query_len - 1),
+    }
+    return sorted(q for q in qs if q > 1)
+
+
+def sm12x_flashinfer_dummy_tune_sizes(
+    capture_sizes: list[int] | None,
+    decode_query_len: int,
+) -> list[int]:
+    """Token counts safe for ``_dummy_run(..., uniform_decode=True)``.
+
+    Extra aligned q_lens (Vision ``k=3`` → q=6) still contribute sizes,
+    but ``num_tokens`` must be a multiple of the runner's
+    ``decode_query_len`` (4 on Vision). 6 and 18 are dropped there.
+    """
+    if decode_query_len <= 0:
+        return []
+    sizes: list[int] = []
+    seen: set[int] = set()
+    for q_len in sm12x_flashinfer_autotune_query_lens(decode_query_len):
+        for num_tokens in sm12x_flashinfer_decode_tune_sizes(capture_sizes, q_len):
+            if num_tokens % decode_query_len != 0 or num_tokens in seen:
+                continue
+            seen.add(num_tokens)
+            sizes.append(num_tokens)
+    return sizes
+
+
 def sm12x_kernel_warmup_prefill_len(decode_query_len: int) -> int:
     """V2 kernel-warmup prefill length.
 

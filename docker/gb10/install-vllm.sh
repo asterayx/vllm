@@ -10,7 +10,10 @@ PYTHON="${1:-${VIRTUAL_ENV:-/opt/venv}/bin/python}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.1a}"
 export VLLM_TARGET_DEVICE="${VLLM_TARGET_DEVICE:-cuda}"
 export MAX_JOBS="${MAX_JOBS:-8}"
-export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION:-0.28.0+dsv4.spark}"
+# shellcheck source=version.sh
+source "$(cd "$(dirname "$0")" && pwd)/version.sh"
+export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION:-${VLLM_SPARK_VERSION}}"
+export VLLM_VERSION_OVERRIDE="${VLLM_VERSION_OVERRIDE:-${VLLM_SPARK_VERSION}}"
 export VLLM_ROOT="${VLLM_ROOT:-${ROOT}}"
 
 "${PYTHON}" -c "import torch; print('torch', torch.__version__, torch.version.cuda, flush=True)"
