@@ -27,6 +27,7 @@ Checked-in copies (localhost `base_url`) live in
 cd docker/gb10/compat-proxy
 # rust-toolchain.toml pins 1.88.0 (some rustup 1.95 images are missing rust-std).
 ./install.sh
+# writes /usr/local/bin/spark-compat-proxy (sudo if needed)
 # or:
 cargo build --release
 sudo install -m755 target/release/spark-compat-proxy /usr/local/bin/
@@ -49,11 +50,15 @@ spark-compat-proxy write-configs --out /tmp/spark-client-configs \
   --public-base http://192.168.8.134:30000
 ```
 
-systemd (edit `User=` and `--public-base`):
+systemd (`User=` must be this host's login, not a leftover `roccen`):
 
 ```bash
-sudo cp spark-compat-proxy.service /etc/systemd/system/
+INSTALL_SYSTEMD=1 ./install.sh
+# or: PUBLIC_BASE=http://<wifi>:30000 INSTALL_SYSTEMD=1 ./install.sh
+sudo systemctl reset-failed spark-compat-proxy
 sudo systemctl enable --now spark-compat-proxy
+# 203/EXEC = /usr/local/bin/spark-compat-proxy missing or not +x
+ls -l /usr/local/bin/spark-compat-proxy
 ```
 
 ## Download configs from the running proxy

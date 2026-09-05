@@ -5,6 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# install.sh INSTALL_SYSTEMD=1 rewrites User= to id -un.
+# A missing binary at ExecStart is systemd 203/EXEC.
 User=roccen
 ExecStart=/usr/local/bin/spark-compat-proxy --listen 0.0.0.0:30000 --upstream http://127.0.0.1:30001 --public-base http://127.0.0.1:30000
 Restart=on-failure

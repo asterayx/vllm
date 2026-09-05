@@ -287,10 +287,11 @@ v0.28 emits `reasoning`. Codex / Grok still read `reasoning_content`.
 
 ```bash
 cd docker/gb10/compat-proxy
-./install.sh          # rust-toolchain.toml pins rustc 1.88.0
-sudo cp spark-compat-proxy.service /etc/systemd/system/
-# edit User= and --public-base (Wi-Fi IP if clients are not on the head)
+INSTALL_SYSTEMD=1 ./install.sh   # rustc 1.88; sudo-installs binary + unit
+# PUBLIC_BASE=http://<head-wifi>:30000 INSTALL_SYSTEMD=1 ./install.sh
+sudo systemctl reset-failed spark-compat-proxy
 sudo systemctl enable --now spark-compat-proxy
+# 203/EXEC = binary missing at /usr/local/bin/spark-compat-proxy
 ```
 
 `--public-base` is what the generated configs put in `base_url` / `baseURL`.
