@@ -256,6 +256,7 @@ def _launch_per_request(
 
     def _fake_launch(**launch_kwargs):
         launches.append(launch_kwargs)
+        launch_kwargs["out"].copy_(launch_kwargs["query"])
 
     monkeypatch.setattr(
         fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
@@ -283,6 +284,7 @@ def _launch_per_request(
         q_len,
         **kwargs,
     )
+    torch.testing.assert_close(output, q)
     return launches
 
 

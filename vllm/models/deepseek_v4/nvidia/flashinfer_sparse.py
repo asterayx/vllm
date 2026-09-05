@@ -154,7 +154,7 @@ def _batch_token_span(
     if n < target:
         extra = target - n
         if fill is None and n > 0:
-            pad = sl[-1:].expand(extra, *sl.shape[1:]).contiguous()
+            pad = sl[-1:].expand(extra, *sl.shape[1:])
         else:
             pad = sl.new_full((extra, *sl.shape[1:]), 0 if fill is None else fill)
         sl = torch.cat((sl, pad), dim=0)
@@ -915,7 +915,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         if launch_len == q_len:
             out = output[token_start:token_end].reshape(1, q_len, *output.shape[1:])
         else:
-            out = _batch_token_span(output, token_start, token_end, launch_len)
+            out = output.new_empty((1, launch_len, *output.shape[1:]))
         req_sparse = sm12x_replace_swa_index_sentinels(
             _batch_token_span(swa_indices, token_start, token_end, launch_len).reshape(
                 1, launch_len, -1

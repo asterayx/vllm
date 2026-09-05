@@ -395,7 +395,7 @@ def sm12x_replace_negative_indices(
     pos = torch.arange(width, device=rows.device)
     last_pos = torch.where(valid, pos, pos.new_zeros(())).amax(dim=-1)
     last_slot = rows.gather(-1, last_pos.unsqueeze(-1)).squeeze(-1)
-    last_slot = torch.where(valid.any(dim=-1), last_slot, last_slot.new_zeros(()))
+    last_slot = last_slot.clamp(min=0)
     filled = torch.where(valid, rows, last_slot.unsqueeze(-1))
     return filled.reshape(indices.shape)
 
