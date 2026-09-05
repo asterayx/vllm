@@ -227,12 +227,14 @@ def test_fused_post_conv_l0():
         pytest.param(4, (8,), torch.bfloat16, torch.float32, id="tp4-max"),
     ],
 )
+@pytest.mark.parametrize("output_gate_activation", ["silu", "sigmoid"])
 @torch.inference_mode()
 def test_fused_gdn_decode_post_conv_mtp_ratio8(
     tp_size: int,
     query_lengths: tuple[int, ...],
     state_dtype: torch.dtype,
     norm_dtype: torch.dtype,
+    output_gate_activation: str,
 ) -> None:
     if torch.cuda.get_device_capability() < (8, 0):
         pytest.skip("fused GDN decode MTP requires compute capability 8.0+")
@@ -316,7 +318,7 @@ def test_fused_gdn_decode_post_conv_mtp_ratio8(
             z=output_gate,
             eps=eps,
             norm_before_gate=True,
-            activation="silu",
+            activation=output_gate_activation,
         )
         actual = ops.fused_gdn_decode_post_conv_mtp(
             mixed_qkv=mixed_qkv,
@@ -333,6 +335,7 @@ def test_fused_gdn_decode_post_conv_mtp_ratio8(
             out=torch.empty_like(output_gate),
             scale=scale,
             norm_eps=eps,
+            output_gate_activation=output_gate_activation,
         )
 
         output_error = (actual.float() - expected.float()).norm()
