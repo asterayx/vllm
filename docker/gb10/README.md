@@ -428,49 +428,69 @@ Confirm in the Cloudflare dashboard: `token.asterayx.com` → CNAME →
 If the tunnel **already exists**, skip `create` / `route dns` and only
 edit ingress.
 
-### 3. `~/.cloudflared/config.yml`
+### 3. Config for the **systemd** unit (`/etc/cloudflared`)
+
+`sudo cloudflared service install` does **not** read `$HOME/.cloudflared`.
+`sudo` makes `~` `/root`, so it looks in `/root/.cloudflared` and
+`/etc/cloudflared`. Login / `tunnel create` still write the JSON under
+the user home; copy that into `/etc/cloudflared` before `service install`.
 
 `/dash` **must** be listed **above** any catch-all `/`. Origin is
 `http://127.0.0.1:3000` — **not** `http://127.0.0.1:3000/dash`
 (that would become `/dash/dash`).
+
+Helper (preferred):
+
+```bash
+# TUNNEL_ID from: cloudflared tunnel list
+# HOSTNAME default in the script is token.asteraix.com
+cd examples/observability/dual_node/cloudflared
+chmod +x install-service.sh
+TUNNEL_ID=PASTE-UUID-HERE \
+  CLOUDFLARED_HOSTNAME=token.asteraix.com \
+  ./install-service.sh
+```
+
+Or by hand:
+
+```bash
+sudo mkdir -p /etc/cloudflared
+sudo cp -f "${HOME}/.cloudflared/${TUNNEL_ID}.json" \
+  "/etc/cloudflared/${TUNNEL_ID}.json"
+sudo tee /etc/cloudflared/config.yml >/dev/null <<EOF
+tunnel: ${TUNNEL_ID}
+credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
+
+ingress:
+  - hostname: token.asteraix.com
+    path: /dash(/.*)?
+    service: http://127.0.0.1:3000
+    originRequest:
+      httpHostHeader: token.asteraix.com
+      disableChunkedEncoding: true
+
+  - service: http_status:404
+EOF
+sudo cloudflared --config /etc/cloudflared/config.yml service install
+sudo systemctl enable --now cloudflared
+```
 
 Full template:
 [`examples/observability/dual_node/cloudflared/config.yml.example`](../../examples/observability/dual_node/cloudflared/config.yml.example).
 Ingress snippet only:
 [`dash-ingress.yml`](../../examples/observability/dual_node/cloudflared/dash-ingress.yml).
 
-```yaml
-tunnel: TUNNEL_ID
-credentials-file: /home/roccen/.cloudflared/TUNNEL_ID.json
-
-ingress:
-  - hostname: token.asterayx.com
-    path: /dash(/.*)?
-    service: http://127.0.0.1:3000
-    originRequest:
-      httpHostHeader: token.asterayx.com
-      disableChunkedEncoding: true
-
-  # optional: whatever you already publish on `/` (not Grafana)
-  # - hostname: token.asterayx.com
-  #   service: http://127.0.0.1:REPLACE_ROOT_PORT
-
-  - service: http_status:404
-```
-
 Delete any leftover `/telemetry` rule.
 
 ### 4. systemd
 
 ```bash
-sudo cloudflared service install
-sudo systemctl enable --now cloudflared
 sudo systemctl status cloudflared --no-pager
-# after editing config.yml:
+# after editing /etc/cloudflared/config.yml:
 sudo systemctl restart cloudflared
 ```
 
-Foreground debug: `cloudflared tunnel run spark-obs`.
+Foreground debug: `cloudflared --config /etc/cloudflared/config.yml tunnel run`.
 
 ### 5. Tell Grafana it lives under `/dash`
 
@@ -478,8 +498,8 @@ In `examples/observability/dual_node/config.env`:
 
 ```bash
 GRAFANA_BIND=127.0.0.1
-GRAFANA_DOMAIN=token.asterayx.com
-GRAFANA_ROOT_URL=https://token.asterayx.com/dash/
+GRAFANA_DOMAIN=token.asteraix.com
+GRAFANA_ROOT_URL=https://token.asteraix.com/dash/
 GRAFANA_SERVE_FROM_SUB_PATH=true
 ```
 
@@ -491,7 +511,7 @@ cd examples/observability/dual_node
 ./deploy.sh up
 ```
 
-Login: `https://token.asterayx.com/dash` with `admin` / `admin`.
+Login: `https://token.asteraix.com/dash` with `admin` / `admin`.
 **Change that password**; the URL is on the public internet.
 
 ## Verify
@@ -513,7 +533,7 @@ curl -fsS http://127.0.0.1:3000/dash/api/health   # after sub-path is on
 
 # tunnel
 cloudflared tunnel info spark-obs
-curl -fsSI https://token.asterayx.com/dash | head
+curl -fsSI https://token.asteraix.com/dash | head
 ```
 
 ## Scripts

@@ -1,23 +1,24 @@
-# Merge into ~/.cloudflared/config.yml on Spark-1 (192.168.100.10).
+# Install to /etc/cloudflared/config.yml (systemd). sudo service install
+# does not read $HOME/.cloudflared — use ./install-service.sh.
 # /dash MUST be listed before the catch-all `/` rule.
 #
 # Fill TUNNEL_ID from: cloudflared tunnel list
 # Grafana is the only observability path. Do not add /telemetry.
 #
-# Hostname is token.asterayx.com (you also wrote asteryax.com; it must
-# match the Cloudflare DNS CNAME for this tunnel).
+# Public host for this pair is token.asteraix.com (must match the
+# Cloudflare DNS CNAME for this tunnel).
 
 tunnel: TUNNEL_ID
-credentials-file: /home/YOUR_USER/.cloudflared/TUNNEL_ID.json
+credentials-file: /etc/cloudflared/TUNNEL_ID.json
 
 ingress:
   # Grafana on loopback. Do not put /dash on the service URL — the
   # public path is forwarded as-is (…/dash → 127.0.0.1:3000/dash).
-  - hostname: token.asterayx.com
+  - hostname: token.asteraix.com
     path: /dash(/.*)?
     service: http://127.0.0.1:3000
     originRequest:
-      httpHostHeader: token.asterayx.com
+      httpHostHeader: token.asteraix.com
       disableChunkedEncoding: true
 
   # Optional catch-all for whatever else you already publish on `/`.

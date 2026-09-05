@@ -83,16 +83,17 @@ systemd) is in
 [`docker/gb10/README.md`](../../../docker/gb10/README.md#cloudflare-tunnel-create-and-dash).
 This section is the Grafana `/dash` ingress only.
 
-On the head (`192.168.100.10`), publish Grafana at
-`https://token.asterayx.com/dash`. This is the only observability
-path; do not keep a `/telemetry` ingress.
+On the head, publish Grafana at `https://token.asteraix.com/dash`.
+This is the only observability path; do not keep a `/telemetry`
+ingress. `sudo cloudflared service install` reads `/etc/cloudflared`,
+not `$HOME/.cloudflared` — use
+[`cloudflared/install-service.sh`](cloudflared/install-service.sh).
 
-1. Add these lines to `config.env` (hostname must match DNS; if the
-   live name is `token.asteryax.com`, use that everywhere):
+1. Add these lines to `config.env` (hostname must match DNS):
 
    ```bash
-   GRAFANA_DOMAIN=token.asterayx.com
-   GRAFANA_ROOT_URL=https://token.asterayx.com/dash/
+   GRAFANA_DOMAIN=token.asteraix.com
+   GRAFANA_ROOT_URL=https://token.asteraix.com/dash/
    GRAFANA_SERVE_FROM_SUB_PATH=true
    ```
 
@@ -102,21 +103,17 @@ path; do not keep a `/telemetry` ingress.
    ./deploy.sh up
    ```
 
-3. Insert the `/dash` ingress rule **above** the catch-all `/` in
-   `~/.cloudflared/config.yml`, and delete any leftover `/telemetry`
-   rule. Copy
-   [`cloudflared/dash-ingress.yml`](cloudflared/dash-ingress.yml).
-   A full template is
-   [`cloudflared/config.yml.example`](cloudflared/config.yml.example).
+3. Install the systemd unit from `/etc/cloudflared/config.yml`
+   (`./cloudflared/install-service.sh`). Delete any leftover
+   `/telemetry` rule.
 
-4. Restart the tunnel (`sudo systemctl restart cloudflared` or
-   `cloudflared tunnel run`).
+4. Restart the tunnel (`sudo systemctl restart cloudflared`).
 
 Cloudflare **URL** must be `http://127.0.0.1:3000` with Path `dash`.
 Do not set the origin to `http://127.0.0.1:3000/dash` — the public
 path is already forwarded, and you would get `/dash/dash`.
 
-Login at `https://token.asterayx.com/dash` with `admin` / `admin`.
+Login at `https://token.asteraix.com/dash` with `admin` / `admin`.
 Change that password; this URL is on the public internet.
 
 ## Spark-2 / worker
