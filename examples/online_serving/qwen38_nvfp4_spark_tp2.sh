@@ -35,6 +35,9 @@ fi
 args=(
     "$model"
     --served-model-name qwen38-nvfp4
+    --enable-auto-tool-choice
+    --tool-call-parser qwen3_coder
+    --reasoning-parser qwen3
     --tensor-parallel-size 2
     --distributed-executor-backend mp
     --nnodes 2

@@ -74,8 +74,23 @@ bash examples/online_serving/qwen38_nvfp4_spark_tp2.sh 0
 
 The script defaults to `enp1s0f1np1`, rendezvous port `29529`, and an API on
 `127.0.0.1:18029`. Override `NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`,
-`MASTER_PORT`, `API_HOST`, or `API_PORT` as needed. Caches stay inside this
-worktree. The configuration uses eager execution, 512K context,
+`MASTER_PORT`, `API_HOST`, or `API_PORT` as needed.
+
+Automatic tool choice uses `--enable-auto-tool-choice` and
+`--tool-call-parser qwen3_coder`, matching the checkpoint's XML function-call
+format. `--reasoning-parser qwen3` separates thinking from content and tools.
+For thinking-enabled requests, the checkpoint template accepts reasoning
+effort `low`, `medium`, or `xhigh`; `none` disables thinking through vLLM.
+Do not select `high`, which this checkpoint's template rejects.
+
+Serving verification covered automatic Chat Completions tool selection with
+thinking disabled, a tool-result follow-up, streamed tool selection with low
+reasoning effort, and streamed Responses function calls. All returned the
+expected function and valid JSON arguments; reasoning aliases matched in the
+stream. The public Chat Completions endpoint also returned HTTP 200 with
+`finish_reason="tool_calls"` for `tool_choice="auto"`.
+
+Caches stay inside this worktree. The configuration uses eager execution, 512K context,
 2048 batched tokens, four concurrent sequences, and a fixed 16 GiB KV cache per
 GPU. The explicit cache budget takes precedence over the memory-utilization
 fraction for KV allocation. Spark shares GPU and system memory; leaving the
