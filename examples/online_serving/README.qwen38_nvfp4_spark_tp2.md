@@ -100,6 +100,13 @@ reported approximately 61.73 GiB of model memory per GPU. Serving initialization
 generation, and model evaluation are still pending; weight loading alone does
 not establish Spark serving support.
 
+On the worker GB10, the existing `test_flashinfer_fp4_moe_no_graph` reference
+check passed for the checkpoint's TP2 expert shape: `n=320`, `k=2560`,
+`e=512`, `topk=10`, BF16 input and SiLU activation, with both `m=1` and
+`m=16`. This validates individual FlashInfer CUTLASS NVFP4 expert computations,
+not end-to-end model outputs. Full serving verification is blocked while the
+head's SSH service is unresponsive.
+
 The broader local `test_config.py` run passed six tests but could not import the
 MTP model for one test because the macOS environment lacks `torchvision`.
 
