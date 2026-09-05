@@ -6,25 +6,28 @@
 use serde_json::Value;
 
 /// Recursively copy `reasoning` → `reasoning_content` when the latter is absent.
-pub fn alias(value: &mut Value) {
+pub fn alias(value: &mut Value) -> bool {
+    let mut changed = false;
     match value {
         Value::Object(map) => {
+            for child in map.values_mut() {
+                changed |= alias(child);
+            }
             if map.contains_key("reasoning") && !map.contains_key("reasoning_content") {
                 if let Some(reasoning) = map.get("reasoning").cloned() {
                     map.insert("reasoning_content".to_string(), reasoning);
+                    changed = true;
                 }
-            }
-            for child in map.values_mut() {
-                alias(child);
             }
         }
         Value::Array(items) => {
             for item in items {
-                alias(item);
+                changed |= alias(item);
             }
         }
         _ => {}
     }
+    changed
 }
 
 /// Rewrite one SSE line. Non-`data:` lines are unchanged.
@@ -38,8 +41,11 @@ pub fn rewrite_sse_line(line: &str) -> String {
     }
     match serde_json::from_str::<Value>(payload) {
         Ok(mut obj) => {
-            alias(&mut obj);
-            format!("data: {obj}")
+            if alias(&mut obj) {
+                format!("data: {obj}")
+            } else {
+                line.to_string()
+            }
         }
         Err(_) => line.to_string(),
     }
@@ -49,8 +55,11 @@ pub fn rewrite_sse_line(line: &str) -> String {
 pub fn alias_json_bytes(data: &[u8]) -> Vec<u8> {
     match serde_json::from_slice::<Value>(data) {
         Ok(mut obj) => {
-            alias(&mut obj);
-            serde_json::to_vec(&obj).unwrap_or_else(|_| data.to_vec())
+            if alias(&mut obj) {
+                serde_json::to_vec(&obj).unwrap_or_else(|_| data.to_vec())
+            } else {
+                data.to_vec()
+            }
         }
         Err(_) => data.to_vec(),
     }
@@ -58,19 +67,22 @@ pub fn alias_json_bytes(data: &[u8]) -> Vec<u8> {
 
 /// Split a chunk stream into SSE lines, rewriting each `data:` payload.
 pub fn rewrite_sse_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
+    let scan_start = pending.len();
     pending.extend_from_slice(chunk);
-    let mut out = String::with_capacity(pending.len() + 32);
-    while let Some(idx) = pending.iter().position(|&byte| byte == b'\n') {
-        let bytes: Vec<u8> = pending.drain(..=idx).collect();
-        let mut line = String::from_utf8_lossy(&bytes).into_owned();
-        if line.ends_with('\n') {
-            line.pop();
+    let mut out = String::new();
+    let mut line_start = 0;
+    for (offset, &byte) in pending[scan_start..].iter().enumerate() {
+        if byte != b'\n' {
+            continue;
         }
-        if line.ends_with('\r') {
-            line.pop();
-        }
-        out.push_str(&rewrite_sse_line(&line));
+        let line_end = scan_start + offset;
+        let line = String::from_utf8_lossy(&pending[line_start..line_end]);
+        out.push_str(&rewrite_sse_line(line.strip_suffix('\r').unwrap_or(&line)));
         out.push('\n');
+        line_start = line_end + 1;
+    }
+    if line_start > 0 {
+        pending.drain(..line_start);
     }
     out
 }
@@ -93,6 +105,32 @@ mod tests {
         let mut v = json!({"reasoning":"new","reasoning_content":"keep"});
         alias(&mut v);
         assert_eq!(v["reasoning_content"], "keep");
+    }
+
+    #[test]
+    fn unchanged_payload_preserves_formatting() {
+        let body = br#"{ "choices": [{"delta": {"content": "hello"}}] }"#;
+        assert_eq!(alias_json_bytes(body), body);
+        let line = format!("data: {}", std::str::from_utf8(body).unwrap());
+        assert_eq!(rewrite_sse_line(&line), line);
+    }
+
+    #[test]
+    fn long_fragmented_lines_match_complete_stream() {
+        let input = format!(
+            "data: {{\"reasoning\":\"{}\"}}\n\ndata: [DONE]\n",
+            "图".repeat(4096)
+        );
+        let expected = rewrite_sse_chunk(&mut Vec::new(), input.as_bytes());
+        for size in [1, 7, 1024, input.len()] {
+            let mut pending = Vec::new();
+            let mut output = String::new();
+            for chunk in input.as_bytes().chunks(size) {
+                output.push_str(&rewrite_sse_chunk(&mut pending, chunk));
+            }
+            assert_eq!(output, expected);
+            assert!(pending.is_empty());
+        }
     }
 
     #[test]
