@@ -44,7 +44,6 @@ from vllm.multimodal.processing import (
 )
 from vllm.multimodal.processing.processor import (
     MultiModalPromptUpdates,
-    MultiModalPromptUpdatesApplyResult,
     PlaceholderFeaturesInfo,
     UpdateMode,
     _plan_prompt_updates,
@@ -476,13 +475,12 @@ class DeepseekV4VLMultiModalProcessor(
             ),
         ]
 
-    def _apply_token_matches_with_placeholders(
+    def _apply_prompt_updates(
         self,
         token_ids: list[int],
         mm_prompt_updates: MultiModalPromptUpdates,
     ) -> tuple[
         list[int],
-        MultiModalPromptUpdatesApplyResult,
         Mapping[str, list[PlaceholderFeaturesInfo]],
     ]:
         # Same as the base implementation, except that each image block gets
@@ -490,7 +488,12 @@ class DeepseekV4VLMultiModalProcessor(
         # sentinels) prepended while splicing: the pad depends on the block's
         # final position in the prompt, which is unknown when the (cacheable)
         # prompt updates are built.
-        matched_updates, result = _plan_prompt_updates(token_ids, mm_prompt_updates)
+        tokenizer = self.info.get_tokenizer()
+        matched_updates, result = _plan_prompt_updates(
+            token_ids, mm_prompt_updates, tokenizer
+        )
+        if any(index is None for indices in result.values() for index in indices):
+            raise ValueError("Could not find every DeepSeek V4 image placeholder")
         placeholders: dict[str, list[PlaceholderFeaturesInfo]] = {
             modality: [] for modality in mm_prompt_updates
         }
@@ -521,7 +524,9 @@ class DeepseekV4VLMultiModalProcessor(
             if tokens:
                 content_is_embed = update.content.is_embed
                 is_embed = (
-                    content_is_embed(tokens) if content_is_embed is not None else None
+                    content_is_embed(tokenizer, tokens)
+                    if content_is_embed is not None
+                    else None
                 )
                 placeholders[update.modality].append(
                     PlaceholderFeaturesInfo(
@@ -537,4 +542,4 @@ class DeepseekV4VLMultiModalProcessor(
             prev_end_idx = match.end_idx
 
         new_token_ids.extend(token_ids[prev_end_idx:])
-        return new_token_ids, result, placeholders
+        return new_token_ids, placeholders

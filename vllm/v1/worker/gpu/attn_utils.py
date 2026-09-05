@@ -688,11 +688,16 @@ def compute_mm_prefix_ranges(
     req_ids: list[str],
     mm_features: dict[str, list[MultiModalFeatureSpec]],
     sliding_window: int | None = None,
+    *,
+    span_leading_pad_modulus: int = 0,
+    clamp_sliding_window: bool = False,
 ) -> dict[int, list[tuple[int, int]]]:
     """Compute PrefixLM bidirectional ranges for multimodal tokens.
 
-    Ranges exceeding sliding_window are skipped to prevent early tokens
-    from attending across the entire image span.
+    Ranges exceeding sliding_window are skipped, except for models that
+    explicitly support sentinel-bracketed images wider than the window.
+    For those models, span_leading_pad_modulus excludes leading alignment pads
+    from the full placeholder span.
     """
     req_doc_ranges: dict[int, list[tuple[int, int]]] = {}
     for req_idx, req_id in enumerate(req_ids):
@@ -700,8 +705,24 @@ def compute_mm_prefix_ranges(
         for mm_feature in mm_features.get(req_id, ()):
             if mm_feature.modality not in ("image", "video"):
                 continue
-            for r in mm_feature.mm_position.extract_embeds_range():
-                if sliding_window is not None and (r[1] - r[0] + 1) > sliding_window:
+            if span_leading_pad_modulus:
+                position = mm_feature.mm_position
+                pad = (
+                    span_leading_pad_modulus
+                    - 1
+                    - position.offset % span_leading_pad_modulus
+                )
+                ranges = [
+                    (position.offset + pad, position.offset + position.length - 1)
+                ]
+            else:
+                ranges = mm_feature.mm_position.extract_embeds_range()
+            for r in ranges:
+                if (
+                    not clamp_sliding_window
+                    and sliding_window is not None
+                    and (r[1] - r[0] + 1) > sliding_window
+                ):
                     continue
                 image_doc_ranges.append(r)
         req_doc_ranges[req_idx] = image_doc_ranges

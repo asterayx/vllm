@@ -7,6 +7,7 @@ reference implementation (``image_processor.py`` from the HF repo)."""
 import importlib.util
 import io
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -28,7 +29,10 @@ from vllm.multimodal.parse import MultiModalDataParser
 from vllm.multimodal.processing import PromptReplacement, PromptUpdateDetails
 from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
-REF_IMAGE_PROCESSOR_PATH = "/tmp/dsv4vis/image_processor.py"
+REF_IMAGE_PROCESSOR_PATH = (
+    Path(os.environ.get("VLLM_TEST_DSV4_REFERENCE_DIR", "/tmp/dsv4vis"))
+    / "image_processor.py"
+)
 
 
 def _load_reference_image_processor():
@@ -41,7 +45,7 @@ def _load_reference_image_processor():
     return module
 
 
-pytestmark = pytest.mark.skipif(
+requires_reference = pytest.mark.skipif(
     not os.path.exists(REF_IMAGE_PROCESSOR_PATH),
     reason="reference image_processor.py not available",
 )
@@ -88,6 +92,7 @@ def _run(fn, *args):
         for w in (14, 30, 42, 100, 512, 756)
     ],
 )
+@requires_reference
 def test_grid_tokens_parity(height: int, width: int):
     expected = ref.grid_tokens(height, width, PATCH_SIZE, DOWNSAMPLE_RATIO)
     actual = ours.grid_tokens(height, width, PATCH_SIZE, DOWNSAMPLE_RATIO)
@@ -98,6 +103,7 @@ def test_grid_tokens_parity(height: int, width: int):
 @pytest.mark.parametrize(
     "height,width", [(50, 3000), (3000, 50), (137, 400), (756, 756), (100, 100)]
 )
+@requires_reference
 def test_solve_resize_ratio_parity(height: int, width: int, max_n_token: int):
     expected = _run(
         ref.solve_resize_ratio,
@@ -122,6 +128,7 @@ def test_solve_resize_ratio_parity(height: int, width: int, max_n_token: int):
 @pytest.mark.parametrize(
     "height,width", [(50, 3000), (3000, 50), (137, 400), (756, 756)]
 )
+@requires_reference
 def test_safe_resize_parity(height: int, width: int, max_n_token: int):
     best_h = -(-height // PATCH_SIZE) * PATCH_SIZE
     best_w = -(-width // PATCH_SIZE) * PATCH_SIZE
@@ -138,6 +145,7 @@ def test_safe_resize_parity(height: int, width: int, max_n_token: int):
 @pytest.mark.parametrize(
     "n_llm_h,n_llm_w", [(h, w) for h in range(1, 9) for w in range(1, 9)]
 )
+@requires_reference
 def test_build_image_block_parity(n_llm_h: int, n_llm_w: int, start_pos: int):
     ref_types, ref_perm = ref.build_image_block(n_llm_h, n_llm_w, start_pos)
     types, perm = ours.build_image_block(n_llm_h, n_llm_w, start_pos)
@@ -149,6 +157,7 @@ def test_build_image_block_parity(n_llm_h: int, n_llm_w: int, start_pos: int):
     "width,height",
     [(800, 600), (100, 2000), (2000, 100), (50, 50), (13, 7), (384, 384)],
 )
+@requires_reference
 def test_load_image_parity(width: int, height: int):
     rng = np.random.default_rng(width * 10000 + height)
     array = rng.integers(0, 256, (height, width, 3), dtype=np.uint8)
@@ -167,6 +176,7 @@ def test_load_image_parity(width: int, height: int):
 
 @pytest.mark.parametrize("start_pos", range(8))
 @pytest.mark.parametrize("n_llm_h,n_llm_w", [(1, 1), (2, 3), (3, 2), (5, 4)])
+@requires_reference
 def test_block_semantics(n_llm_h: int, n_llm_w: int, start_pos: int):
     types, perm = ours.build_image_block(n_llm_h, n_llm_w, start_pos)
 
@@ -204,6 +214,7 @@ def test_pad_free_block(n_llm_h: int, n_llm_w: int):
     assert types[0] == IMAGE_START and types[-1] == IMAGE_END
 
 
+@requires_reference
 def test_processor_output():
     config = DeepseekV4Config(vocab_size=129280)
     processor = DeepseekV4VLProcessor(config)
@@ -250,7 +261,11 @@ class _StubInfo:
     def get_data_parser(self):
         return MultiModalDataParser()
 
+    def get_tokenizer(self):
+        return None
 
+
+@requires_reference
 def test_apply_token_matches_adds_compress_pad():
     base = ours.IMAGE_SENTINEL_BASE_ID
     image_token_id = 7
@@ -268,10 +283,9 @@ def test_apply_token_matches_adds_compress_pad():
     prompt = [11, 12, image_token_id, 13, 14, 15, image_token_id, 16]
     mm_prompt_updates = {"image": [[update.resolve(0)], [update.resolve(1)]]}
 
-    new_token_ids, match_result, placeholders = (
-        processor._apply_token_matches_with_placeholders(prompt, mm_prompt_updates)
+    new_token_ids, placeholders = processor._apply_prompt_updates(
+        prompt, mm_prompt_updates
     )
-    assert match_result == {"image": [0, 0]}
 
     # Reference construction: pads computed from the final position of each
     # block via ``build_image_block``'s ``start_pos``.

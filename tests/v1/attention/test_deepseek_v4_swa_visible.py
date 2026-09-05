@@ -34,6 +34,47 @@ WIDTH = WINDOW + MAX_IMG
 BLOCK_SIZE = 64
 
 
+@pytest.mark.parametrize("offset", range(4))
+def test_image_prefix_range_includes_newlines_and_excludes_alignment_pad(offset):
+    """A real N-layout image remains one span even when wider than SWA."""
+    from vllm.models.deepseek_v4.common.mm_preprocess import (
+        COMPRESS_PAD_TO,
+        IMAGE,
+        IMAGE_START,
+        build_image_block,
+    )
+    from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+    from vllm.v1.worker.gpu.attn_utils import compute_mm_prefix_ranges
+
+    types, _ = build_image_block(8, 16, offset)
+    position = PlaceholderRange(
+        offset=offset, length=len(types), is_embed=types == IMAGE
+    )
+    features = {
+        "image": [
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="test",
+                mm_position=position,
+            )
+        ]
+    }
+    ranges = compute_mm_prefix_ranges(
+        ["text", "image"],
+        features,
+        sliding_window=128,
+        span_leading_pad_modulus=COMPRESS_PAD_TO,
+        clamp_sliding_window=True,
+    )
+    start = offset + types.tolist().index(IMAGE_START)
+    assert ranges == {0: [], 1: [(start, offset + len(types) - 1)]}
+    assert ranges[1][0][1] - start + 1 > 128
+    assert compute_mm_prefix_ranges(["image"], features, 128)[0] == (
+        position.extract_embeds_range()
+    )
+
+
 def ref_left_right(
     seq_lens: list[int],
     query_lens: list[int],
