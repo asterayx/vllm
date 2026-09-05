@@ -85,6 +85,7 @@ load_config() {
   : "${SPARK1_NODE_EXPORTER:=127.0.0.1:9100}"
   : "${SPARK2_LABEL:=spark-2}"
   : "${SPARK2_NODE_EXPORTER:=}"
+  : "${SPARK2_SSH:=}"
   : "${ROCE_DEVICE_REGEX:=rocep1s0f1|roceP2p1s0f1}"
   GRAFANA_ROOT_URL="$(_strip_md_url "$GRAFANA_ROOT_URL")"
   GRAFANA_DOMAIN="$(_strip_md_url "$GRAFANA_DOMAIN")"
