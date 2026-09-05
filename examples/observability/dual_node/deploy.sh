@@ -100,7 +100,8 @@ cmd_init() {
   fi
   cp "$ROOT/config.env.example" "$ROOT/config.env"
   log "Wrote $ROOT/config.env"
-  log "Set SPARK2_NODE_EXPORTER to Spark-2's Wi-Fi IP:9100, then continue."
+  log "Head: Grafana/Prometheus/node_exporter on 127.0.0.1 (cloudflared)."
+  log "Worker: set NODE_EXPORTER_LISTEN to the RoCE IP:9100 (192.168.101.13)."
 }
 
 cmd_check() {
@@ -135,9 +136,18 @@ cmd_check() {
     warn "RoCE devices missing on this machine. Dashboards will be empty until node_exporter sees them."
   fi
 
+  if [[ "${GRAFANA_BIND}" != "127.0.0.1" && "${GRAFANA_BIND}" != "localhost" ]]; then
+    warn "GRAFANA_BIND=${GRAFANA_BIND} is not loopback; cloudflared expects 127.0.0.1:3000"
+  fi
+  if [[ "${PROMETHEUS_LISTEN}" != 127.0.0.1:* && "${PROMETHEUS_LISTEN}" != localhost:* ]]; then
+    warn "PROMETHEUS_LISTEN=${PROMETHEUS_LISTEN} is not loopback"
+  fi
+
   if [[ -z "${SPARK2_NODE_EXPORTER}" ]]; then
     warn "SPARK2_NODE_EXPORTER is empty — Prometheus will scrape only this node."
-    warn "On Spark-2 run: ip -br addr   then put <wifi>:9100 in config.env"
+    warn "On Spark-2 bind node_exporter to the RoCE IP, e.g. 192.168.101.13:9100"
+  elif [[ "${SPARK2_NODE_EXPORTER}" == 192.168.8.* ]]; then
+    warn "SPARK2_NODE_EXPORTER=${SPARK2_NODE_EXPORTER} looks like Wi-Fi; scrape over RoCE"
   fi
 
   if curl -fsS --max-time 2 "http://${VLLM_METRICS_TARGET}/metrics" >/dev/null 2>&1; then
@@ -361,27 +371,29 @@ cmd_status() {
 cmd_remote() {
   load_config
   cat <<EOF
-On Spark-2 (worker), install only node_exporter:
+On Spark-2 (worker), install only node_exporter. Bind the RoCE IP
+so the head scrapes over the QSFP DAC (not Wi-Fi):
 
   1. Copy this directory (or just deploy.sh + config.env):
-       scp -r $ROOT <user>@<spark2>:vllm-obs/
+       scp -r $ROOT ${SPARK2_SSH:-<user>@192.168.101.13}:vllm-obs/
 
-  2. On Spark-2, set NODE_EXPORTER_LISTEN to THAT machine's Wi-Fi IP:
-       NODE_EXPORTER_LISTEN=<spark2-wifi>:9100
+  2. On Spark-2, set NODE_EXPORTER_LISTEN to THAT machine's RoCE IP:
+       NODE_EXPORTER_LISTEN=192.168.101.13:9100
 
   3. Run:
        cd vllm-obs && ./deploy.sh install-node-exporter
 
   4. Back on Spark-1, put the same address in config.env:
-       SPARK2_NODE_EXPORTER=<spark2-wifi>:9100
+       SPARK2_NODE_EXPORTER=192.168.101.13:9100
      then:
        ./deploy.sh generate && ./deploy.sh up
 
-Do not start Prometheus/Grafana on Spark-2.
+Do not start Prometheus/Grafana/cloudflared on Spark-2.
+Those listen on 127.0.0.1 on the head; cloudflared publishes Grafana.
 Prefer docker/gb10/run.sh or run-vision.sh (metrics on head :30001).
 If you set NCCL yourself:
-  export VLLM_HOST_IP=192.168.100.x          # QSFP .100 address
-  export NCCL_SOCKET_IFNAME=enp1s0f1np1
+  export VLLM_HOST_IP=192.168.101.12         # .13 on Spark-2
+  export NCCL_SOCKET_IFNAME=enP2p1s0f1np1
   export NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1
 EOF
 }

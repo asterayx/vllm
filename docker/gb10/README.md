@@ -70,20 +70,21 @@ Default pair used by the scripts and
 
 | Interface | Address | Role |
 | --- | --- | --- |
-| `enp1s0f1np1` / `rocep1s0f1` | `192.168.100.10` / `.11` | RoCE rail 0, `VLLM_HOST_IP` |
-| `enP2p1s0f1np1` / `roceP2p1s0f1` | `192.168.101.10` / `.11` | RoCE rail 1 |
-| Wi-Fi (example `wlP9s9`) | `192.168.8.134` | Grafana / `node_exporter` / LAN clients |
+| `enP2p1s0f1np1` / `roceP2p1s0f1` | `192.168.101.12` / `.13` | RoCE rail 1, `VLLM_HOST_IP` + node scrape |
+| `enp1s0f1np1` / `rocep1s0f1` | (rail 0, if up) | extra IB HCA |
+| Wi-Fi | roaming | clients / SSH only — not Grafana, not scrape |
 
 `VLLM_HOST_IP` and NCCL stay on the **QSFP DAC**. Do not point them at
-Wi-Fi or `tun0`.
+Wi-Fi or `tun0`. Grafana / Prometheus bind **127.0.0.1**; cloudflared
+publishes Grafana.
 
 | Port | Process | Bind |
 | --- | --- | --- |
 | **30001** | vLLM OpenAI + `/metrics` (head, rank 0) | `0.0.0.0` |
 | **30000** | `spark-compat-proxy` (`reasoning` → `reasoning_content`) | `0.0.0.0` |
-| **3000** | Grafana | `127.0.0.1` when cloudflared is local |
+| **3000** | Grafana | `127.0.0.1` (cloudflared origin) |
 | **9091** | Prometheus (9090 is often taken) | `127.0.0.1` |
-| **9100** | `node_exporter` | Wi-Fi IP, both nodes |
+| **9100** | `node_exporter` | head `127.0.0.1`; worker RoCE `192.168.101.13` |
 | **29500** | vLLM `--master-port` | RoCE |
 
 Clients (Codex / Grok / OpenCode) talk to **:30000**, not :30001.
@@ -329,8 +330,9 @@ Python `codex_proxy.py` is the prototype. Use the Rust binary.
 ## Prometheus + Grafana
 
 Local compose stack on the **head** only. Scrapes head `:30001/metrics`
-and `node_exporter` InfiniBand/RoCE on both machines. Host networking.
-Scrape traffic stays on Wi-Fi, not the 200 GbE DAC.
+locally and the worker `node_exporter` over **RoCE** (`192.168.101.13:9100`).
+Grafana / Prometheus / head `node_exporter` bind **127.0.0.1** so a
+roaming Wi-Fi address cannot break cloudflared.
 
 Needs Docker **Compose V2** (`docker compose version`).
 
@@ -339,12 +341,20 @@ cd examples/observability/dual_node
 ./deploy.sh init
 ```
 
-Edit `config.env` (quote `ROCE_DEVICE_REGEX` — it contains `|`):
+`config.env.example` is already this layout (quote `ROCE_DEVICE_REGEX`):
 
-1. `GRAFANA_BIND=127.0.0.1` when cloudflared is on this host.
-2. `NODE_EXPORTER_LISTEN` / `SPARK1_NODE_EXPORTER` = this Wi-Fi IP `:9100`.
-3. `VLLM_METRICS_TARGET=127.0.0.1:30001` (override if you set `VLLM_PORT`).
-4. Leave `SPARK2_NODE_EXPORTER` empty until the worker exporter is up.
+```bash
+GRAFANA_BIND=127.0.0.1
+GRAFANA_DOMAIN=token.asteraix.com
+GRAFANA_ROOT_URL=https://token.asteraix.com/dash/
+GRAFANA_SERVE_FROM_SUB_PATH=true
+PROMETHEUS_LISTEN=127.0.0.1:9091
+VLLM_METRICS_TARGET=127.0.0.1:30001
+NODE_EXPORTER_LISTEN=127.0.0.1:9100
+SPARK1_NODE_EXPORTER=127.0.0.1:9100
+SPARK2_NODE_EXPORTER=192.168.101.13:9100
+ROCE_DEVICE_REGEX='rocep1s0f1|roceP2p1s0f1'
+```
 
 ```bash
 ./deploy.sh check
@@ -355,16 +365,16 @@ Edit `config.env` (quote `ROCE_DEVICE_REGEX` — it contains `|`):
 # or, after config.env is filled: ./deploy.sh all
 ```
 
-Worker: **do not** start Prometheus/Grafana.
+Worker: **do not** start Prometheus/Grafana/cloudflared.
 
 ```bash
 # on head, prints the copy/install commands
 ./deploy.sh remote-node-exporter
 ```
 
-On Spark-2: set `NODE_EXPORTER_LISTEN=<spark2-wifi>:9100` in that node's
+On Spark-2: set `NODE_EXPORTER_LISTEN=192.168.101.13:9100` in that node's
 `config.env`, then `./deploy.sh install-node-exporter`. Back on the head,
-set `SPARK2_NODE_EXPORTER` to the same address and
+`SPARK2_NODE_EXPORTER` must be the same RoCE address, then
 `./deploy.sh generate && ./deploy.sh up`.
 
 `node_exporter` must run as **root** on Spark (`User=nobody` cannot read
@@ -381,8 +391,7 @@ Open `http://<GRAFANA_BIND>:3000` (default `admin` / `admin`). Folder
 Set RoCE refresh to 2s. Official Performance defaults to
 `granite-33-2b-instruct` — pick **All** or your served model.
 
-LAN-only (no tunnel): you may bind Grafana to the Wi-Fi IP instead of
-loopback. Do not bind `0.0.0.0` on a box that also has `tun0`.
+Do not bind Grafana to Wi-Fi. cloudflared originates at `127.0.0.1:3000`.
 
 ## Cloudflare Tunnel (create and /dash)
 
@@ -390,9 +399,9 @@ Publish Grafana at `https://<host>/dash` only. Do **not** add `/telemetry`.
 Do **not** put vLLM `:30001` or the compat proxy on the public internet
 unless you intend to; this section is Grafana-only.
 
-Hostname in the checked-in examples is `token.asterayx.com`. Replace it
+Hostname in the checked-in examples is `token.asteraix.com`. Replace it
 everywhere (DNS, `config.yml`, `GRAFANA_DOMAIN`, `GRAFANA_ROOT_URL`) if
-yours differs. A typo (`asteryax.com`) will 404.
+yours differs. A typo (`asterayx` / `asteryax`) will 404.
 
 ### 1. Install `cloudflared` (head, aarch64)
 
@@ -406,7 +415,7 @@ cloudflared --version
 ### 2. Login and create the tunnel (first time)
 
 ```bash
-# opens a browser / prints a URL; authorize the zone (asterayx.com)
+# opens a browser / prints a URL; authorize the zone (asteraix.com)
 cloudflared tunnel login
 
 # named tunnel; writes ~/.cloudflared/<TUNNEL_UUID>.json
@@ -419,10 +428,10 @@ Copy the UUID from `tunnel list`. That is `TUNNEL_ID` below.
 Point DNS at the tunnel (Cloudflare creates the CNAME):
 
 ```bash
-cloudflared tunnel route dns spark-obs token.asterayx.com
+cloudflared tunnel route dns spark-obs token.asteraix.com
 ```
 
-Confirm in the Cloudflare dashboard: `token.asterayx.com` → CNAME →
+Confirm in the Cloudflare dashboard: `token.asteraix.com` → CNAME →
 `<TUNNEL_ID>.cfargotunnel.com`, proxied.
 
 If the tunnel **already exists**, skip `create` / `route dns` and only

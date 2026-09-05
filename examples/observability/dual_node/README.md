@@ -18,8 +18,9 @@ Prometheus and Grafana on the head node, scrapes vLLM `/metrics` plus
   plugged QSFP (`rocep1s0f1` + `roceP2p1s0f1`)
 
 Prometheus and Grafana use host networking so they can reach vLLM and
-`node_exporter` on the host. Scrape traffic is intended to stay on the
-management / Wi-Fi NIC, not the 200 GbE DAC.
+`node_exporter` on the host. They bind **127.0.0.1**. cloudflared
+publishes Grafana. The head scrapes the worker `node_exporter` over
+**RoCE** (`192.168.101.13:9100`), not Wi-Fi.
 
 ## Prerequisites
 
@@ -32,9 +33,9 @@ Default `config.env.example` matches this layout:
 
 | Interface | Address | Role |
 | --- | --- | --- |
-| `enp1s0f1np1` / `rocep1s0f1` | `192.168.100.10` | RoCE rail 0, `VLLM_HOST_IP` |
-| `enP2p1s0f1np1` / `roceP2p1s0f1` | `192.168.101.10` | RoCE rail 1 |
-| `wlP9s9` | `192.168.8.134` | Grafana + node_exporter listen |
+| `enP2p1s0f1np1` / `roceP2p1s0f1` | `192.168.101.12` / `.13` | RoCE, `VLLM_HOST_IP`, worker `:9100` |
+| loopback | `127.0.0.1` | Grafana `:3000`, Prometheus `:9091`, head `:9100` |
+| Wi-Fi | roaming | SSH / LAN clients only |
 
 ## Step-by-step (Spark-1 / head)
 
@@ -44,15 +45,15 @@ chmod +x deploy.sh
 ./deploy.sh init
 ```
 
-Edit `config.env` (quote `ROCE_DEVICE_REGEX` — it contains `|`):
+Edit `config.env` (quote `ROCE_DEVICE_REGEX` — it contains `|`).
+The example is already loopback + RoCE scrape:
 
-1. Set `GRAFANA_BIND` and `NODE_EXPORTER_LISTEN` / `SPARK1_NODE_EXPORTER`
-   to this machine's Wi-Fi IP (`ip -br addr`).
-2. Set `SPARK2_NODE_EXPORTER=<spark2-wifi>:9100` after Spark-2 has
-   `node_exporter`. Leave it empty to bring the stack up on Spark-1 only.
+1. Keep `GRAFANA_BIND=127.0.0.1` and
+   `NODE_EXPORTER_LISTEN` / `SPARK1_NODE_EXPORTER=127.0.0.1:9100`.
+2. Set `SPARK2_NODE_EXPORTER=192.168.101.13:9100` after Spark-2 has
+   `node_exporter` on that RoCE address.
 3. Keep `VLLM_METRICS_TARGET=127.0.0.1:30001` when using
-   `docker/gb10/run.sh` or `docker/gb10/run-vision.sh` (their default
-   `VLLM_PORT`). Override if you set `VLLM_PORT`.
+   `docker/gb10/run.sh` or `docker/gb10/run-vision.sh`.
 
 ```bash
 ./deploy.sh check
@@ -128,11 +129,11 @@ On Spark-2:
 
 ```bash
 # after copying this directory
-# set NODE_EXPORTER_LISTEN to Spark-2's Wi-Fi IP in config.env
+# NODE_EXPORTER_LISTEN=192.168.101.13:9100
 ./deploy.sh install-node-exporter
 ```
 
-Then on Spark-1 put that address in `SPARK2_NODE_EXPORTER` and run
+Then on Spark-1 keep `SPARK2_NODE_EXPORTER=192.168.101.13:9100` and run
 `./deploy.sh generate && ./deploy.sh up`.
 
 ## vLLM / NCCL (both nodes)
@@ -148,7 +149,7 @@ NODE_RANK=0 ./docker/gb10/run.sh
 NODE_RANK=0 ./docker/gb10/run-vision.sh
 
 # Worker
-NODE_RANK=1 VLLM_HOST_IP=192.168.100.11 HEADLESS=--headless \
+NODE_RANK=1 VLLM_HOST_IP=192.168.101.13 HEADLESS=--headless \
   ./docker/gb10/run.sh          # or run-vision.sh
 ```
 
@@ -157,8 +158,8 @@ Then scrape `http://127.0.0.1:30001/metrics` on the head. Do not point
 keep:
 
 ```bash
-export VLLM_HOST_IP=192.168.100.10   # .11 on Spark-2
-export NCCL_SOCKET_IFNAME=enp1s0f1np1
+export VLLM_HOST_IP=192.168.101.12   # .13 on Spark-2
+export NCCL_SOCKET_IFNAME=enP2p1s0f1np1
 export NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1
 export NCCL_IB_DISABLE=0
 ```
@@ -182,8 +183,8 @@ export NCCL_IB_DISABLE=0
 - `f0` twins (`rocep1s0f0`, `roceP2p1s0f0`) are the unused QSFP; leave them out.
 - RoCE graphs are bursty under tensor-parallel allreduce; look at peaks and
   twin balance, not the time average.
-- Bind Grafana / `node_exporter` to Wi-Fi, not `0.0.0.0`, on a box that also
-  has `tun0`.
+- Bind Grafana / Prometheus / head `node_exporter` to `127.0.0.1`.
+  Bind the worker `node_exporter` to the RoCE IP. Do not use Wi-Fi.
 - `node_exporter` must run as root on Spark. `User=nobody` cannot read some
   ConnectX sysfs counters, so `node_infiniband_*` stays empty. Re-run
   `./deploy.sh install-node-exporter` or `sudo systemctl restart node_exporter`
