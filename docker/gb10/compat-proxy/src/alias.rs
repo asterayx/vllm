@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 //! Copy v0.28 `reasoning` onto Codex/Grok `reasoning_content`.
 
 use serde_json::Value;
@@ -54,11 +57,12 @@ pub fn alias_json_bytes(data: &[u8]) -> Vec<u8> {
 }
 
 /// Split a chunk stream into SSE lines, rewriting each `data:` payload.
-pub fn rewrite_sse_chunk(pending: &mut String, chunk: &str) -> String {
-    pending.push_str(chunk);
+pub fn rewrite_sse_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
+    pending.extend_from_slice(chunk);
     let mut out = String::with_capacity(pending.len() + 32);
-    while let Some(idx) = pending.find('\n') {
-        let mut line = pending.drain(..=idx).collect::<String>();
+    while let Some(idx) = pending.iter().position(|&byte| byte == b'\n') {
+        let bytes: Vec<u8> = pending.drain(..=idx).collect();
+        let mut line = String::from_utf8_lossy(&bytes).into_owned();
         if line.ends_with('\n') {
             line.pop();
         }
@@ -103,11 +107,26 @@ mod tests {
 
     #[test]
     fn rewrite_sse_chunk_handles_split_lines() {
-        let mut pending = String::new();
-        let a = rewrite_sse_chunk(&mut pending, "data: {\"reasoning\":");
+        let mut pending = Vec::new();
+        let a = rewrite_sse_chunk(&mut pending, b"data: {\"reasoning\":");
         assert!(a.is_empty());
-        let b = rewrite_sse_chunk(&mut pending, "\"y\"}\n");
+        let b = rewrite_sse_chunk(&mut pending, b"\"y\"}\n");
         assert!(b.contains("reasoning_content"));
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn rewrite_sse_preserves_utf8_at_every_chunk_boundary() {
+        let input = "data: {\"reasoning\":\"图片中有一只猫🐈\"}\r\n\r\ndata: [DONE]\n\n";
+        let expected = rewrite_sse_chunk(&mut Vec::new(), input.as_bytes());
+        assert!(expected.contains("图片中有一只猫🐈"));
+        assert!(expected.contains("reasoning_content"));
+        for split in 0..=input.len() {
+            let mut pending = Vec::new();
+            let mut output = rewrite_sse_chunk(&mut pending, &input.as_bytes()[..split]);
+            output.push_str(&rewrite_sse_chunk(&mut pending, &input.as_bytes()[split..]));
+            assert_eq!(output, expected, "split at byte {split}");
+            assert!(pending.is_empty());
+        }
     }
 }

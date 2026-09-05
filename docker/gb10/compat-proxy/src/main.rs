@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 //! Production OpenAI-compat proxy for Spark vLLM.
 
 mod alias;
@@ -335,7 +338,7 @@ where
     use bytes::Bytes;
 
     let mut stream = Box::pin(stream);
-    let mut pending = String::new();
+    let mut pending = Vec::new();
     let mut finished = false;
     futures_util::stream::poll_fn(move |cx| {
         if finished {
@@ -343,9 +346,8 @@ where
         }
         match stream.poll_next_unpin(cx) {
             std::task::Poll::Ready(Some(Ok(chunk))) => {
-                let text = String::from_utf8_lossy(&chunk);
                 std::task::Poll::Ready(Some(Ok(Bytes::from(rewrite_sse_chunk(
-                    &mut pending, &text,
+                    &mut pending, &chunk,
                 )))))
             }
             std::task::Poll::Ready(Some(Err(e))) => {
@@ -357,7 +359,8 @@ where
                 if pending.is_empty() {
                     std::task::Poll::Ready(None)
                 } else {
-                    let line = std::mem::take(&mut pending);
+                    let bytes = std::mem::take(&mut pending);
+                    let line = String::from_utf8_lossy(&bytes);
                     let line = line.trim_end_matches(['\r', '\n']);
                     std::task::Poll::Ready(Some(Ok(Bytes::from(format!(
                         "{}\n",
