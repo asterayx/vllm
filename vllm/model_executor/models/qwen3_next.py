@@ -41,6 +41,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.config_utils import (
+    get_quark_ocp_mx_group_size,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -110,6 +113,38 @@ def _is_shared_expert_fse_compatible(quant_config) -> bool:
     return not any("shared_expert." in str(e) for e in exclude)
 
 
+def _should_replicate_misaligned_shared_expert(
+    intermediate_size: int,
+    tp_size: int,
+    group_size: int | None,
+    enable_expert_parallel: bool,
+    is_sequence_parallel: bool,
+) -> bool:
+    if intermediate_size <= 0 or group_size is None:
+        return False
+
+    partition_size, remainder = divmod(intermediate_size, tp_size)
+    if remainder == 0 and partition_size % group_size == 0:
+        return False
+
+    if enable_expert_parallel or is_sequence_parallel:
+        return True
+
+    if remainder != 0:
+        raise ValueError(
+            f"Shared-expert intermediate size {intermediate_size} must be "
+            f"divisible by tensor-parallel size {tp_size}."
+        )
+
+    raise ValueError(
+        "The Quark OCP MX shared expert cannot be tensor-parallelized: "
+        f"intermediate size {intermediate_size} with TP size {tp_size} "
+        f"produces a partition of {partition_size}, which is not divisible by "
+        f"the OCP MX group size {group_size}. Choose a compatible "
+        "tensor-parallel size or enable expert parallelism."
+    )
+
+
 class Qwen3NextSparseMoeBlock(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -126,6 +161,17 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
+        shared_expert_group_size = get_quark_ocp_mx_group_size(
+            quant_config,
+            f"{prefix}.shared_expert.down_proj",
+        )
+        self.replicate_shared_expert = _should_replicate_misaligned_shared_expert(
+            config.shared_expert_intermediate_size,
+            self.tp_size,
+            shared_expert_group_size,
+            parallel_config.enable_expert_parallel,
+            self.is_sequence_parallel,
+        )
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -158,13 +204,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         )
 
         _fse_requested = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        _fse_enabled = _fse_requested and _is_shared_expert_fse_compatible(quant_config)
+        _fse_enabled = (
+            _fse_requested
+            and not self.replicate_shared_expert
+            and _is_shared_expert_fse_compatible(quant_config)
+        )
         if _fse_requested and not _fse_enabled:
             logger.warning(
                 "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled but "
                 "shared expert has a different quantization spec than routed "
                 "experts. Falling back to non-fused shared expert path."
             )
+        self.is_fused_shared_expert_enabled = _fse_enabled
         if _fse_enabled or config.shared_expert_intermediate_size <= 0:
             self.shared_expert = None
         else:
@@ -176,11 +227,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 reduce_results=False,
                 expert_gate=self.shared_expert_gate,
                 is_sequence_parallel=self.is_sequence_parallel,
+                disable_tp=self.replicate_shared_expert,
                 prefix=f"{prefix}.shared_expert",
             )
 
         self.experts = FusedMoEFactory(
-            shared_experts=self.shared_expert,
+            shared_experts=(
+                None if self.replicate_shared_expert else self.shared_expert
+            ),
             gate=self.gate,
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
@@ -211,9 +265,16 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if self.is_sequence_parallel and not already_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
+        replicated_shared_output = (
+            self.shared_expert(hidden_states)
+            if self.replicate_shared_expert and self.shared_expert is not None
+            else None
+        )
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=hidden_states
         )
+        if replicated_shared_output is not None:
+            final_hidden_states += replicated_shared_output
 
         if self.is_sequence_parallel and not already_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -486,7 +547,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-        positions: torch.Tensor = None,
+        positions: torch.Tensor,
         **kwargs: object,
     ):
         full_num_tokens = positions.shape[-1]
