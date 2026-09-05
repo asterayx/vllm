@@ -133,3 +133,60 @@ def test_vision_attention_matches_unbatched_sdpa():
     )
     expected = attention.wo(expected.transpose(0, 1).reshape(35, -1))
     torch.testing.assert_close(attention(x, cos, sin), expected)
+
+
+@pytest.mark.parametrize("grid", [(6, 6), (7, 5)])
+def test_batched_images_match_independent_encoding(grid):
+    """Batching must preserve image isolation and padded spatial merge order."""
+    config = _make_config()
+    vision = DeepseekV4ViT(config)
+    aligner = DeepseekV4Aligner(config)
+    h, w = grid
+    patches = torch.randn(2, h * w, 3, 14, 14)
+    with torch.no_grad():
+        expected = torch.stack(
+            [aligner(vision(image, h, w), h, w) for image in patches]
+        )
+        actual = aligner(vision(patches, h, w), h, w)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_multimodal_batching_preserves_image_and_token_order(batch_size):
+    """Consecutive groups split at the cap without mixing grids or permutations."""
+    from vllm.models.deepseek_v4.nvidia.vl_model import (
+        DeepseekV4ForConditionalGeneration,
+    )
+
+    config = _make_config()
+    model = DeepseekV4ForConditionalGeneration.__new__(
+        DeepseekV4ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.vision = DeepseekV4ViT(config)
+    model.aligner = DeepseekV4Aligner(config)
+    model.vision_encoder_batch_size = batch_size
+    grids = [(6, 6)] * 3 + [(7, 5), (6, 6)]
+    llm_grids = [((h + 2) // 3, (w + 2) // 3) for h, w in grids]
+    patches = [torch.randn(h * w, 3, 14, 14) for h, w in grids]
+    perms = [torch.randperm(h * w) for h, w in llm_grids]
+    with torch.no_grad():
+        expected = [
+            model.aligner(model.vision(image, h, w), h, w)[perm]
+            for image, (h, w), perm in zip(patches, grids, perms)
+        ]
+        batch_sizes = []
+        handle = model.vision.register_forward_pre_hook(
+            lambda module, args: batch_sizes.append(args[0].shape[0])
+        )
+        actual = model.embed_multimodal(
+            patches=torch.cat(patches),
+            vit_grid=torch.tensor(grids),
+            llm_grid=torch.tensor(llm_grids),
+            perm=torch.cat(perms),
+        )
+        handle.remove()
+    assert batch_sizes == ([1] * 5 if batch_size == 1 else [2, 1, 1, 1])
+    assert len(actual) == len(expected)
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, rtol=1e-5, atol=1e-6)

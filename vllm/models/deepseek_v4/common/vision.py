@@ -54,7 +54,7 @@ class DeepseekV4PatchEmbed(nn.Module):
         self.proj = nn.Linear(3 * config.vision_patch_size**2, config.vision_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x.flatten(1))
+        return self.proj(x.flatten(-3))
 
 
 class DeepseekV4VisionAttention(nn.Module):
@@ -68,19 +68,21 @@ class DeepseekV4VisionAttention(nn.Module):
     def forward(
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> torch.Tensor:
-        n = x.size(0)
+        original_shape = x.shape
+        if x.ndim == 2:
+            x = x.unsqueeze(0)
         q, k, v = (
-            t.view(n, self.n_heads, self.head_dim)
+            t.view(*x.shape[:-1], self.n_heads, self.head_dim)
             for t in self.wqkv(x).chunk(3, dim=-1)
         )
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
         o = F.scaled_dot_product_attention(
-            q.transpose(0, 1).unsqueeze(0),
-            k.transpose(0, 1).unsqueeze(0),
-            v.transpose(0, 1).unsqueeze(0),
-        ).squeeze(0)
-        return self.wo(o.transpose(0, 1).reshape(n, -1))
+            q.transpose(-3, -2),
+            k.transpose(-3, -2),
+            v.transpose(-3, -2),
+        )
+        return self.wo(o.transpose(-3, -2).reshape(original_shape))
 
 
 class DeepseekV4VisionMLP(nn.Module):
@@ -146,7 +148,14 @@ class DeepseekV4Aligner(nn.Module):
 
     def forward(self, x: torch.Tensor, n_vit_h: int, n_vit_w: int) -> torch.Tensor:
         r = self.downsample_ratio
-        x = x.view(n_vit_h, n_vit_w, -1).permute(2, 0, 1)
-        x = F.pad(x, (0, -n_vit_w % r, 0, -n_vit_h % r))
-        x = F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
+        batch_shape = x.shape[:-2]
+        dim = x.shape[-1]
+        x = x.reshape(-1, n_vit_h, n_vit_w, dim)
+        pad_h, pad_w = -n_vit_h % r, -n_vit_w % r
+        if pad_h or pad_w:
+            x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
+        out_h, out_w = (n_vit_h + pad_h) // r, (n_vit_w + pad_w) // r
+        # Match unfold's channel, patch-row, patch-column order.
+        x = x.reshape(-1, out_h, r, out_w, r, dim).permute(0, 1, 3, 5, 2, 4)
+        x = x.reshape(*batch_shape, out_h * out_w, dim * r * r)
         return self.w2(F.gelu(self.w1(x)))

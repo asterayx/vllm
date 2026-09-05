@@ -24,6 +24,7 @@ class DeepseekV4Config(PretrainedConfig):
         vision_max_n_token: int = 384,
         vision_min_pixels: int = 147456,
         vision_max_wh_ratio: float = 8,
+        vision_encoder_batch_size: int = 2,
         **kwargs,
     ):
         self.max_position_embeddings = max_position_embeddings
@@ -41,6 +42,9 @@ class DeepseekV4Config(PretrainedConfig):
         self.vision_max_n_token = vision_max_n_token
         self.vision_min_pixels = vision_min_pixels
         self.vision_max_wh_ratio = vision_max_wh_ratio
+        if vision_encoder_batch_size < 1:
+            raise ValueError("vision_encoder_batch_size must be positive")
+        self.vision_encoder_batch_size = vision_encoder_batch_size
         # The sparse-SWA index kernels widen the window within image spans
         # in-kernel, so mm-prefix ranges longer than sliding_window must be
         # kept (they are only consumed by those kernels).

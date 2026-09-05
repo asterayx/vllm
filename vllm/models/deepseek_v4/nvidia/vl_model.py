@@ -21,10 +21,12 @@ Thin multimodal wrapper around the text-only ``DeepseekV4ForCausalLM``:
 """
 
 from collections.abc import Iterable, Iterator
+from itertools import groupby
 
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
@@ -106,6 +108,9 @@ class DeepseekV4ForConditionalGeneration(
         model_config = vllm_config.model_config
         config = model_config.hf_config
         self.config = config
+        self.vision_encoder_batch_size = (
+            1 if envs.VLLM_BATCH_INVARIANT else config.vision_encoder_batch_size
+        )
         self.multimodal_config = model_config.multimodal_config
         assert self.multimodal_config is not None
 
@@ -194,25 +199,32 @@ class DeepseekV4ForConditionalGeneration(
     ) -> tuple[torch.Tensor, ...]:
         assert self.vision is not None and self.aligner is not None
         patches = patches.to(self.aligner.w1.weight.dtype)
+        perm = perm.to(patches.device)
 
         embeds: list[torch.Tensor] = []
         vit_offset = 0
         llm_offset = 0
-        for (n_vit_h, n_vit_w), (n_llm_h, n_llm_w) in zip(
-            vit_grid.tolist(), llm_grid.tolist(), strict=True
-        ):
+        grids = zip(vit_grid.tolist(), llm_grid.tolist(), strict=True)
+        for ((n_vit_h, n_vit_w), (n_llm_h, n_llm_w)), items in groupby(grids):
             n_vit = n_vit_h * n_vit_w
             n_llm = n_llm_h * n_llm_w
-            image_embeds = self.aligner(
-                self.vision(patches[vit_offset : vit_offset + n_vit], n_vit_h, n_vit_w),
-                n_vit_h,
-                n_vit_w,
-            )
-            # Reorder into the N-layout block order used in the prompt.
-            item_perm = perm[llm_offset : llm_offset + n_llm].to(image_embeds.device)
-            embeds.append(image_embeds[item_perm])
-            vit_offset += n_vit
-            llm_offset += n_llm
+            remaining = sum(1 for _ in items)
+            while remaining:
+                batch_size = min(remaining, self.vision_encoder_batch_size)
+                batch = patches[vit_offset : vit_offset + batch_size * n_vit]
+                batch = batch.unflatten(0, (batch_size, n_vit))
+                image_embeds = self.aligner(
+                    self.vision(batch, n_vit_h, n_vit_w), n_vit_h, n_vit_w
+                )
+                item_perm = perm[llm_offset : llm_offset + batch_size * n_llm]
+                item_perm = item_perm.view(batch_size, n_llm, 1)
+                ordered = image_embeds.gather(
+                    1, item_perm.expand(-1, -1, image_embeds.shape[-1])
+                )
+                embeds.extend(ordered.unbind(0))
+                vit_offset += batch_size * n_vit
+                llm_offset += batch_size * n_llm
+                remaining -= batch_size
         return tuple(embeds)
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
