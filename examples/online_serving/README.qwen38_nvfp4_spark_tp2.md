@@ -109,6 +109,29 @@ checkpoint files are not modified. Set `MAX_MODEL_LEN=262144` or less to use
 the checkpoint's original RoPE. Four concurrent sequences share the cache;
 this budget does not promise four simultaneous full-length 512K requests.
 
+The launcher defaults to MTP with two speculative tokens. Set `MTP_TOKENS=1`
+for one token or `MTP_TOKENS=0` to disable it, identically on both nodes. The
+checkpoint contains one MTP layer (31 BF16 tensors, 4.856 GiB in total); the
+two-token setting reuses that layer for successive draft steps.
+
+The requested trial order was two tokens, then one only on failure, then
+disabled only if both failed. The two-token run started and passed actual
+generation, automatic tool calls, tool-result follow-up, streaming reasoning,
+and Responses function-call checks. Both draft positions recorded accepted
+tokens, confirming active two-token speculation. The service stayed healthy,
+so no one-token trial or performance comparison was performed.
+
+In this rc4 implementation, the MTP draft retains its native 262,144-token
+limit while the target remains at 524,288. Batches exceeding the drafter's
+limit skip speculation. Startup also warns that draft KV cache groups cannot
+be identified, disabling cross-request prefix-cache reuse. Fused multi-step
+drafting is unavailable for the QSA state backend; vLLM rebuilds attention
+metadata between draft steps. These fallbacks do not prevent serving, but
+mean this configuration is not a demonstrated throughput improvement.
+The MTP run reported 1,153,433 cache tokens and approximately 26 GiB available
+system memory on the head during verification. Full-length 512K generation
+was validated before MTP was enabled and was not repeated in this trial.
+
 FlashInfer autotuning is disabled in this example. On a repeated two-node
 startup, rank 0 hit its cached MoE tactics while rank 1 entered profiling and
 waited in `flashinfer.autotuner._profile_single_kernel`'s `all_reduce`. Disabling

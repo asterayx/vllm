@@ -17,6 +17,11 @@ if [[ ! -f "$model/config.json" ]]; then
     echo "Set MODEL_PATH to the local checkpoint directory (config.json missing)." >&2
     exit 2
 fi
+mtp_tokens=${MTP_TOKENS:-2}
+if [[ ! "$mtp_tokens" =~ ^[012]$ ]]; then
+    echo "MTP_TOKENS must be 0 (disabled), 1, or 2." >&2
+    exit 2
+fi
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export VLLM_HOST_IP=${VLLM_HOST_IP:?Set VLLM_HOST_IP to the local interconnect IP}
@@ -56,6 +61,9 @@ args=(
     --disable-custom-all-reduce
     --enforce-eager
 )
+if (( mtp_tokens > 0 )); then
+    args+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$mtp_tokens}")
+fi
 if (( ${MAX_MODEL_LEN:-524288} > 262144 )); then
     args+=(--hf-overrides '{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":262144,"rope_theta":10000000,"partial_rotary_factor":0.25,"mrope_section":[11,11,10],"mrope_interleaved":true}}}')
 fi
