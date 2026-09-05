@@ -289,27 +289,24 @@ v0.28 emits `reasoning`. Codex / Grok still read `reasoning_content`.
 ```bash
 cd docker/gb10/compat-proxy
 INSTALL_SYSTEMD=1 ./install.sh   # rustc 1.88; sudo-installs binary + unit
-# PUBLIC_BASE=http://127.0.0.1:30000 DOWNLOAD_BASE=https://token.asteraix.com \
-#   INSTALL_SYSTEMD=1 ./install.sh
+# PUBLIC_BASE=http://<head-wifi>:30000 INSTALL_SYSTEMD=1 ./install.sh
 sudo systemctl reset-failed spark-compat-proxy
 sudo systemctl enable --now spark-compat-proxy
 # 203/EXEC = binary missing at /usr/local/bin/spark-compat-proxy
 ```
 
-`--public-base` is the API `base_url` in the downloaded files (loopback).
-`--download-base` is the public host for `/configs` (cloudflared). Do not
-put `/v1` on the tunnel.
+`--public-base` is what the generated configs put in `base_url` / `baseURL`.
 
 ```bash
 export VLLM_API_KEY=dummy
-# on the head
 curl -fsS http://127.0.0.1:30000/healthz
-# public download page (after cloudflared /configs ingress)
-curl -fsS https://token.asteraix.com/configs
-curl -fsS https://token.asteraix.com/configs/codex.toml -o ~/.codex/config.toml
-curl -fsS https://token.asteraix.com/configs/grok.toml -o ~/.grok/config.toml
+# browser index
+curl -fsS http://127.0.0.1:30000/configs
+# downloads (Content-Disposition: attachment)
+curl -fsS http://127.0.0.1:30000/configs/codex.toml -o ~/.codex/config.toml
+curl -fsS http://127.0.0.1:30000/configs/grok.toml >> ~/.grok/config.toml
 mkdir -p ~/.config/opencode
-curl -fsS https://token.asteraix.com/configs/opencode.json \
+curl -fsS http://127.0.0.1:30000/configs/opencode.json \
   -o ~/.config/opencode/opencode.json
 ```
 
@@ -319,8 +316,7 @@ Write files without serving:
 
 ```bash
 spark-compat-proxy write-configs --out /tmp/spark-client-configs \
-  --public-base http://127.0.0.1:30000 \
-  --download-base https://token.asteraix.com
+  --public-base http://192.168.8.134:30000
 ```
 
 | Client | File | Notes |
@@ -399,9 +395,9 @@ Do not bind Grafana to Wi-Fi. cloudflared originates at `127.0.0.1:3000`.
 
 ## Cloudflare Tunnel (create and /dash)
 
-Publish Grafana at `https://<host>/dash` and client config downloads at
-`https://<host>/configs`. Do **not** add `/telemetry`. Do **not** put
-vLLM `:30001` or the OpenAI `/v1` API on the tunnel.
+Publish Grafana at `https://<host>/dash` only. Do **not** add `/telemetry`.
+Do **not** put vLLM `:30001` or the compat proxy on the public internet
+unless you intend to; this section is Grafana-only.
 
 Hostname in the checked-in examples is `token.asteraix.com`. Replace it
 everywhere (DNS, `config.yml`, `GRAFANA_DOMAIN`, `GRAFANA_ROOT_URL`) if
@@ -482,17 +478,6 @@ ingress:
       httpHostHeader: token.asteraix.com
       disableChunkedEncoding: true
 
-  - hostname: token.asteraix.com
-    path: /configs(/.*)?
-    service: http://127.0.0.1:30000
-    originRequest:
-      httpHostHeader: token.asteraix.com
-      disableChunkedEncoding: true
-
-  - hostname: token.asteraix.com
-    path: /healthz
-    service: http://127.0.0.1:30000
-
   - service: http_status:404
 EOF
 sudo cloudflared --config /etc/cloudflared/config.yml service install
@@ -548,7 +533,7 @@ curl -fsS http://127.0.0.1:30001/v1/models
 
 # proxy
 curl -fsS http://127.0.0.1:30000/healthz
-curl -fsSI https://token.asteraix.com/configs/codex.toml | grep -i content-disposition
+curl -fsSI http://127.0.0.1:30000/configs/codex.toml | grep -i content-disposition
 
 # metrics + Grafana
 curl -fsS http://127.0.0.1:30001/metrics | grep -E '^vllm_' | head

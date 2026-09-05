@@ -54,16 +54,14 @@ echo "installed ${BIN}"
 if [[ "${INSTALL_SYSTEMD:-0}" == "1" ]]; then
   UNIT_USER="${UNIT_USER:-$(id -un)}"
   PUBLIC_BASE="${PUBLIC_BASE:-http://127.0.0.1:30000}"
-  DOWNLOAD_BASE="${DOWNLOAD_BASE:-https://token.asteraix.com}"
   tmp="$(mktemp)"
   sed -e "s/^User=.*/User=${UNIT_USER}/" \
       -e "s|--public-base [^[:space:]]*|--public-base ${PUBLIC_BASE}|" \
-      -e "s|--download-base [^[:space:]]*|--download-base ${DOWNLOAD_BASE}|" \
       "${ROOT}/spark-compat-proxy.service" > "${tmp}"
   sudo install -m644 "${tmp}" /etc/systemd/system/spark-compat-proxy.service
   rm -f "${tmp}"
   sudo systemctl daemon-reload
-  echo "installed unit User=${UNIT_USER} public-base=${PUBLIC_BASE} download-base=${DOWNLOAD_BASE}"
+  echo "installed unit User=${UNIT_USER} public-base=${PUBLIC_BASE}"
 fi
 
 echo "  ${BIN} --help"

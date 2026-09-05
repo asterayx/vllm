@@ -37,7 +37,6 @@ struct AppState {
     client: Client,
     upstream: String,
     public_base: String,
-    download_base: String,
     model: String,
     display_name: String,
 }
@@ -46,7 +45,6 @@ impl AppState {
     fn ctx(&self) -> ConfigContext<'_> {
         ConfigContext {
             public_base: &self.public_base,
-            download_base: &self.download_base,
             model: &self.model,
             display_name: &self.display_name,
         }
@@ -72,12 +70,9 @@ struct Args {
         global = true
     )]
     upstream: String,
-    /// API base_url written into Codex / Grok / OpenCode files.
+    /// URL clients should use (configs + download page).
     #[arg(long, env = "SPARK_COMPAT_PUBLIC_BASE", global = true)]
     public_base: Option<String>,
-    /// Download page / curl host (cloudflared /configs). Defaults to public-base.
-    #[arg(long, env = "SPARK_COMPAT_DOWNLOAD_BASE", global = true)]
-    download_base: Option<String>,
     #[arg(
         long,
         default_value = "deepseek-v4-flash-vision-exp",
@@ -118,16 +113,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let public_base = args.public_base.unwrap_or_else(|| {
         default_public_base(&args.listen)
     });
-    let download_base = args
-        .download_base
-        .unwrap_or_else(|| public_base.clone());
 
     if let Some(Command::WriteConfigs { out }) = args.command {
         write_config_files(
             &out,
             &ConfigContext {
                 public_base: &public_base,
-                download_base: &download_base,
                 model: &args.model,
                 display_name: &args.display_name,
             },
@@ -149,13 +140,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client,
         upstream: args.upstream.trim_end_matches('/').to_string(),
         public_base,
-        download_base,
         model: args.model,
         display_name: args.display_name,
     };
 
     let app = Router::new()
-        .route("/", get(configs_index))
         .route("/healthz", get(healthz))
         .route("/configs", get(configs_index))
         .route("/configs/", get(configs_index))
@@ -171,7 +160,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listen = %addr,
         upstream = %state.upstream,
         public_base = %state.public_base,
-        download_base = %state.download_base,
         "spark-compat-proxy listening (reasoning => reasoning_content)"
     );
     axum::serve(listener, app)

@@ -3,8 +3,7 @@
 # /dash MUST be listed before the catch-all `/` rule.
 #
 # Fill TUNNEL_ID from: cloudflared tunnel list
-# Public paths: Grafana /dash and compat-proxy /configs (not the API).
-# Do not add /telemetry or a catch-all to :30001 / :30000.
+# Grafana is the only observability path. Do not add /telemetry.
 #
 # Public host for this pair is token.asteraix.com (must match the
 # Cloudflare DNS CNAME for this tunnel).
@@ -22,16 +21,8 @@ ingress:
       httpHostHeader: token.asteraix.com
       disableChunkedEncoding: true
 
-  # Codex / Grok / OpenCode config downloads (not /v1).
-  - hostname: token.asteraix.com
-    path: /configs(/.*)?
-    service: http://127.0.0.1:30000
-    originRequest:
-      httpHostHeader: token.asteraix.com
-      disableChunkedEncoding: true
-
-  - hostname: token.asteraix.com
-    path: /healthz
-    service: http://127.0.0.1:30000
+  # Optional catch-all for whatever else you already publish on `/`.
+  - hostname: token.asterayx.com
+    service: http://127.0.0.1:REPLACE_ROOT_PORT
 
   - service: http_status:404

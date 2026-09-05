@@ -36,20 +36,18 @@ sudo install -m755 target/release/spark-compat-proxy /usr/local/bin/
 ## Run
 
 ```bash
-# public-base = API in the files; download-base = public /configs page
+# public-base is what Codex/Grok/OpenCode put in base_url (Wi-Fi IP if remote)
 spark-compat-proxy \
   --listen 0.0.0.0:30000 \
   --upstream http://127.0.0.1:30001 \
-  --public-base http://127.0.0.1:30000 \
-  --download-base https://token.asteraix.com
+  --public-base http://127.0.0.1:30000
 ```
 
 Write configs to disk without serving:
 
 ```bash
 spark-compat-proxy write-configs --out /tmp/spark-client-configs \
-  --public-base http://127.0.0.1:30000 \
-  --download-base https://token.asteraix.com
+  --public-base http://192.168.8.134:30000
 ```
 
 systemd (`User=` must be this host's login, not a leftover `roccen`):
@@ -68,14 +66,14 @@ ls -l /usr/local/bin/spark-compat-proxy
 ```bash
 export VLLM_API_KEY=dummy
 curl -fsS http://127.0.0.1:30000/healthz
-curl -fsS https://token.asteraix.com/configs/codex.toml -o ~/.codex/config.toml
-curl -fsS https://token.asteraix.com/configs/grok.toml -o ~/.grok/config.toml
+curl -fsS http://127.0.0.1:30000/configs/codex.toml -o ~/.codex/config.toml
+curl -fsS http://127.0.0.1:30000/configs/grok.toml -o ~/.grok/config.toml
 mkdir -p ~/.config/opencode
-curl -fsS https://token.asteraix.com/configs/opencode.json \
+curl -fsS http://127.0.0.1:30000/configs/opencode.json \
   -o ~/.config/opencode/opencode.json
 ```
 
-Or open `https://token.asteraix.com/configs` in a browser.
+Or open `http://<head-wifi>:30000/configs` in a browser.
 
 The Python script `../codex_proxy.py` is the original prototype. Use this
 binary for production.
