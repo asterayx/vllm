@@ -4,6 +4,8 @@
 reference implementation."""
 
 import importlib.util
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,10 +13,15 @@ import torch
 
 from vllm.models.deepseek_v4.common.vision import (
     DeepseekV4Aligner,
+    DeepseekV4VisionAttention,
     DeepseekV4ViT,
+    apply_rotary,
+    get_vision_cos_sin,
 )
 
-REF_VISION_PATH = "/tmp/dsv4vis/vision.py"
+REF_VISION_PATH = (
+    Path(os.environ.get("VLLM_TEST_DSV4_REFERENCE_DIR", "/tmp/dsv4vis")) / "vision.py"
+)
 
 
 def _load_reference_vision():
@@ -25,7 +32,11 @@ def _load_reference_vision():
     return module
 
 
-ref_vision = _load_reference_vision()
+ref_vision = _load_reference_vision() if REF_VISION_PATH.is_file() else None
+requires_reference = pytest.mark.skipif(
+    ref_vision is None,
+    reason="set VLLM_TEST_DSV4_REFERENCE_DIR to the reference checkout",
+)
 
 
 def _make_config() -> SimpleNamespace:
@@ -48,7 +59,9 @@ def _ref_args(config: SimpleNamespace) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("n_vit_h,n_vit_w", [(6, 6), (7, 5), (4, 10)])
+@requires_reference
 def test_vit_parity(n_vit_h: int, n_vit_w: int):
+    assert ref_vision is not None
     torch.manual_seed(0)
     config = _make_config()
     ours = DeepseekV4ViT(config)
@@ -68,7 +81,9 @@ def test_vit_parity(n_vit_h: int, n_vit_w: int):
 
 
 @pytest.mark.parametrize("n_vit_h,n_vit_w", [(6, 6), (7, 5), (4, 10)])
+@requires_reference
 def test_aligner_parity(n_vit_h: int, n_vit_w: int):
+    assert ref_vision is not None
     torch.manual_seed(0)
     config = _make_config()
     ours = DeepseekV4Aligner(config)
@@ -98,3 +113,23 @@ def test_aligner_output_grid(n_vit_h: int, n_vit_w: int):
     with torch.no_grad():
         out = aligner(x, n_vit_h, n_vit_w)
     assert out.shape == (n_llm_h * n_llm_w, config.hidden_size)
+
+
+def test_vision_attention_matches_unbatched_sdpa():
+    """Adding the batch dimension must preserve bidirectional attention."""
+    torch.manual_seed(0)
+    config = _make_config()
+    attention = DeepseekV4VisionAttention(config)
+    x = torch.randn(35, config.vision_dim)
+    cos, sin = get_vision_cos_sin(7, 5, attention.head_dim // 2, 10000.0)
+    q, k, v = [
+        t.view(35, attention.n_heads, attention.head_dim)
+        for t in attention.wqkv(x).chunk(3, dim=-1)
+    ]
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        apply_rotary(q, cos, sin).transpose(0, 1),
+        apply_rotary(k, cos, sin).transpose(0, 1),
+        v.transpose(0, 1),
+    )
+    expected = attention.wo(expected.transpose(0, 1).reshape(35, -1))
+    torch.testing.assert_close(attention(x, cos, sin), expected)

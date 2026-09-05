@@ -16,8 +16,11 @@ from torch import nn
 
 @lru_cache(8)
 def get_vision_cos_sin(
-    n_h: int, n_w: int, dim: int, theta: float
+    n_h: int, n_w: int, dim: int, theta: float, device: torch.device | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if device is not None:
+        cos, sin = get_vision_cos_sin(n_h, n_w, dim, theta)
+        return cos.to(device=device), sin.to(device=device)
     inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     hpos = torch.arange(n_h).unsqueeze(1).expand(n_h, n_w)
     wpos = torch.arange(n_w).unsqueeze(0).expand(n_h, n_w)
@@ -73,8 +76,10 @@ class DeepseekV4VisionAttention(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
         o = F.scaled_dot_product_attention(
-            q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
-        )
+            q.transpose(0, 1).unsqueeze(0),
+            k.transpose(0, 1).unsqueeze(0),
+            v.transpose(0, 1).unsqueeze(0),
+        ).squeeze(0)
         return self.wo(o.transpose(0, 1).reshape(n, -1))
 
 
@@ -121,9 +126,9 @@ class DeepseekV4ViT(nn.Module):
         self, patches: torch.Tensor, n_vit_h: int, n_vit_w: int
     ) -> torch.Tensor:
         x = self.patch_embed(patches)
-        cos, sin = get_vision_cos_sin(n_vit_h, n_vit_w, self.rope_dim, self.rope_theta)
-        cos = cos.to(device=x.device)
-        sin = sin.to(device=x.device)
+        cos, sin = get_vision_cos_sin(
+            n_vit_h, n_vit_w, self.rope_dim, self.rope_theta, x.device
+        )
         for block in self.blocks:
             x = block(x, cos, sin)
         return self.norm(x)
