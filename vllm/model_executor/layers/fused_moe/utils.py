@@ -100,8 +100,10 @@ def is_model_fused_shared_expert_compatible(
         and isinstance(moe_layer, moe_cls)
     )
 
+    # AITER FSE probes return None on non-ROCm, so treat missing/None as off.
     enabled = [
-        getattr(layer, "is_fused_shared_expert_enabled", False) for layer in moe_layers
+        bool(getattr(layer, "is_fused_shared_expert_enabled", False))
+        for layer in moe_layers
     ]
     enabled_count = sum(enabled)
     disabled_count = len(enabled) - enabled_count

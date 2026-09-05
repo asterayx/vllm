@@ -203,7 +203,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.shared_expert_gate",
         )
 
-        _fse_requested = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        _fse_requested = bool(rocm_aiter_ops.is_fusion_moe_shared_experts_enabled())
         _fse_enabled = (
             _fse_requested
             and not self.replicate_shared_expert
