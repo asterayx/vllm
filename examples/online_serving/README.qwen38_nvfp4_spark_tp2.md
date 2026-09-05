@@ -166,5 +166,35 @@ kernel journal. During verification, a separate test watchdog terminates only
 the test process group if system `MemAvailable` stays below 8 GiB. Compilation
 caches were prepared before full loading and `MAX_JOBS=4` was used for serving.
 
+## Compatibility proxy and public access
+
+The Rust proxy in `docker/gb10/compat-proxy` was restored from repository commit
+`0648ef21c`. It preserves native `/v1/responses` requests and adds the
+`reasoning_content` alias to `reasoning` fields in JSON and SSE responses.
+It does not convert Chat Completions into Responses.
+
+Build and start it on the head from the isolated worktree:
+
+```bash
+cargo build --locked --release --manifest-path docker/gb10/compat-proxy/Cargo.toml -j4
+bash examples/online_serving/qwen38_nvfp4_spark_proxy.sh
+```
+
+The deployment path is Cloudflare Tunnel → `127.0.0.1:30000` (proxy) →
+`127.0.0.1:18029` (vLLM). The public API base is
+`https://token.asterayx.com/v1`, and the served model is `qwen38-nvfp4`.
+The proxy wrapper sets the client context limit to 16,384 tokens.
+
+`https://token.asterayx.com/configs/grok.toml` provides the Grok Build model
+configuration. Merge its model block into the existing Grok configuration,
+then use `grok --model qwen38-nvfp4`. It selects the `responses` API backend
+and reads the API key from `VLLM_API_KEY`.
+
+Proxy validation passed nine Rust release-mode unit tests, including split
+UTF-8 SSE chunks and generated model/context settings. Public requests returned
+HTTP 200 for models, JSON Responses, streamed Responses, and Chat Completions;
+both Responses modes returned `OK`, and Chat Completions preserved `reasoning`
+while adding `reasoning_content`. Repository pre-commit checks passed.
+
 AI assistance was used for this branch. The backported implementation and tests
 retain their upstream provenance above.
