@@ -216,7 +216,8 @@ PY
   --master-addr "${MASTER_ADDR}" --master-port "${MASTER_PORT:-29500}" \
   --kv-cache-dtype fp8_ds_mla --block-size 256 \
   --max-model-len "${MAX_MODEL_LEN:-524288}" \
-  --max-num-seqs "${MAX_NUM_SEQS:-6}" --max-num-batched-tokens 8192 \
+  --max-num-seqs "${MAX_NUM_SEQS:-6}" \
+  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-8192}" \
   --max-cudagraph-capture-size "${MAX_CUGRAPH:-36}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.87}" \
   --tokenizer-mode deepseek_v4 \

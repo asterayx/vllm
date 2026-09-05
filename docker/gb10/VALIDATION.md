@@ -67,6 +67,35 @@ Results on 2026-09-05:
   23 failures because unrelated Hugging Face model configs were unavailable
   in offline mode. These failures are not counted as successful validation.
 
+## Second optimization pass (2026-09-05)
+
+- Consecutive images with equal ViT and LLM grids now share encoder calls,
+  capped at two images by default. `--hf-overrides
+  '{"vision_encoder_batch_size":1}'` restores single-image calls; merge this
+  field into any existing HF overrides. `VLLM_BATCH_INVARIANT=1` forces one.
+  Batching increases temporary activation memory; validate peak memory and
+  BF16 output tolerance on Spark before choosing a larger cap.
+- Spatial merging uses reshape/permutation instead of `unfold`, retaining
+  the reference channel and patch ordering, including padded image edges.
+- Padded sparse attention allocates output storage without copying old
+  output, avoids a redundant input-padding copy, and removes one reduction
+  from negative-index repair. Existing sparse kernel selection is unchanged.
+- The proxy scans only newly received bytes and drains complete lines once
+  per chunk. JSON without missing reasoning aliases avoids serialization.
+- Docker build failure handling now limits the ignored failure to the
+  optional FlashInfer cache uninstall. `MAX_NUM_BATCHED_TOKENS` exposes the
+  prefill budget in `run.sh`, with its existing default of 8192.
+
+Validation: the main Python command above plus
+`tests/models/test_deepseek_v4_vl_input_ids.py`,
+`tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py`, and
+`tests/config/test_speculative_draft_hf_overrides.py` completed with
+**784 passed, 17 CUDA-only skips**. A subsequent vision-suite run after
+strengthening the batch-cap assertions passed all **13 tests**. Proxy tests
+passed **10 tests**. Shell syntax was checked with `bash -n`.
+The Docker image was not rebuilt, and no full-model evaluation or Spark
+performance measurement was possible on this host.
+
 ## Required Spark validation
 
 No GPU performance or full-model quality results are claimed by these

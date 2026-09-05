@@ -82,7 +82,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && chmod +x /opt/vllm/docker/gb10/install-vllm.sh \
     && MAX_JOBS=${MAX_JOBS} TORCH_CUDA_ARCH_LIST=12.1a VLLM_TARGET_DEVICE=cuda \
         /opt/vllm/docker/gb10/install-vllm.sh /opt/venv/bin/python \
-    && uv pip uninstall --python /opt/venv/bin/python flashinfer-jit-cache || true \
+    && (uv pip uninstall --python /opt/venv/bin/python flashinfer-jit-cache || true) \
     && chmod +x /opt/vllm/docker/gb10/entrypoint.sh \
                /opt/vllm/docker/gb10/install-b12x.sh \
     && /opt/vllm/docker/gb10/install-b12x.sh /opt/venv/bin/python \
