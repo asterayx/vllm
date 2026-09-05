@@ -20,7 +20,7 @@ Thin multimodal wrapper around the text-only ``DeepseekV4ForCausalLM``:
   proxy the text backbone (``get_language_model`` via ``_mark_language_model``).
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 
 import torch
 from torch import nn
@@ -299,14 +299,19 @@ class DeepseekV4ForConditionalGeneration(
         return self.language_model.get_expert_mapping()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Map HF names into this wrapper's namespace up front and sort, so
-        # the "language_model." group reaches the child loader as one
-        # contiguous block (AutoWeightsLoader delegates per contiguous group,
-        # and the child's load_weights finalizes fused expert weights, which
-        # must not run on a partially loaded model).
-        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
+        def mapped_weights() -> Iterator[tuple[str, torch.Tensor]]:
+            # Keep the language model contiguous so expert finalization runs
+            # once, without retaining the entire checkpoint in host memory.
+            tower_weights = []
+            for name, weight in self.hf_to_vllm_mapper.apply(weights):
+                if name.startswith("language_model."):
+                    yield name, weight
+                else:
+                    tower_weights.append((name, weight))
+            yield from sorted(tower_weights, key=lambda item: item[0])
+
         loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(mapped)
+        loaded_params = loader.load_weights(mapped_weights())
         # The child's load_weights already ran its post-load finalization.
         self._weights_finalized = True
         return loaded_params

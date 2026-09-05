@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
+from torch import nn
 
 from vllm.model_executor.models.interfaces import SupportsEagle3
+from vllm.model_executor.models.utils import WeightsMapper
 from vllm.models.deepseek_v4.nvidia.vl_model import (
     DeepseekV4ForConditionalGeneration,
     _make_deepseek_v4_vl_weights_mapper,
@@ -75,3 +78,49 @@ def test_vl_weights_mapper_drops_tower_when_image_disabled():
     assert mapper._map_name("image_start") is None
     # bias_vl still loads: the MoE gate keeps it whenever vision_n_layers > 0
     assert mapper._map_name("layers.7.ffn.gate.bias_vl") is not None
+
+
+def test_vl_weights_stream_backbone_and_finalize_once():
+    """Interleaved tower weights must not force whole-checkpoint buffering."""
+
+    class Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = nn.Parameter(torch.zeros(1))
+            self.second = nn.Parameter(torch.zeros(1))
+            self.loads = 0
+
+        def load_weights(self, weights):
+            self.loads += 1
+            loaded = set()
+            for name, value in weights:
+                getattr(self, name).data.copy_(value)
+                loaded.add(name)
+            return loaded
+
+    model = DeepseekV4ForConditionalGeneration.__new__(
+        DeepseekV4ForConditionalGeneration
+    )
+    nn.Module.__init__(model)
+    model.language_model = Backbone()
+    model.vision = nn.Linear(1, 1)
+    model.hf_to_vllm_mapper = WeightsMapper()
+
+    def weights():
+        yield "language_model.first", torch.tensor([1.0])
+        yield "vision.weight", torch.tensor([[3.0]])
+        yield "language_model.second", torch.tensor([2.0])
+        assert model.language_model.first.item() == 1.0
+        yield "vision.bias", torch.tensor([4.0])
+
+    loaded = model.load_weights(weights())
+    assert loaded == {
+        "language_model.first",
+        "language_model.second",
+        "vision.weight",
+        "vision.bias",
+    }
+    assert model.language_model.loads == 1
+    assert model.language_model.second.item() == 2.0
+    assert model.vision.weight.item() == 3.0
+    assert model.vision.bias.item() == 4.0
