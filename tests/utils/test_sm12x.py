@@ -404,11 +404,7 @@ def _dspark_full_decode_capture_sizes(
 
 
 def test_sm12x_dspark_capture_avoids_q_len_5_dummy(monkeypatch):
-    """DSpark sample_from_anchor is q_len=5; capture must use aligned 6.
-
-    q_len=5 first graph is 25=5×5 (IMA before FlashInfer pad).
-    q_len=6 first graph is 36=6×6 (main capture already green).
-    """
+    """FlashInfer aligns q=5 to six; unsafe logical graph sizes stay excluded."""
     from vllm.utils import sm12x as sm12x_utils
 
     monkeypatch.setattr(
@@ -536,7 +532,7 @@ def test_dspark_init_cudagraph_manager_copies_capture_sizes(monkeypatch):
     class _Mgr:
         def __init__(
             self,
-            cfg: object,
+            cfg: SimpleNamespace,
             device: object,
             cudagraph_mode: object,
             decode_query_len: int,
@@ -559,7 +555,7 @@ def test_dspark_init_cudagraph_manager_copies_capture_sizes(monkeypatch):
     )
     spec.init_cudagraph_manager(CUDAGraphMode.FULL)
 
-    assert captured["q"] == 6
+    assert captured["q"] == 3
     assert captured["sizes"] == [6, 12, 18, 24, 36]
     assert captured["cfg_id"] != id(vllm_config)
     assert captured["comp_id"] != id(compilation_config)

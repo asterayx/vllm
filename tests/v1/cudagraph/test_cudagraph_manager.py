@@ -46,6 +46,52 @@ def _create_vllm_config() -> MagicMock:
     return vllm_config
 
 
+@pytest.mark.parametrize("query_len", [3, 5])
+def test_sm12x_dspark_capture_matches_logical_request_width(monkeypatch, query_len):
+    """FlashInfer padding must not produce unmatchable draft graph descriptors."""
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform, "get_global_graph_pool", lambda: None
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "is_device_capability_family",
+        lambda family: family == 120,
+    )
+    config = _create_vllm_config()
+    config.compilation_config.cudagraph_capture_sizes = [1, 2, 4, 8, 12, 16, 24]
+    config.compilation_config.max_cudagraph_capture_size = 24
+    config.scheduler_config.max_num_seqs = 6
+    draft = SimpleNamespace(
+        attn_cg_support=SimpleNamespace(
+            min_cg_support=AttentionCGSupport.UNIFORM_BATCH,
+        ),
+        num_query_per_req=query_len,
+        vllm_config=config,
+        device=torch.device("cpu"),
+        _speculator_name="DSpark",
+    )
+    DFlashSpeculator.init_cudagraph_manager(draft, CUDAGraphMode.FULL_AND_PIECEWISE)
+    manager = draft.query_cudagraph_manager
+    manager._graphs_captured = True
+    for num_reqs in range(1, 7):
+        desc = manager.dispatch(num_reqs, num_reqs * query_len, query_len, 0)
+        if query_len == 3:
+            assert desc.cg_mode == CUDAGraphMode.FULL
+            assert desc.uniform_token_count == query_len
+            assert desc.num_reqs >= num_reqs
+        else:
+            # No proven SM12x capture size is divisible by five.
+            assert desc.cg_mode == CUDAGraphMode.NONE
+
+
 def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
     """FULL capture must set graph_pool_id before entering torch.cuda.graph().
 
