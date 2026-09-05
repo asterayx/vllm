@@ -11,14 +11,20 @@
 # If MODEL_HOST has no config.json, the script serves the HF repo id and
 # does not bind-mount an empty directory (Docker would hide the hub cache).
 #
-# Stop any DeepSeek containers that share port 30001:
-#   docker rm -f dspark-tp2-rank0 dspark-tp2-rank1
-#
 # Head:
 #   NODE_RANK=0 ./docker/gb10/run-qwen38.sh
 # Worker:
 #   NODE_RANK=1 VLLM_HOST_IP=192.168.100.11 HEADLESS=--headless \
 #     ./docker/gb10/run-qwen38.sh
+#
+# By default this script stops leftover Spark serve containers on this
+# node (dspark-tp2-rank*, dspark-vision-tp2-rank*). Those hold the 128 GB
+# unified GPU and make NCCL fail at ncclCommInitRank with CUDA OOM.
+#   STOP_OTHER_SPARK_SERVERS=0 ./docker/gb10/run-qwen38.sh
+#
+# 262144 context does not fit with the FP8 PLE table on-GPU. Override
+# after a successful load if you have headroom:
+#   MAX_MODEL_LEN=32768 MAX_NUM_SEQS=4 ./docker/gb10/run-qwen38.sh
 #
 # Do not set VLLM_PLE_CPU_OFFLOAD=1: PLE offload rejects nnodes=2, so the
 # FP8 n-gram table (~25 GiB/rank) stays in GPU memory.
@@ -63,14 +69,23 @@ if [ "${HF_HUB_OFFLINE:-}" = "1" ] || [ "${HF_HUB_OFFLINE:-}" = "0" ]; then
   hf_offline="${HF_HUB_OFFLINE}"
 fi
 
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.80}"
+
 if [ "${QWEN38_RESOLVE_ONLY:-0}" = "1" ]; then
-  printf 'serve=%s\noffline=%s\nmount=%s\n' \
-    "${SERVE_MODEL}" "${hf_offline}" "${model_mount[*]-}"
+  printf 'serve=%s\noffline=%s\nmount=%s\nmax_model_len=%s\n' \
+    "${SERVE_MODEL}" "${hf_offline}" "${model_mount[*]-}" "${MAX_MODEL_LEN}"
   exit 0
 fi
 
 src_mount=()
 pythonpath_args=()
+hf_token_args=()
+if [ -n "${HF_TOKEN:-}" ]; then
+  hf_token_args=(-e "HF_TOKEN=${HF_TOKEN}")
+fi
 if [ "${MOUNT_VLLM_SRC}" != "0" ]; then
   VLLM_SRC="${VLLM_SRC:-$(cd "$(dirname "$0")/../.." && pwd)}"
   src_mount=(-v "${VLLM_SRC}:/opt/vllm")
@@ -82,6 +97,28 @@ fi
 
 mkdir -p "${VLLM_CACHE}" "${HF_CACHE}/flashinfer"
 docker rm -f "${NAME}" 2>/dev/null || true
+
+if [ "${STOP_OTHER_SPARK_SERVERS:-1}" != "0" ]; then
+  leftover=(
+    dspark-tp2-rank0
+    dspark-tp2-rank1
+    dspark-vision-tp2-rank0
+    dspark-vision-tp2-rank1
+  )
+  for c in "${leftover[@]}"; do
+    if docker inspect "${c}" >/dev/null 2>&1; then
+      docker rm -f "${c}" >/dev/null
+      echo "stopped leftover GPU server: ${c}"
+    fi
+  done
+fi
+
+echo "docker: $(docker ps --format '{{.Names}}' | tr '\n' ' ')"
+if command -v nvidia-smi >/dev/null 2>&1; then
+  echo "gpu: $(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits | tr -d ' ') MiB used/total"
+  nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory \
+    --format=csv,noheader 2>/dev/null | sed 's/^/gpu-proc: /' || true
+fi
 
 # JSON defaults cannot live in ${VAR:-...} (bash cuts at the first `}`).
 if [ -z "${CUGRAPH_CFG+x}" ]; then
@@ -106,6 +143,7 @@ docker run -d --name "${NAME}" \
   -v "${HF_CACHE}/flashinfer:/root/.cache/flashinfer" \
   -e HF_HUB_OFFLINE="${hf_offline}" \
   -e TRANSFORMERS_OFFLINE="${hf_offline}" \
+  "${hf_token_args[@]}" \
   "${pythonpath_args[@]}" \
   -e MOUNT_VLLM_SRC="${MOUNT_VLLM_SRC}" \
   -e VLLM_HOST_IP="${VLLM_HOST_IP}" \
@@ -150,10 +188,10 @@ docker run -d --name "${NAME}" \
   --distributed-executor-backend mp \
   --nnodes 2 --node-rank "${NODE_RANK}" \
   --master-addr "${MASTER_ADDR}" --master-port "${MASTER_PORT:-29500}" \
-  --max-model-len "${MAX_MODEL_LEN:-262144}" \
-  --max-num-seqs "${MAX_NUM_SEQS:-8}" \
-  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-8192}" \
-  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.85}" \
+  --max-model-len "${MAX_MODEL_LEN}" \
+  --max-num-seqs "${MAX_NUM_SEQS}" \
+  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --enable-prefix-caching \
   --no-enable-flashinfer-autotune \
   --enable-auto-tool-choice \

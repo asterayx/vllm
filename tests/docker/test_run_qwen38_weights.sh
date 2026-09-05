@@ -10,6 +10,10 @@ out="$(QWEN38_RESOLVE_ONLY=1 MODEL_HOST="${tmp}/missing" "${SCRIPT}")"
 printf '%s\n' "${out}" | grep -q 'serve=RadixArk/Qwen3.8-Flash-Next-NVFP4'
 printf '%s\n' "${out}" | grep -q 'offline=0'
 printf '%s\n' "${out}" | grep -q 'mount=$'
+printf '%s\n' "${out}" | grep -q 'max_model_len=8192'
+
+out="$(QWEN38_RESOLVE_ONLY=1 MODEL_HOST="${tmp}/missing" MAX_MODEL_LEN=32768 "${SCRIPT}")"
+printf '%s\n' "${out}" | grep -q 'max_model_len=32768'
 
 mkdir -p "${tmp}/empty"
 out="$(QWEN38_RESOLVE_ONLY=1 MODEL_HOST="${tmp}/empty" "${SCRIPT}")"
