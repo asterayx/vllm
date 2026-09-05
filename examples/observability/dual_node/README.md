@@ -84,10 +84,11 @@ systemd) is in
 [`docker/gb10/README.md`](../../../docker/gb10/README.md#cloudflare-tunnel-create-and-dash).
 This section is the Grafana `/dash` ingress only.
 
-On the head, publish Grafana at `https://token.asteraix.com/dash`.
-This is the only observability path; do not keep a `/telemetry`
-ingress. `sudo cloudflared service install` reads `/etc/cloudflared`,
-not `$HOME/.cloudflared` — use
+On the head, publish Grafana at `https://token.asteraix.com/dash`
+(listed first) and the compat proxy on the same host (`/v1`,
+`/configs`). Originate the API at `127.0.0.1:30000`, not `:30001`.
+`sudo cloudflared service install` reads `/etc/cloudflared`, not
+`$HOME/.cloudflared` — use
 [`cloudflared/install-service.sh`](cloudflared/install-service.sh).
 
 1. Add these lines to `config.env` (hostname must match DNS):

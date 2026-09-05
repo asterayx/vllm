@@ -395,9 +395,11 @@ Do not bind Grafana to Wi-Fi. cloudflared originates at `127.0.0.1:3000`.
 
 ## Cloudflare Tunnel (create and /dash)
 
-Publish Grafana at `https://<host>/dash` only. Do **not** add `/telemetry`.
-Do **not** put vLLM `:30001` or the compat proxy on the public internet
-unless you intend to; this section is Grafana-only.
+Publish Grafana at `https://<host>/dash` and the compat proxy
+(` /v1`, `/configs`, `/healthz`) on the same host. `/dash` must be
+listed first. Originate the API at `127.0.0.1:30000`, **not** vLLM
+`:30001`. Do **not** add `/telemetry`. This puts an unauthenticated
+OpenAI-compatible API on the public internet.
 
 Hostname in the checked-in examples is `token.asteraix.com`. Replace it
 everywhere (DNS, `config.yml`, `GRAFANA_DOMAIN`, `GRAFANA_ROOT_URL`) if
@@ -477,6 +479,15 @@ ingress:
     originRequest:
       httpHostHeader: token.asteraix.com
       disableChunkedEncoding: true
+
+  - hostname: token.asteraix.com
+    service: http://127.0.0.1:30000
+    originRequest:
+      httpHostHeader: token.asteraix.com
+      disableChunkedEncoding: true
+      connectTimeout: 10s
+      keepAliveTimeout: 600s
+      noHappyEyeballs: true
 
   - service: http_status:404
 EOF

@@ -67,6 +67,15 @@ ingress:
       httpHostHeader: ${HOSTNAME}
       disableChunkedEncoding: true
 
+  - hostname: ${HOSTNAME}
+    service: http://127.0.0.1:30000
+    originRequest:
+      httpHostHeader: ${HOSTNAME}
+      disableChunkedEncoding: true
+      connectTimeout: 10s
+      keepAliveTimeout: 600s
+      noHappyEyeballs: true
+
   - service: http_status:404
 EOF
 fi
@@ -80,4 +89,5 @@ fi
 sudo systemctl daemon-reload
 sudo systemctl enable --now cloudflared
 sudo systemctl status cloudflared --no-pager
-echo "login: https://${HOSTNAME}/dash"
+echo "login:  https://${HOSTNAME}/dash"
+echo "api:    https://${HOSTNAME}/v1/models"
