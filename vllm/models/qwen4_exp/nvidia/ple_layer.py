@@ -23,6 +23,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+    ModelOptNvFp4Config,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
@@ -106,9 +110,15 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
             input_size_per_partition,
             None,
             weight_loader,
-            scale_dtype=torch.bfloat16,
+            scale_dtype=torch.float32,
         )
         layer.register_parameter("weight_scale", weight_scale)
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        """Reject FP8 PLE checkpoints without a global scale."""
+        sentinel = torch.finfo(torch.float32).min
+        if torch.any(layer.weight_scale == sentinel):
+            raise ValueError("FP8 PLE checkpoint is missing its global scale")
 
     def apply(
         self,
@@ -122,11 +132,34 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
         return F.embedding(input_, layer.weight)
 
 
+def _ple_checkpoint_is_fp8(ple_embedding_dtype: object) -> bool:
+    """Whether ``ple_embedding_dtype`` declares FP8 PLE shards."""
+    if isinstance(ple_embedding_dtype, str):
+        ple_embedding_dtype = getattr(
+            torch, ple_embedding_dtype.rsplit(".", 1)[-1], None
+        )
+    return isinstance(ple_embedding_dtype, torch.dtype) and is_fp8(ple_embedding_dtype)
+
+
 def _get_ple_embedding_quant_method(
     quant_config: QuantizationConfig | None,
     prefix: str,
+    ple_embedding_dtype: object = None,
 ) -> QuantizeMethodBase | None:
     """Select global-scale FP8 only for quantized PLE checkpoint shards."""
+
+    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+        if quant_config._resolve_quant_algo(prefix) == "FP8":
+            return Qwen4ExpPLEFp8EmbeddingMethod()
+        return None
+
+    if isinstance(quant_config, ModelOptNvFp4Config):
+        # Excluded PLE tables can carry FP8 shards with a global scale.
+        if not quant_config.is_layer_excluded(prefix):
+            return None
+        if not _ple_checkpoint_is_fp8(ple_embedding_dtype):
+            return None
+        return Qwen4ExpPLEFp8EmbeddingMethod()
 
     if not isinstance(quant_config, Fp8Config):
         return None
@@ -315,7 +348,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             padding_size=divisor,
             prefix=f"{prefix}.ngram_embedding",
             quant_method=_get_ple_embedding_quant_method(
-                quant_config, f"{prefix}.ngram_embedding"
+                quant_config,
+                f"{prefix}.ngram_embedding",
+                getattr(config, "ple_embedding_dtype", None),
             ),
         )
         self.register_buffer(

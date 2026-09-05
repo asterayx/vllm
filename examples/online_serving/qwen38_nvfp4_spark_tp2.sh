@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+set -euo pipefail
+
+rank=${1:?Usage: bash qwen38_nvfp4_spark_tp2.sh NODE_RANK [extra vllm arguments]}
+shift
+if [[ "$rank" != 0 && "$rank" != 1 ]]; then
+    echo "NODE_RANK must be 0 or 1" >&2
+    exit 2
+fi
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+model=${MODEL_PATH:-$HOME/models/Qwen3.8-Flash-Next-NVFP4}
+if [[ ! -f "$model/config.json" ]]; then
+    echo "Set MODEL_PATH to the local checkpoint directory (config.json missing)." >&2
+    exit 2
+fi
+
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+export VLLM_HOST_IP=${VLLM_HOST_IP:?Set VLLM_HOST_IP to the local interconnect IP}
+export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1}
+export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}
+export VLLM_USE_DEEP_GEMM=0
+export FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST:-12.1a}
+export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-$repo_root/.cache/vllm}
+export FLASHINFER_WORKSPACE_BASE=${FLASHINFER_WORKSPACE_BASE:-$repo_root/.cache/flashinfer}
+
+args=(
+    "$model"
+    --served-model-name qwen38-nvfp4
+    --tensor-parallel-size 2
+    --distributed-executor-backend mp
+    --nnodes 2
+    --node-rank "$rank"
+    --master-addr "${MASTER_ADDR:?Set MASTER_ADDR to the rank 0 interconnect IP}"
+    --master-port "${MASTER_PORT:-29529}"
+    --quantization modelopt
+    --moe-backend "${MOE_BACKEND:-flashinfer_cutlass}"
+    --dtype bfloat16
+    --max-model-len "${MAX_MODEL_LEN:-16384}"
+    --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-2048}"
+    --max-num-seqs "${MAX_NUM_SEQS:-4}"
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.80}"
+    --disable-custom-all-reduce
+    --enforce-eager
+)
+if [[ "$rank" == 1 ]]; then
+    args+=(--headless)
+else
+    args+=(--host "${API_HOST:-127.0.0.1}" --port "${API_PORT:-18029}")
+fi
+
+exec "$repo_root/.venv/bin/vllm" serve "${args[@]}" "$@"

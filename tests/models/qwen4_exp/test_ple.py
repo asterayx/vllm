@@ -12,6 +12,10 @@ from torch.nn import functional as F
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+    ModelOptNvFp4Config,
+)
 from vllm.models.qwen4_exp.common.ple import (
     PLEShardOverlap,
     compute_ple_shard_overlap,
@@ -72,7 +76,7 @@ def _make_fp8_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     )
     embedding.register_parameter(
         "weight_scale",
-        nn.Parameter(torch.zeros(1, dtype=torch.bfloat16), requires_grad=False),
+        nn.Parameter(torch.zeros(1, dtype=torch.float32), requires_grad=False),
     )
     _set_test_embedding_weight_loader(embedding)
     module.ngram_embedding = embedding
@@ -156,11 +160,17 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
         module.ngram_embedding.weight.float(),
         torch.cat((shard_0[2:4], shard_1[0:2])).float(),
     )
-    assert torch.equal(module.ngram_embedding.weight_scale, weight_scale)
+    assert module.ngram_embedding.weight_scale.dtype == torch.float32
+    torch.testing.assert_close(
+        module.ngram_embedding.weight_scale,
+        weight_scale.float(),
+    )
 
 
 def _make_fp8_embedding_layer(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    load_scale: bool = True,
 ) -> embedding_module.VocabParallelEmbedding:
     monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -180,12 +190,14 @@ def _make_fp8_embedding_layer(
     )
     weight = torch.tensor([[1.0, 2.0], [4.0, 8.0], [16.0, 32.0]])
     layer.weight.data.copy_(weight.to(torch.float8_e4m3fn))
-    layer.weight_scale.data.copy_(torch.tensor([0.25], dtype=torch.bfloat16))
+    if load_scale:
+        layer.weight_scale.data.copy_(torch.tensor([0.25], dtype=torch.bfloat16))
     return layer
 
 
 def test_ple_fp8_embedding_dequantizes_in_ple_layer(monkeypatch) -> None:
     layer = _make_fp8_embedding_layer(monkeypatch)
+    layer.quant_method.process_weights_after_loading(layer)
     quantized_output = layer(torch.tensor([2, 0]))
     ple_layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     nn.Module.__init__(ple_layer)
@@ -198,11 +210,18 @@ def test_ple_fp8_embedding_dequantizes_in_ple_layer(monkeypatch) -> None:
     )
 
     assert layer.weight.dtype == torch.float8_e4m3fn
-    assert layer.weight_scale.dtype == torch.bfloat16
+    assert layer.weight_scale.dtype == torch.float32
     assert quantized_output.dtype == torch.float8_e4m3fn
     assert output.dtype == torch.bfloat16
     weight = torch.tensor([[1.0, 2.0], [4.0, 8.0], [16.0, 32.0]])
     torch.testing.assert_close(output, (weight[[2, 0]] * 0.25).bfloat16())
+
+
+def test_ple_fp8_embedding_rejects_missing_global_scale(monkeypatch) -> None:
+    layer = _make_fp8_embedding_layer(monkeypatch, load_scale=False)
+
+    with pytest.raises(ValueError, match="missing its global scale"):
+        layer.quant_method.process_weights_after_loading(layer)
 
 
 def test_ple_fp8_embedding_uses_int8_for_tp_reduce(monkeypatch) -> None:
@@ -399,3 +418,130 @@ def test_ple_short_conv_uses_fallback_when_profile_metadata_is_omitted(
     output = module._short_conv(inputs)
 
     assert output is expected
+
+
+def test_ple_fp8_embedding_supports_mixed_precision_config() -> None:
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    quant_config = ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "exclude_modules": [],
+                "group_size": 16,
+                "quantized_layers": {
+                    prefix: {"quant_algo": "FP8"},
+                    "model.language_model.layers.2.moe.gate_proj": {
+                        "quant_algo": "NVFP4"
+                    },
+                },
+            }
+        }
+    )
+
+    assert isinstance(
+        _get_ple_embedding_quant_method(quant_config, prefix),
+        Qwen4ExpPLEFp8EmbeddingMethod,
+    )
+    assert (
+        _get_ple_embedding_quant_method(
+            quant_config,
+            "model.language_model.layers.2.moe.gate_proj",
+        )
+        is None
+    )
+
+
+def _nvfp4_config(exclude_modules: list[str]) -> ModelOptNvFp4Config:
+    """Mirrors ``config.json``'s ``quantization_config`` in NVFP4 checkpoints."""
+    return ModelOptNvFp4Config.from_config(
+        {
+            "quant_algo": "NVFP4",
+            "quant_method": "modelopt",
+            "ignore": exclude_modules,
+            "group_size": 16,
+        }
+    )
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_nvfp4_ple_loads_fp8_checkpoint_across_tp2_shards(monkeypatch, rank):
+    """Both ranks load their rows and global scale through the real selector."""
+    from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
+
+    for module in (embedding_module, parameter_module):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 2)
+    config = Qwen4ExpTextConfig(
+        ngram_size=2,
+        heads_per_ngram=1,
+        ngram_vocab_size_base=7,
+        make_ngram_vocab_size_divisible_by=2,
+        split_ngram_parts=3,
+        ple_embedding_dtype="float8_e4m3fn",
+        eos_token_id=0,
+    )
+    module = Qwen4ExpNGramEmbedding(
+        config,
+        embedding_dim=2,
+        ple_dense_layer_id=0,
+        max_total_tokens=4,
+        max_num_reqs=1,
+        prefix="model.language_model.layers.2.ple.ple_embedding",
+        layer_name="ple",
+        quant_config=_nvfp4_config(["*.ple.*"]),
+        params_dtype=torch.bfloat16,
+    )
+    table = torch.arange(16).reshape(8, 2).to(torch.float8_e4m3fn)
+    loaded = module.load_weights(
+        [
+            (f"ngram_embedding.shard_{i}.weight", shard)
+            for i, shard in enumerate(table.split(3))
+        ]
+        + [("ngram_embedding.weight_scale", torch.tensor([0.25]))]
+    )
+    embedding = module.ngram_embedding
+    embedding.quant_method.process_weights_after_loading(embedding)
+
+    assert loaded == {"ngram_embedding.weight", "ngram_embedding.weight_scale"}
+    assert embedding.weight.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(
+        embedding.weight.float(), table[rank * 4 : rank * 4 + 4].float()
+    )
+    torch.testing.assert_close(embedding.weight_scale, torch.tensor([0.25]))
+
+
+def test_ple_fp8_embedding_loads_under_nvfp4_checkpoint() -> None:
+    """An NVFP4 body keeps the FP8 PLE table's global scale (see #54765)."""
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    quant_config = _nvfp4_config(["*.ple.*"])
+
+    assert isinstance(
+        _get_ple_embedding_quant_method(quant_config, prefix, "float8_e4m3fn"),
+        Qwen4ExpPLEFp8EmbeddingMethod,
+    )
+    assert isinstance(
+        _get_ple_embedding_quant_method(quant_config, prefix, torch.float8_e4m3fn),
+        Qwen4ExpPLEFp8EmbeddingMethod,
+    )
+
+
+@pytest.mark.parametrize(
+    "exclude_modules,ple_embedding_dtype",
+    [
+        # The table is excluded but stored unquantized.
+        (["*.ple.*"], None),
+        (["*.ple.*"], "bfloat16"),
+        # The table is not excluded, so NVFP4 shards are expected.
+        ([], "float8_e4m3fn"),
+    ],
+)
+def test_ple_fp8_embedding_skipped_for_non_fp8_nvfp4_tables(
+    exclude_modules: list[str], ple_embedding_dtype: object
+) -> None:
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    quant_config = _nvfp4_config(exclude_modules)
+
+    assert (
+        _get_ple_embedding_quant_method(quant_config, prefix, ple_embedding_dtype)
+        is None
+    )
