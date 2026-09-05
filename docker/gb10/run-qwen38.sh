@@ -4,9 +4,12 @@
 # This model is Qwen4Exp (GDN + QSA + PLE + MoE). Official v0.28.0 does not
 # include it; this branch backports #53896 and the NVFP4 PLE load fix (#54765).
 #
-# Download the checkpoint on both nodes first:
+# Weights: either a local dir with config.json, or the HF hub/cache.
 #   huggingface-cli download RadixArk/Qwen3.8-Flash-Next-NVFP4 \
 #     --local-dir ~/models/Qwen3.8-Flash-Next-NVFP4
+#   MODEL_HOST=~/models/Qwen3.8-Flash-Next-NVFP4 ./docker/gb10/run-qwen38.sh
+# If MODEL_HOST has no config.json, the script serves the HF repo id and
+# does not bind-mount an empty directory (Docker would hide the hub cache).
 #
 # Stop any DeepSeek containers that share port 30001:
 #   docker rm -f dspark-tp2-rank0 dspark-tp2-rank1
@@ -23,6 +26,7 @@
 set -euo pipefail
 
 IMAGE="${VLLM_GB10_IMAGE:-vllm-gb10:v0.28.0-dsv4-spark}"
+HF_MODEL_ID="${HF_MODEL_ID:-RadixArk/Qwen3.8-Flash-Next-NVFP4}"
 MODEL_HOST="${MODEL_HOST:-${HOME}/models/Qwen3.8-Flash-Next-NVFP4}"
 MODEL_PATH="${MODEL_PATH:-/models/Qwen3.8-Flash-Next-NVFP4}"
 MOUNT_VLLM_SRC="${MOUNT_VLLM_SRC:-1}"
@@ -33,6 +37,37 @@ VLLM_HOST_IP="${VLLM_HOST_IP:-${MASTER_ADDR}}"
 NODE_RANK="${NODE_RANK:-0}"
 HEADLESS="${HEADLESS:-}"
 NAME="${NAME:-qwen38-nvfp4-tp2-rank${NODE_RANK}}"
+
+model_mount=()
+hf_offline=0
+if [ -f "${MODEL_HOST}/config.json" ]; then
+  SERVE_MODEL="${MODEL_PATH}"
+  model_mount=(-v "${MODEL_HOST}:${MODEL_PATH}:ro")
+  hf_offline=1
+  echo "weights: ${MODEL_HOST} -> ${MODEL_PATH}"
+else
+  if [ -e "${MODEL_HOST}" ]; then
+    echo "weights: ${MODEL_HOST} exists but has no config.json; using ${HF_MODEL_ID}" >&2
+    if [ -d "${MODEL_HOST}" ]; then
+      echo "weights: contents: $(ls -A "${MODEL_HOST}" | head -n 8 | tr '\n' ' ')" >&2
+    fi
+  else
+    echo "weights: ${MODEL_HOST} missing; using ${HF_MODEL_ID}" >&2
+    echo "weights: download with --local-dir ${MODEL_HOST} to skip hub lookup" >&2
+  fi
+  SERVE_MODEL="${HF_MODEL_ID}"
+  # Do not bind-mount a missing/empty MODEL_HOST. Docker creates an empty
+  # directory and vLLM then rejects /models/... as an invalid local path.
+fi
+if [ "${HF_HUB_OFFLINE:-}" = "1" ] || [ "${HF_HUB_OFFLINE:-}" = "0" ]; then
+  hf_offline="${HF_HUB_OFFLINE}"
+fi
+
+if [ "${QWEN38_RESOLVE_ONLY:-0}" = "1" ]; then
+  printf 'serve=%s\noffline=%s\nmount=%s\n' \
+    "${SERVE_MODEL}" "${hf_offline}" "${model_mount[*]-}"
+  exit 0
+fi
 
 src_mount=()
 pythonpath_args=()
@@ -64,13 +99,13 @@ docker run -d --name "${NAME}" \
   --device /dev/infiniband \
   -v /dev/infiniband:/dev/infiniband \
   -v /sys/class/infiniband:/sys/class/infiniband \
-  -v "${MODEL_HOST}:${MODEL_PATH}:ro" \
+  "${model_mount[@]}" \
   "${src_mount[@]}" \
   -v "${VLLM_CACHE}:/root/.cache/vllm" \
   -v "${HF_CACHE}:/root/.cache/huggingface" \
   -v "${HF_CACHE}/flashinfer:/root/.cache/flashinfer" \
-  -e HF_HUB_OFFLINE=1 \
-  -e TRANSFORMERS_OFFLINE=1 \
+  -e HF_HUB_OFFLINE="${hf_offline}" \
+  -e TRANSFORMERS_OFFLINE="${hf_offline}" \
   "${pythonpath_args[@]}" \
   -e MOUNT_VLLM_SRC="${MOUNT_VLLM_SRC}" \
   -e VLLM_HOST_IP="${VLLM_HOST_IP}" \
@@ -107,7 +142,7 @@ docker run -d --name "${NAME}" \
        fi
        exec /opt/venv/bin/python -m vllm.entrypoints.cli.main "$@"' \
   vllm \
-  serve "${MODEL_PATH}" \
+  serve "${SERVE_MODEL}" \
   --served-model-name "${SERVED_MODEL_NAME:-qwen3.8-flash-next-nvfp4}" \
   --host 0.0.0.0 --port "${VLLM_PORT:-30001}" \
   --trust-remote-code \
