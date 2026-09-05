@@ -11,6 +11,7 @@ if [[ "$rank" != 0 && "$rank" != 1 ]]; then
 fi
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+export PATH="$repo_root/.venv/bin:$PATH"
 model=${MODEL_PATH:-$HOME/models/Qwen3.8-Flash-Next-NVFP4}
 if [[ ! -f "$model/config.json" ]]; then
     echo "Set MODEL_PATH to the local checkpoint directory (config.json missing)." >&2
@@ -23,8 +24,13 @@ export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1}
 export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}
 export VLLM_USE_DEEP_GEMM=0
 export FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST:-12.1a}
+export MAX_JOBS=${MAX_JOBS:-8}
 export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-$repo_root/.cache/vllm}
 export FLASHINFER_WORKSPACE_BASE=${FLASHINFER_WORKSPACE_BASE:-$repo_root/.cache/flashinfer}
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$repo_root/.cache/triton}
+if [[ -f "$repo_root/.venv/include/python3.12/Python.h" ]]; then
+    export CPATH="$repo_root/.venv/include/python3.12:$repo_root/.venv/include${CPATH:+:$CPATH}"
+fi
 
 args=(
     "$model"

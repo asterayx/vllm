@@ -42,6 +42,17 @@ uv pip install -e . --torch-backend=cu130 --index-strategy unsafe-best-match
 Both nodes need the same model revision and complete local weights. A Hugging
 Face cache snapshot can be passed directly as `MODEL_PATH`.
 
+The interpreter's matching Python development headers are required, including
+for Triton's runtime compilation. For an isolated deployment without system
+package changes, place `python3.12/` and the matching architecture-specific
+header directory under `.venv/include/`. The launcher uses those headers when
+`.venv/include/python3.12/Python.h` exists. Both the interpreter version and
+architecture must match the headers.
+
+The launcher puts `.venv/bin` on `PATH` so FlashInfer can find `ninja` during
+kernel compilation. It defaults to eight compilation jobs; override `MAX_JOBS`
+to adjust this limit.
+
 ## Launch
 
 Run rank 1 on the worker, then rank 0 on the head. Set the interconnect IPs and
@@ -83,8 +94,11 @@ curl --fail http://127.0.0.1:18029/v1/chat/completions \
 ```
 
 Local validation: 18 PLE tests passed, including both TP2 ranks; all relevant
-pre-commit hooks passed. Full GPU loading, generation, and model evaluation
-results are pending. CPU tests alone do not establish Spark serving support.
+pre-commit hooks passed. On the head GB10, the combined PLE and model config
+suites passed all 25 tests. Both TP ranks loaded the complete checkpoint and
+reported approximately 61.73 GiB of model memory per GPU. Serving initialization,
+generation, and model evaluation are still pending; weight loading alone does
+not establish Spark serving support.
 
 The broader local `test_config.py` run passed six tests but could not import the
 MTP model for one test because the macOS environment lacks `torchvision`.
@@ -96,12 +110,11 @@ On the two test machines, the isolated worktree is
 over the interconnect to rank 1 at
 `/home/roccen/models/Qwen3.8-Flash-Next-NVFP4-codex-rc4`.
 
-Head installation completed with the rc4 precompiled wheel. Worker installation
-hit a missing `Python.h` while building `instanttensor`; copying the completed
-head environment was attempted but could not be verified after SSH connections
-started timing out during banner exchange. Finish the worker installation and
-verify both GPU environments before launching the service. The old worker
-container `qwen38-nvfp4-tp2-rank1` was stopped with user authorization.
+Both machines have the rc4 precompiled extensions and can import CUDA kernels.
+Worker dependencies were copied from the isolated head environment, followed by
+a completed editable install; matching Python headers were copied into its
+`.venv/include/` for Triton. The old worker container
+`qwen38-nvfp4-tp2-rank1` was stopped with user authorization.
 
 AI assistance was used for this branch. The backported implementation and tests
 retain their upstream provenance above.
