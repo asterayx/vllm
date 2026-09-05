@@ -12,8 +12,11 @@ This branch restores the existing proxy from commit `0648ef21c`, including its
 UTF-8 stream-boundary fix. For Qwen3.8, run
 `bash examples/online_serving/qwen38_nvfp4_spark_proxy.sh` from the repository
 root after building. It uses loopback port 30000, upstream port 18029, model
-`qwen38-nvfp4`, and a 16384-token client context limit. `--context-window` controls
+`qwen38-nvfp4`, and a 524288-token client context limit. `--context-window` controls
 the advertised Grok/OpenCode limit; it must match the serving configuration.
+The Qwen wrapper allows 3600 seconds of upstream silence during long prefill
+(`--upstream-read-timeout-secs`). SSE streams emit keep-alive comments every
+15 seconds without changing model events or splitting partial SSE lines.
 
 Also serves downloadable client configs:
 

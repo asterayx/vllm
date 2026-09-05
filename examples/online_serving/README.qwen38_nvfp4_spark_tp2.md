@@ -75,8 +75,8 @@ bash examples/online_serving/qwen38_nvfp4_spark_tp2.sh 0
 The script defaults to `enp1s0f1np1`, rendezvous port `29529`, and an API on
 `127.0.0.1:18029`. Override `NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`,
 `MASTER_PORT`, `API_HOST`, or `API_PORT` as needed. Caches stay inside this
-worktree. The initial configuration uses eager execution, 16K context,
-2048 batched tokens, four concurrent sequences, and a fixed 4 GiB KV cache per
+worktree. The configuration uses eager execution, 512K context,
+2048 batched tokens, four concurrent sequences, and a fixed 16 GiB KV cache per
 GPU. The explicit cache budget takes precedence over the memory-utilization
 fraction for KV allocation. Spark shares GPU and system memory; leaving the
 cache budget implicit allocated about 33 GiB per GPU in the initial test and
@@ -85,6 +85,14 @@ Set `MAX_MODEL_LEN`, `MAX_NUM_BATCHED_TOKENS`, `MAX_NUM_SEQS`, and
 `KV_CACHE_MEMORY_BYTES` identically on both nodes when tuning. Increase the cache
 budget when increasing context length or concurrency, and check available system
 memory during startup and serving.
+
+512K means 524,288 total input and output tokens per request. The checkpoint
+declares 262,144 positions; above that length the launcher applies a 2x YaRN
+RoPE override while preserving interleaved multimodal RoPE. This is an
+experimental extension, not the checkpoint's native context guarantee. The
+checkpoint files are not modified. Set `MAX_MODEL_LEN=262144` or less to use
+the checkpoint's original RoPE. Four concurrent sequences share the cache;
+this budget does not promise four simultaneous full-length 512K requests.
 
 FlashInfer autotuning is disabled in this example. On a repeated two-node
 startup, rank 0 hit its cached MoE tactics while rank 1 entered profiling and
@@ -183,7 +191,28 @@ bash examples/online_serving/qwen38_nvfp4_spark_proxy.sh
 The deployment path is Cloudflare Tunnel → `127.0.0.1:30000` (proxy) →
 `127.0.0.1:18029` (vLLM). The public API base is
 `https://token.asterayx.com/v1`, and the served model is `qwen38-nvfp4`.
-The proxy wrapper sets the client context limit to 16,384 tokens.
+The proxy wrapper sets the client context limit to 524,288 tokens and the
+upstream read timeout to 3,600 seconds. SSE comments keep downstream streams
+active every 15 seconds while upstream prefill is silent. Use streaming for
+long requests through the public tunnel; non-streaming HTTP requests remain
+subject to the tunnel's response timeout.
+
+The 512K startup reported 1,278,714 cache tokens (2.44 maximum-length requests
+by the engine's estimate). A streamed Responses request through the local
+proxy processed 523,760 input tokens and generated 15 output tokens in
+258.52 seconds, with no cached input tokens. It correctly retrieved all three
+four-digit codes placed at approximately 10%, 50%, and 90% of a repeated
+archive prompt. Head available memory stayed around 28 GiB. This synthetic
+retrieval smoke test does not establish accuracy on general 512K documents.
+The same full-length payload also completed through the public HTTPS Responses
+endpoint with HTTP 200 and all three correct codes. That repeat took 50.84
+seconds including upload and reused 523,712 cached input tokens; it is not a
+cold-prefill timing.
+The same 16-question GSM8K evaluation with YaRN enabled scored 15/16 (93.75%)
+with zero invalid responses, matching the original configuration. Its latency
+included waiting behind the long prefill and is not a throughput measurement.
+All 11 proxy Rust tests passed, including idle-stream heartbeats and preservation
+of partial SSE lines, along with repository pre-commit checks.
 
 `https://token.asterayx.com/configs/grok.toml` provides the Grok Build model
 configuration. Merge its model block into the existing Grok configuration,

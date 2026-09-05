@@ -45,14 +45,17 @@ args=(
     --moe-backend "${MOE_BACKEND:-flashinfer_cutlass}"
     --kernel-config '{"enable_flashinfer_autotune": false}'
     --dtype bfloat16
-    --max-model-len "${MAX_MODEL_LEN:-16384}"
+    --max-model-len "${MAX_MODEL_LEN:-524288}"
     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-2048}"
     --max-num-seqs "${MAX_NUM_SEQS:-4}"
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.80}"
-    --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES:-4294967296}"
+    --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES:-17179869184}"
     --disable-custom-all-reduce
     --enforce-eager
 )
+if (( ${MAX_MODEL_LEN:-524288} > 262144 )); then
+    args+=(--hf-overrides '{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":262144,"rope_theta":10000000,"partial_rotary_factor":0.25,"mrope_section":[11,11,10],"mrope_interleaved":true}}}')
+fi
 if [[ "$rank" == 1 ]]; then
     args+=(--headless)
 else

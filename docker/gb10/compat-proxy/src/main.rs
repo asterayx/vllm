@@ -102,6 +102,9 @@ struct Args {
     context_window: u32,
     #[command(subcommand)]
     command: Option<Command>,
+    /// Maximum upstream silence while prefill or generation is running.
+    #[arg(long, default_value_t = 600)]
+    upstream_read_timeout_secs: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -147,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect_timeout(Duration::from_secs(5))
         // No total timeout: DSv4 streams can run past 10 minutes.
         // Stall if the upstream goes silent between SSE chunks.
-        .read_timeout(Duration::from_secs(600))
+        .read_timeout(Duration::from_secs(args.upstream_read_timeout_secs))
         .build()?;
 
     let state = AppState {
@@ -355,11 +358,23 @@ where
     S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    sse_rewrite_stream_with_keepalive(stream, Duration::from_secs(15))
+}
+
+fn sse_rewrite_stream_with_keepalive<S, E>(
+    stream: S,
+    heartbeat: Duration,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     use bytes::Bytes;
 
     let mut stream = Box::pin(stream);
     let mut pending = Vec::new();
     let mut finished = false;
+    let mut interval = tokio::time::interval(heartbeat);
     futures_util::stream::poll_fn(move |cx| {
         if finished {
             return std::task::Poll::Ready(None);
@@ -386,7 +401,13 @@ where
                     )))))
                 }
             }
-            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Pending => {
+                if interval.poll_tick(cx).is_ready() && pending.is_empty() {
+                    std::task::Poll::Ready(Some(Ok(Bytes::from_static(b": keep-alive\n\n"))))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
         }
     })
     .filter(|item| {
@@ -395,6 +416,42 @@ where
             Err(_) => true,
         })
     })
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn silent_upstream_emits_sse_comment() {
+        let source = futures_util::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+        let stream = sse_rewrite_stream_with_keepalive(source, Duration::from_millis(1));
+        futures_util::pin_mut!(stream);
+        let chunk = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk, bytes::Bytes::from_static(b": keep-alive\n\n"));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_does_not_split_partial_sse_line() {
+        let source = futures_util::stream::iter([Ok::<_, std::io::Error>(
+            bytes::Bytes::from_static(b"data: [DO"),
+        )])
+        .chain(futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok(bytes::Bytes::from_static(b"NE]\n\n"))
+        }));
+        let stream = sse_rewrite_stream_with_keepalive(source, Duration::from_millis(1));
+        futures_util::pin_mut!(stream);
+        let mut output = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            output.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(output, b"data: [DONE]\n\n");
+    }
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {

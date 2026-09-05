@@ -16,5 +16,6 @@ exec "$binary" \
     --public-base "${PUBLIC_BASE:-https://token.asterayx.com}" \
     --model qwen38-nvfp4 \
     --display-name Qwen3.8-Flash-Next-NVFP4 \
-    --context-window "${MAX_MODEL_LEN:-16384}" \
+    --context-window "${MAX_MODEL_LEN:-524288}" \
+    --upstream-read-timeout-secs "${UPSTREAM_READ_TIMEOUT_SECS:-3600}" \
     "$@"
