@@ -24,7 +24,7 @@ export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp1s0f1np1}
 export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}
 export VLLM_USE_DEEP_GEMM=0
 export FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST:-12.1a}
-export MAX_JOBS=${MAX_JOBS:-8}
+export MAX_JOBS=${MAX_JOBS:-4}
 export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-$repo_root/.cache/vllm}
 export FLASHINFER_WORKSPACE_BASE=${FLASHINFER_WORKSPACE_BASE:-$repo_root/.cache/flashinfer}
 export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$repo_root/.cache/triton}
@@ -43,11 +43,13 @@ args=(
     --master-port "${MASTER_PORT:-29529}"
     --quantization modelopt
     --moe-backend "${MOE_BACKEND:-flashinfer_cutlass}"
+    --kernel-config '{"enable_flashinfer_autotune": false}'
     --dtype bfloat16
     --max-model-len "${MAX_MODEL_LEN:-16384}"
     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-2048}"
     --max-num-seqs "${MAX_NUM_SEQS:-4}"
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.80}"
+    --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES:-4294967296}"
     --disable-custom-all-reduce
     --enforce-eager
 )

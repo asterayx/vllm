@@ -50,7 +50,7 @@ header directory under `.venv/include/`. The launcher uses those headers when
 architecture must match the headers.
 
 The launcher puts `.venv/bin` on `PATH` so FlashInfer can find `ninja` during
-kernel compilation. It defaults to eight compilation jobs; override `MAX_JOBS`
+kernel compilation. It defaults to four compilation jobs; override `MAX_JOBS`
 to adjust this limit.
 
 ## Launch
@@ -60,7 +60,7 @@ interface names for your machines. The following addresses match the test setup:
 
 ```bash
 # Worker: aitopatom-da17
-MODEL_PATH=/path/to/local/checkpoint \
+MODEL_PATH="$HOME/models/Qwen3.8-Flash-Next-NVFP4-codex-rc4" \
 MASTER_ADDR=192.168.100.10 VLLM_HOST_IP=192.168.100.11 \
 bash examples/online_serving/qwen38_nvfp4_spark_tp2.sh 1
 ```
@@ -76,39 +76,72 @@ The script defaults to `enp1s0f1np1`, rendezvous port `29529`, and an API on
 `127.0.0.1:18029`. Override `NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`,
 `MASTER_PORT`, `API_HOST`, or `API_PORT` as needed. Caches stay inside this
 worktree. The initial configuration uses eager execution, 16K context,
-2048 batched tokens, four concurrent sequences, and 80% memory utilization.
+2048 batched tokens, four concurrent sequences, and a fixed 4 GiB KV cache per
+GPU. The explicit cache budget takes precedence over the memory-utilization
+fraction for KV allocation. Spark shares GPU and system memory; leaving the
+cache budget implicit allocated about 33 GiB per GPU in the initial test and
+left only about 10 GiB available on the head during serving.
 Set `MAX_MODEL_LEN`, `MAX_NUM_BATCHED_TOKENS`, `MAX_NUM_SEQS`, and
-`GPU_MEMORY_UTILIZATION` identically on both nodes when tuning.
+`KV_CACHE_MEMORY_BYTES` identically on both nodes when tuning. Increase the cache
+budget when increasing context length or concurrency, and check available system
+memory during startup and serving.
+
+FlashInfer autotuning is disabled in this example. On a repeated two-node
+startup, rank 0 hit its cached MoE tactics while rank 1 entered profiling and
+waited in `flashinfer.autotuner._profile_single_kernel`'s `all_reduce`. Disabling
+this optional tuning avoids that collective mismatch; CUTLASS kernel execution
+and the other kernel warmups remain enabled. Performance with heuristic tactics
+can differ from a successful autotuned run.
+
+To access the head's loopback API from the local computer, keep an SSH tunnel
+open with `ssh -N -L 18029:127.0.0.1:18029 aitopatom-d6d3`, then use
+`http://127.0.0.1:18029/v1` with model name `qwen38-nvfp4`.
 
 ## Verification
 
 ```bash
-.venv/bin/python -m pytest tests/models/qwen4_exp/test_ple.py -v
+.venv/bin/python -m pytest tests/models/qwen4_exp/test_ple.py \
+  tests/models/qwen4_exp/test_config.py -v
 pre-commit run --files vllm/models/qwen4_exp/nvidia/ple_layer.py \
   tests/models/qwen4_exp/test_ple.py \
   examples/online_serving/qwen38_nvfp4_spark_tp2.sh
 curl --fail http://127.0.0.1:18029/health
 curl --fail http://127.0.0.1:18029/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen38-nvfp4","messages":[{"role":"user","content":"What is 2 + 2?"}],"max_tokens":256,"temperature":0}'
+  -d '{"model":"qwen38-nvfp4","messages":[{"role":"user","content":"What is 2 + 2?"}],"max_tokens":256,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}'
+.venv/bin/python examples/online_serving/qwen38_nvfp4_spark_eval.py
 ```
 
 Local validation: 18 PLE tests passed, including both TP2 ranks; all relevant
 pre-commit hooks passed. On the head GB10, the combined PLE and model config
 suites passed all 25 tests. Both TP ranks loaded the complete checkpoint and
-reported approximately 61.73 GiB of model memory per GPU. Serving initialization,
-generation, and model evaluation are still pending; weight loading alone does
-not establish Spark serving support.
+reported approximately 61.73 GiB of model memory per GPU. Both ranks completed
+profiling, cache initialization, and kernel warmup. The health endpoint returned
+HTTP 200; arithmetic, Chinese explanation, and synthetic red-image recognition
+requests returned correct responses.
 
-On the worker GB10, the existing `test_flashinfer_fp4_moe_no_graph` reference
+On both GB10s, the existing `test_flashinfer_fp4_moe_no_graph` reference
 check passed for the checkpoint's TP2 expert shape: `n=320`, `k=2560`,
 `e=512`, `topk=10`, BF16 input and SiLU activation, with both `m=1` and
-`m=16`. This validates individual FlashInfer CUTLASS NVFP4 expert computations,
-not end-to-end model outputs. Full serving verification is blocked while the
-head's SSH service is unresponsive.
+`m=16`.
 
-The broader local `test_config.py` run passed six tests but could not import the
-MTP model for one test because the macOS environment lacks `torchvision`.
+The first serving evaluation answered 15/16 GSM8K questions correctly (93.75%),
+with no invalid responses. It used the first 16 test questions, five-shot prompts,
+chat completions with thinking disabled, temperature 0, seed 42, a 1024-token
+output limit, and two concurrent requests. The evaluation script reuses the
+repository's GSM8K prompt builder and scorer and saves per-question outputs to
+`.run/gsm8k-16.json`. This is a small regression sample, not a full accuracy or
+performance benchmark.
+
+The final 4 GiB cache configuration with autotuning disabled started successfully.
+Four simultaneously submitted requests passed: recall from a 14,543-token prompt,
+integer multiplication, Chinese translation, and red-image recognition. Available
+system memory during these requests was approximately 41 GiB on the head and
+46 GiB on the worker, compared with about 10 GiB on the head in the initial
+implicit-cache run. The final GSM8K rerun also scored 15/16 (93.75%) with zero
+invalid responses: 2,674 output tokens in 70.45 seconds at two-request
+concurrency. These timings include request processing and are not a dedicated
+throughput benchmark. The health endpoint remained HTTP 200 after evaluation.
 
 On the two test machines, the isolated worktree is
 `/home/roccen/src/vllm-qwen38-nvfp4-spark-tp2`. The original
@@ -118,10 +151,20 @@ over the interconnect to rank 1 at
 `/home/roccen/models/Qwen3.8-Flash-Next-NVFP4-codex-rc4`.
 
 Both machines have the rc4 precompiled extensions and can import CUDA kernels.
+The head's editable install generated the version string
+`0.29.0rc5.dev0+gd2906cc19.d20260905` from the modified rc4 tree; this is build
+metadata, not an rc5 source base. The source baseline and binary wheel are the
+rc4 commit recorded above. The installation command pins the displayed version
+for future installs.
 Worker dependencies were copied from the isolated head environment, followed by
 a completed editable install; matching Python headers were copied into its
 `.venv/include/` for Triton. The old worker container
 `qwen38-nvfp4-tp2-rank1` was stopped with user authorization.
+
+The head's earlier SSH failure coincided with repeated system OOM events in the
+kernel journal. During verification, a separate test watchdog terminates only
+the test process group if system `MemAvailable` stays below 8 GiB. Compilation
+caches were prepared before full loading and `MAX_JOBS=4` was used for serving.
 
 AI assistance was used for this branch. The backported implementation and tests
 retain their upstream provenance above.
