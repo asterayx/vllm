@@ -67,6 +67,17 @@ ingress:
       httpHostHeader: ${HOSTNAME}
       disableChunkedEncoding: true
 
+  - hostname: ${HOSTNAME}
+    path: /configs(/.*)?
+    service: http://127.0.0.1:30000
+    originRequest:
+      httpHostHeader: ${HOSTNAME}
+      disableChunkedEncoding: true
+
+  - hostname: ${HOSTNAME}
+    path: /healthz
+    service: http://127.0.0.1:30000
+
   - service: http_status:404
 EOF
 fi
@@ -80,4 +91,5 @@ fi
 sudo systemctl daemon-reload
 sudo systemctl enable --now cloudflared
 sudo systemctl status cloudflared --no-pager
-echo "login: https://${HOSTNAME}/dash"
+echo "login:     https://${HOSTNAME}/dash"
+echo "configs:   https://${HOSTNAME}/configs"

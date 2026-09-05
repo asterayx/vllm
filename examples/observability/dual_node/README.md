@@ -84,9 +84,10 @@ systemd) is in
 [`docker/gb10/README.md`](../../../docker/gb10/README.md#cloudflare-tunnel-create-and-dash).
 This section is the Grafana `/dash` ingress only.
 
-On the head, publish Grafana at `https://token.asteraix.com/dash`.
-This is the only observability path; do not keep a `/telemetry`
-ingress. `sudo cloudflared service install` reads `/etc/cloudflared`,
+On the head, publish Grafana at `https://token.asteraix.com/dash`
+and Codex / Grok / OpenCode downloads at
+`https://token.asteraix.com/configs`. Do not keep a `/telemetry`
+ingress or a catch-all to `:30000` / `:30001`. `sudo cloudflared service install` reads `/etc/cloudflared`,
 not `$HOME/.cloudflared` — use
 [`cloudflared/install-service.sh`](cloudflared/install-service.sh).
 

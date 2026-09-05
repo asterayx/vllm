@@ -1,7 +1,10 @@
 //! Client configs for Codex, Grok Build, and OpenCode.
 
 pub struct ConfigContext<'a> {
+    /// API base_url / baseURL written into Codex / Grok / OpenCode files.
     pub public_base: &'a str,
+    /// Host for the download page and curl examples (cloudflared /configs).
+    pub download_base: &'a str,
     pub model: &'a str,
     pub display_name: &'a str,
 }
@@ -37,7 +40,7 @@ request_max_retries = 4
 "#,
         model = ctx.model,
         api = api,
-        pub = ctx.public_base.trim_end_matches('/'),
+        pub = ctx.download_base.trim_end_matches('/'),
     )
 }
 
@@ -69,7 +72,7 @@ context_window = 524288
         model = ctx.model,
         api = api,
         display = ctx.display_name,
-        pub = ctx.public_base.trim_end_matches('/'),
+        pub = ctx.download_base.trim_end_matches('/'),
     )
 }
 
@@ -127,6 +130,8 @@ pub fn index_html(ctx: &ConfigContext<'_>) -> String {
   <h1>Spark OpenAI compat proxy</h1>
   <p>Upstream rewrite: <code>reasoning</code> → <code>reasoning_content</code>.
      API base: <code>{api}</code> · model <code>{model}</code></p>
+  <p>Download this page from <code>{pub}/configs</code>. The API itself
+     stays on the listen address (not published on the tunnel).</p>
   <p><a href="/healthz">/healthz</a></p>
   <h2>Download client configs</h2>
   <ul>
@@ -149,7 +154,7 @@ curl -fsS {pub}/configs/opencode.json -o ~/.config/opencode/opencode.json</pre>
 "#,
         api = api,
         model = ctx.model,
-        pub = ctx.public_base.trim_end_matches('/'),
+        pub = ctx.download_base.trim_end_matches('/'),
     )
 }
 
@@ -159,7 +164,8 @@ mod tests {
 
     fn ctx() -> ConfigContext<'static> {
         ConfigContext {
-            public_base: "http://192.168.8.134:30000",
+            public_base: "http://127.0.0.1:30000",
+            download_base: "https://token.asteraix.com",
             model: "deepseek-v4-flash-vision-exp",
             display_name: "DeepSeek-V4-Flash-Vision-Exp",
         }
@@ -168,7 +174,8 @@ mod tests {
     #[test]
     fn codex_has_base_and_responses() {
         let t = codex_toml(&ctx());
-        assert!(t.contains("base_url = \"http://192.168.8.134:30000/v1\""));
+        assert!(t.contains("base_url = \"http://127.0.0.1:30000/v1\""));
+        assert!(t.contains("https://token.asteraix.com/configs/codex.toml"));
         assert!(t.contains("wire_api = \"responses\""));
         assert!(t.contains("deepseek-v4-flash-vision-exp"));
     }
@@ -178,7 +185,8 @@ mod tests {
         let t = grok_toml(&ctx());
         assert!(t.contains("[model.\"dsv4-spark\"]"));
         assert!(t.contains("api_backend = \"responses\""));
-        assert!(t.contains("base_url = \"http://192.168.8.134:30000/v1\""));
+        assert!(t.contains("base_url = \"http://127.0.0.1:30000/v1\""));
+        assert!(t.contains("https://token.asteraix.com/configs/grok.toml"));
     }
 
     #[test]
@@ -188,13 +196,20 @@ mod tests {
         assert_eq!(v["model"], "spark/deepseek-v4-flash-vision-exp");
         assert_eq!(
             v["provider"]["spark"]["options"]["baseURL"],
-            "http://192.168.8.134:30000/v1"
+            "http://127.0.0.1:30000/v1"
         );
         assert_eq!(
             v["provider"]["spark"]["api"],
-            "http://192.168.8.134:30000/v1"
+            "http://127.0.0.1:30000/v1"
         );
         assert!(t.contains("\"spark\""));
         assert!(!t.contains("spark.vllm"));
+    }
+
+    #[test]
+    fn index_uses_download_base_for_curl() {
+        let html = index_html(&ctx());
+        assert!(html.contains("https://token.asteraix.com/configs/codex.toml"));
+        assert!(html.contains("http://127.0.0.1:30000/v1"));
     }
 }
