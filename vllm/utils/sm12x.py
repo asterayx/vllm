@@ -8,6 +8,7 @@ from typing import Literal
 
 import torch
 
+import vllm.envs as envs
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -86,7 +87,7 @@ def sm12x_dspark_capture_sizes(
     max_cg = max(sizes)
     allow = [
         n
-        for n in SM12X_DSPARK_SAFE_CAPTURE_TOKENS
+        for n in sm12x_dspark_safe_capture_tokens()
         if n <= max_cg and n % decode_query_len == 0
     ]
     return allow or sizes
@@ -104,7 +105,7 @@ def sm12x_allow_full_decode_capture(num_tokens: int, decode_query_len: int) -> b
     if not current_platform.is_device_capability_family(120):
         return True
     return (
-        num_tokens in SM12X_DSPARK_SAFE_CAPTURE_TOKENS
+        num_tokens in sm12x_dspark_safe_capture_tokens()
         and num_tokens % decode_query_len == 0
     )
 
@@ -185,12 +186,41 @@ def sm12x_align_decode_q_len(q_len: int) -> int:
     """
     if q_len <= 0 or not current_platform.is_device_capability_family(120):
         return q_len
+    allow_4 = envs.VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4
     for safe in SM12X_SAFE_DECODE_Q_LENS:
-        if safe == 4 and q_len < 4:
+        if safe == 4 and q_len < 4 and not allow_4:
             continue
         if q_len <= safe:
             return safe
     return q_len
+
+
+def _parse_int_csv(value: str) -> tuple[int, ...]:
+    out: list[int] = []
+    for item in value.split(","):
+        item = item.strip()
+        if item:
+            out.append(int(item))
+    return tuple(out)
+
+
+def sm12x_batched_decode_next_n() -> frozenset[int]:
+    """Uniform decode widths allowed on the batched FlashInfer launch."""
+    return frozenset(_parse_int_csv(envs.VLLM_SM12X_BATCHED_DECODE_NEXT_N))
+
+
+def sm12x_dspark_extra_capture_tokens() -> tuple[int, ...]:
+    """Operator-validated token counts added to the DSpark FULL capture set."""
+    return _parse_int_csv(envs.VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS)
+
+
+def sm12x_dspark_safe_capture_tokens() -> tuple[int, ...]:
+    return tuple(
+        sorted(
+            set(SM12X_DSPARK_SAFE_CAPTURE_TOKENS)
+            | set(sm12x_dspark_extra_capture_tokens())
+        )
+    )
 
 
 def sm12x_treat_short_extends_as_decodes() -> bool:
@@ -208,11 +238,25 @@ def sm12x_disable_attn_aux_streams() -> bool:
     """Do not overlap indexer/compressor GEMMs on SM12x aux streams.
 
     ``maybe_execute_in_parallel`` already drops aux during breakable
-    CUDA-graph capture. Mixed warmup is eager after capture and is the
-    first time those aux streams run; Marlin already IMA'd on aux.
+    CUDA-graph capture. Mixed warmup runs eagerly before capture and is
+    the first time those aux streams run; Marlin already IMA'd on aux.
     Shared experts disable their aux stream on SM12x for the same reason.
+    ``VLLM_SM12X_ATTN_AUX_STREAMS=1`` re-enables them once validated.
     """
+    if envs.VLLM_SM12X_ATTN_AUX_STREAMS:
+        return False
     return current_platform.is_device_capability_family(120)
+
+
+def sm12x_disable_shared_experts_stream() -> bool:
+    """SM12x custom GEMMs IMA'd on the shared-experts aux stream during
+    PIECEWISE dummy capture. ``VLLM_SM12X_SHARED_EXPERTS_STREAM=1``
+    re-enables it once validated."""
+    if envs.VLLM_SM12X_SHARED_EXPERTS_STREAM:
+        return False
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        120
+    )
 
 
 def sm12x_disable_eager_scratch_pool() -> bool:
@@ -434,6 +478,17 @@ def sm12x_pad_prefill_token_rows(t: torch.Tensor, target: int) -> torch.Tensor:
         return t
     extra = target - n
     return torch.cat((t, t[-1:].expand(extra, *t.shape[1:])), dim=0)
+
+
+def sm12x_match_token_rows(t: torch.Tensor, num_rows: int) -> torch.Tensor:
+    """Slice or repeat-pad ``t`` along dim 0 to exactly ``num_rows``.
+
+    The model pads ``input_ids`` once per forward; MoE layers slice that
+    tensor instead of re-padding it per layer.
+    """
+    if t.shape[0] >= num_rows:
+        return t[:num_rows]
+    return sm12x_pad_prefill_token_rows(t, num_rows)
 
 
 def pad_token_rows(t: torch.Tensor, target: int) -> torch.Tensor:

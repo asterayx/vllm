@@ -159,6 +159,19 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     def capture(self) -> None:
+        assert self.query_cudagraph_manager is not None
+        if not self.query_cudagraph_manager.needs_capture():
+            logger.warning(
+                "%s speculator has no CUDA graphs to capture (capture sizes %s, "
+                "draft q_len %d): every draft step runs eagerly. On SM12x add "
+                "validated token counts via VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS.",
+                self._speculator_name,
+                tuple(
+                    self.vllm_config.compilation_config.cudagraph_capture_sizes or ()
+                ),
+                self.num_query_per_req,
+            )
+            return
         logger.info("Capturing model for %s speculator...", self._speculator_name)
         # Padded sample rows must not scatter into a live request during capture.
         self.sample_indices.zero_()

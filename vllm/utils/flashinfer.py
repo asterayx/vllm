@@ -162,22 +162,17 @@ _flashinfer_trtllm_batch_decode_sparse_mla_dsv4_impl = _lazy_import_wrapper(
 
 
 def flashinfer_trtllm_batch_decode_sparse_mla_dsv4(*args: Any, **kwargs: Any):
-    """SM12x last line: refuse ``[1, 2]`` / ``[1, 3]``; drop SWA ``-1``."""
+    """SM12x last line: refuse ``[1, 2]`` / ``[1, 3]`` query shapes.
+
+    ``-1`` index sentinels are replaced once by the callers in
+    ``models/deepseek_v4/nvidia/flashinfer_sparse.py`` (per launch, not
+    again here: the repair is ~8 small kernels per index tensor).
+    """
     query = kwargs.get("query", args[0] if args else None)
     if query is not None:
         from vllm.utils.sm12x import reject_sm12x_unsafe_decode_query
 
         reject_sm12x_unsafe_decode_query(query)
-    from vllm.utils.sm12x import sm12x_replace_swa_index_sentinels
-
-    if "sparse_indices" in kwargs:
-        kwargs["sparse_indices"] = sm12x_replace_swa_index_sentinels(
-            kwargs["sparse_indices"]
-        )
-    if kwargs.get("extra_sparse_indices") is not None:
-        kwargs["extra_sparse_indices"] = sm12x_replace_swa_index_sentinels(
-            kwargs["extra_sparse_indices"]
-        )
     return _flashinfer_trtllm_batch_decode_sparse_mla_dsv4_impl(*args, **kwargs)
 
 

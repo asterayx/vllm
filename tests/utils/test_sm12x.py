@@ -786,3 +786,47 @@ def test_sm12x_dspark_dummy_syncs_only_on_eager_warmup(monkeypatch):
     assert synced == []
     dflash_cg._sync_after_eager_dspark_dummy(True)
     assert synced == [True]
+
+
+def test_sm12x_env_knobs_relax_conservative_policies(monkeypatch):
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        sm12x_utils.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    monkeypatch.setattr(sm12x_utils.current_platform, "is_cuda", lambda: True)
+    assert sm12x_align_decode_q_len(3) == 6
+    monkeypatch.setattr(sm12x_utils.envs, "VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4", True)
+    assert sm12x_align_decode_q_len(2) == 4
+    assert sm12x_align_decode_q_len(3) == 4
+    assert sm12x_align_decode_q_len(5) == 6
+
+    assert sm12x_disable_attn_aux_streams() is True
+    monkeypatch.setattr(sm12x_utils.envs, "VLLM_SM12X_ATTN_AUX_STREAMS", True)
+    assert sm12x_disable_attn_aux_streams() is False
+    assert sm12x_utils.sm12x_disable_shared_experts_stream() is True
+    monkeypatch.setattr(sm12x_utils.envs, "VLLM_SM12X_SHARED_EXPERTS_STREAM", True)
+    assert sm12x_utils.sm12x_disable_shared_experts_stream() is False
+
+    assert 30 not in sm12x_utils.sm12x_dspark_safe_capture_tokens()
+    assert sm12x_utils.sm12x_dspark_capture_sizes([1, 2, 4, 8, 16, 24, 32, 36], 5) == [
+        1,
+        2,
+        4,
+        8,
+        16,
+        24,
+        32,
+        36,
+    ]
+    monkeypatch.setattr(
+        sm12x_utils.envs, "VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS", "30, 35"
+    )
+    assert sm12x_utils.sm12x_dspark_capture_sizes([1, 2, 4, 8, 16, 24, 32, 36], 5) == [
+        30,
+        35,
+    ]
+    assert sm12x_utils.sm12x_allow_full_decode_capture(30, 5)
+    assert not sm12x_utils.sm12x_allow_full_decode_capture(25, 5)

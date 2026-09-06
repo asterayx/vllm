@@ -659,3 +659,182 @@ def test_forward_prefill_c4a_q_len_2_is_one_padded_launch(monkeypatch):
     assert topk_calls["n"] == 0
     assert shapes[0][1] != 4
     assert shapes[0] != torch.Size([65, 8, 512])
+
+
+def _split_prefill_fixture(monkeypatch, *, num_tokens: int, image_rows, split: bool):
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+    from vllm.utils import sm12x as sm12x_utils
+
+    for mod in (fi_sparse, sm12x_utils):
+        monkeypatch.setattr(
+            mod.current_platform,
+            "is_device_capability_family",
+            lambda fam: fam == 120,
+        )
+    monkeypatch.setattr(fi_sparse.envs, "VLLM_SM12X_SPLIT_IMAGE_PREFILL", split)
+    launches: list[dict] = []
+
+    def _fake_launch(**launch_kwargs):
+        launches.append(launch_kwargs)
+
+    def _fake_topk(local_topk, *args, **kwargs):
+        n = local_topk.shape[0]
+        return (
+            torch.zeros(n, 8, dtype=torch.int32),
+            torch.ones(n, dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(
+        fi_sparse, "flashinfer_trtllm_batch_decode_sparse_mla_dsv4", _fake_launch
+    )
+    monkeypatch.setattr(fi_sparse, "compute_global_topk_indices_and_lens", _fake_topk)
+    dummy = SimpleNamespace(
+        compress_ratio=4,
+        PREFILL_CHUNK_SIZE=4,
+        scale=1.0,
+        attn_sink=None,
+        kv_cache_torch_dtype=torch.bfloat16,
+        topk_indices_buffer=torch.zeros(num_tokens, 8, dtype=torch.int32),
+        _get_workspace=lambda device: torch.zeros(8, dtype=torch.uint8),
+        _as_sparse_cache=DeepseekV4FlashInferSM120Attention._as_sparse_cache,
+        _global_topk_output_buffers=lambda local_topk: None,
+    )
+    for name in (
+        "_prepare_query",
+        "_launch_per_request_decode",
+        "_launch_image_rows_swa_only",
+    ):
+        setattr(
+            dummy,
+            name,
+            getattr(DeepseekV4FlashInferSM120Attention, name).__get__(dummy),
+        )
+    width = 512
+    swa = SimpleNamespace(
+        num_prefills=1,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefill_tokens=num_tokens,
+        query_start_loc_cpu=torch.tensor([0, num_tokens]),
+        prefill_swa_indices=torch.arange(num_tokens * width, dtype=torch.int32).reshape(
+            num_tokens, 1, width
+        ),
+        prefill_swa_lens=torch.full((num_tokens,), 300, dtype=torch.int32),
+        prefill_left_visible=torch.zeros(num_tokens, dtype=torch.int32),
+        prefill_right_visible=torch.zeros(num_tokens, dtype=torch.int32),
+        prefill_image_row_ranges=image_rows,
+        token_to_req_indices=torch.zeros(num_tokens, dtype=torch.int32),
+        is_valid_token=torch.ones(num_tokens, dtype=torch.bool),
+    )
+    attn = SimpleNamespace(
+        block_table=torch.zeros(1, 4, dtype=torch.int32),
+        block_size=64,
+    )
+    q = torch.zeros(num_tokens, 8, 512, dtype=torch.bfloat16)
+    output = torch.zeros(num_tokens, 8, 512, dtype=torch.bfloat16)
+    DeepseekV4FlashInferSM120Attention._forward_prefill(
+        dummy, q, torch.zeros(1), torch.zeros(1), output, attn, swa
+    )
+    return launches, swa
+
+
+def test_image_prefill_keeps_c4a_for_text_rows_and_relaunches_image_rows(
+    monkeypatch,
+):
+    """>64-token Vision prefill: dual-cache 128 for all rows, 512 SWA-only
+    only for the in-image rows (instead of SWA-only for every row)."""
+    launches, swa = _split_prefill_fixture(
+        monkeypatch, num_tokens=200, image_rows=[(50, 170)], split=True
+    )
+    assert len(launches) == 2
+    main, image = launches
+    assert main["query"].shape[0] == 200
+    assert main["compressed_kv_cache"] is not None
+    assert main["sparse_indices"].shape[-1] == 128
+    assert torch.equal(main["sparse_indices"], swa.prefill_swa_indices[..., :128])
+    assert int(main["swa_topk_lens"].max()) == 128
+    assert image["query"].shape[0] == 120
+    assert image["compressed_kv_cache"] is None
+    assert image["extra_sparse_indices"] is None
+    assert image["sparse_indices"].shape[-1] == 512
+    assert torch.equal(image["sparse_indices"], swa.prefill_swa_indices[50:170])
+    assert torch.equal(image["swa_topk_lens"], swa.prefill_swa_lens[50:170])
+    assert image["out"].shape[0] == 120
+
+
+def test_image_prefill_short_cut_span_pads_through_decode_form(monkeypatch):
+    """An image span cut to <=64 rows by a chunk boundary still gets the
+    widened SWA row through the padded decode-form launch."""
+    launches, _ = _split_prefill_fixture(
+        monkeypatch, num_tokens=200, image_rows=[(180, 200)], split=True
+    )
+    assert len(launches) == 2
+    image = launches[1]
+    assert image["query"].shape[:2] == (1, 24)
+    assert image["compressed_kv_cache"] is None
+    assert image["sparse_indices"].shape[-1] == 512
+
+
+def test_image_prefill_split_disabled_is_swa_only(monkeypatch):
+    launches, _ = _split_prefill_fixture(
+        monkeypatch, num_tokens=200, image_rows=[(50, 170)], split=False
+    )
+    assert len(launches) == 1
+    assert launches[0]["compressed_kv_cache"] is None
+    assert launches[0]["sparse_indices"].shape[-1] == 512
+
+
+def test_image_prefill_without_image_rows_in_chunk_keeps_c4a(monkeypatch):
+    """A batch flagged has_image whose chunk holds no in-image rows slices
+    to 128 and keeps C4A (no re-launch)."""
+    launches, _ = _split_prefill_fixture(
+        monkeypatch, num_tokens=200, image_rows=[], split=True
+    )
+    assert len(launches) == 1
+    assert launches[0]["compressed_kv_cache"] is not None
+    assert launches[0]["sparse_indices"].shape[-1] == 128
+
+
+def test_image_rows_in_chunk_clips_ranges():
+    from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import _image_rows_in_chunk
+
+    assert _image_rows_in_chunk(None, 0, 10) == []
+    assert _image_rows_in_chunk([(5, 20), (30, 40)], 10, 35) == [(10, 20), (30, 35)]
+    assert _image_rows_in_chunk([(5, 20)], 20, 40) == []
+
+
+def test_compute_prefill_image_row_ranges_clips_to_scheduled_tokens():
+    from vllm.v1.attention.backends.mla.sparse_swa import (
+        compute_prefill_image_row_ranges,
+    )
+
+    # decode req 0; prefill req 1 has prefix 100 and 50 scheduled tokens,
+    # prefill req 2 is a fresh prompt of 30 tokens.
+    query_start_loc = torch.tensor([0, 4, 54, 84])
+    seq_lens = torch.tensor([9, 150, 30])
+    mm_ranges = {
+        0: [(1, 3)],
+        1: [(80, 120), (140, 170)],
+        2: [(0, 29)],
+    }
+    ranges = compute_prefill_image_row_ranges(
+        mm_ranges, 1, 2, query_start_loc, seq_lens
+    )
+    assert ranges == [(0, 21), (40, 50), (50, 80)]
+
+
+def test_sm12x_batched_decode_next_n_env_enables_batched_launch(monkeypatch):
+    from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as fi_sparse
+    from vllm.utils import sm12x as sm12x_utils
+
+    monkeypatch.setattr(
+        fi_sparse.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    monkeypatch.setattr(sm12x_utils.envs, "VLLM_SM12X_BATCHED_DECODE_NEXT_N", "4")
+    assert not sm12x_use_per_request_decode(4, 4)
+    assert not sm12x_use_per_request_decode(4, 6)
+    assert sm12x_use_per_request_decode(2, 6)
+    monkeypatch.setattr(sm12x_utils.envs, "VLLM_SM12X_BATCHED_DECODE_NEXT_N", "")
+    assert sm12x_use_per_request_decode(4, 4)

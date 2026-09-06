@@ -33,7 +33,10 @@ export NAME="${NAME:-dspark-vision-tp2-rank${NODE_RANK:-0}}"
 # Do not put JSON inside ${VAR:-...}: bash ends the expansion at the
 # first `}` and produced `...probabilistic"}}`.
 if [ -z "${EXTRA_VLLM_ARGS+x}" ]; then
-  export EXTRA_VLLM_ARGS='--limit-mm-per-prompt {"image":4}'
+  # --disable-chunked-mm-input keeps every image span inside one prefill
+  # chunk: the in-image visibility window is bidirectional and must not
+  # reach past the KV written by the current step.
+  export EXTRA_VLLM_ARGS='--limit-mm-per-prompt {"image":4} --disable-chunked-mm-input'
 fi
 if [ -z "${SPECULATIVE_CONFIG+x}" ]; then
   export SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}'

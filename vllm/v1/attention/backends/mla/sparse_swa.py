@@ -197,6 +197,10 @@ class DeepseekSparseSWAMetadata:
     # None when the model is text-only or the batch has no image spans.
     prefill_left_visible: torch.Tensor | None = None
     prefill_right_visible: torch.Tensor | None = None
+    # Prefill-relative [start, end) token ranges that lie inside an image span
+    # (CPU, sorted). Only these rows can carry an SWA window wider than
+    # window_size; None when prefill_left_visible is None.
+    prefill_image_row_ranges: list[tuple[int, int]] | None = None
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
     num_decodes: int = 0
@@ -688,6 +692,16 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 token_to_req_indices,
             )
 
+        prefill_image_row_ranges: list[tuple[int, int]] | None = None
+        if prefill_left_visible is not None and mm_ranges:
+            prefill_image_row_ranges = compute_prefill_image_row_ranges(
+                mm_ranges,
+                num_decodes,
+                num_prefills,
+                query_start_loc_cpu,
+                seq_lens_cpu,
+            )
+
         # Prefill SWA indices live in paged coordinates. `token_offset` lets
         # the kernel read is_valid_token / token_to_req_indices at absolute
         # prefill positions while writing output starting at index 0.
@@ -754,6 +768,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             ),
             prefill_left_visible=prefill_left_visible,
             prefill_right_visible=prefill_right_visible,
+            prefill_image_row_ranges=prefill_image_row_ranges,
             block_size=self.block_size,
             num_decodes=num_decodes,
             num_prefills=num_prefills,
@@ -936,6 +951,39 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         return result
 
 
+def compute_prefill_image_row_ranges(
+    mm_ranges: dict[int, list[tuple[int, int]]],
+    num_decodes: int,
+    num_prefills: int,
+    query_start_loc_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+) -> list[tuple[int, int]]:
+    """Prefill-relative ``[start, end)`` token ranges inside image spans.
+
+    ``mm_ranges`` holds inclusive absolute ``(span_start, span_end)`` prompt
+    positions per (decode-first) request index. Spans are clipped to the
+    tokens scheduled this step so a span cut by a chunk boundary yields only
+    its scheduled part.
+    """
+    base = int(query_start_loc_cpu[num_decodes])
+    ranges: list[tuple[int, int]] = []
+    for i in range(num_prefills):
+        req_idx = num_decodes + i
+        spans = mm_ranges.get(req_idx)
+        if not spans:
+            continue
+        qs = int(query_start_loc_cpu[req_idx]) - base
+        qe = int(query_start_loc_cpu[req_idx + 1]) - base
+        query_len = qe - qs
+        prefix_len = int(seq_lens_cpu[req_idx]) - query_len
+        for span_start, span_end in spans:
+            lo = max(span_start - prefix_len, 0)
+            hi = min(span_end + 1 - prefix_len, query_len)
+            if hi > lo:
+                ranges.append((qs + lo, qs + hi))
+    return ranges
+
+
 @triton.jit(do_not_specialize=["token_offset"])
 def _compute_image_visibility_kernel(
     left_visible_ptr,
@@ -1037,7 +1085,9 @@ def _compute_swa_indices_and_lens_kernel(
         right = 0
     left_add = tl.maximum(left - (window_size - 1), 0)
     start_pos = tl.maximum(pos - (window_size - 1) - left_add, 0)
-    end_pos = pos + right + 1
+    # An image span cut by a chunk boundary would otherwise point past the
+    # KV written so far (unallocated block-table slots).
+    end_pos = tl.minimum(pos + right + 1, seq_len)
 
     swa_len = end_pos - start_pos
     tl.store(swa_lens_ptr + pid, swa_len)

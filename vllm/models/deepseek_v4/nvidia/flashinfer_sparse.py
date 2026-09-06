@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
@@ -32,6 +33,7 @@ from vllm.utils.sm12x import (
     sm12x_align_decode_q_len,
     sm12x_align_flashinfer_dual_prefill,
     sm12x_align_prefill_q_len,
+    sm12x_batched_decode_next_n,
     sm12x_replace_swa_index_sentinels,
     sm12x_skip_padded_prefill_c4a,
 )
@@ -119,11 +121,32 @@ def sm12x_use_per_request_decode(next_n: int | None, decode_query_len: int) -> b
         return False
     if not current_platform.is_device_capability_family(120):
         return False
+    if next_n in sm12x_batched_decode_next_n():
+        # Operator-validated batched width (VLLM_SM12X_BATCHED_DECODE_NEXT_N),
+        # e.g. 4 for Vision DSpark k=3 target verification.
+        return False
     # 4 is a valid per-request decode dummy ([1, 4] captured). Batched
     # [B, 4] is untested on GB10; keep per-request. 5 is DSpark draft.
     if next_n not in SM12X_SAFE_PREFILL_DECODE_Q_LENS:
         return True
     return next_n != decode_query_len
+
+
+def _image_rows_in_chunk(
+    image_row_ranges: list[tuple[int, int]] | None,
+    chunk_start: int,
+    chunk_end: int,
+) -> list[tuple[int, int]]:
+    """Clip prefill-relative in-image row ranges to ``[chunk_start, chunk_end)``."""
+    if not image_row_ranges:
+        return []
+    rows: list[tuple[int, int]] = []
+    for start, end in image_row_ranges:
+        lo = max(start, chunk_start)
+        hi = min(end, chunk_end)
+        if hi > lo:
+            rows.append((lo, hi))
+    return rows
 
 
 def sm12x_q_len_spans(q_len: int) -> list[tuple[int, int]]:
@@ -600,7 +623,9 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                 query=query[:num_decode_tokens],
                 swa_kv_cache=swa_k_cache,
                 workspace_buffer=workspace,
-                sparse_indices=sparse_indices[:num_decode_tokens],
+                sparse_indices=sm12x_replace_swa_index_sentinels(
+                    sparse_indices[:num_decode_tokens]
+                ),
                 compressed_kv_cache=compressed_kv_cache,
                 sparse_topk_lens=sparse_topk_lens[:num_decode_tokens],
                 seq_lens=seq_lens[:num_decodes],
@@ -625,7 +650,9 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                 query=query[num_decode_tokens:num_tokens],
                 swa_kv_cache=swa_k_cache,
                 workspace_buffer=workspace,
-                sparse_indices=sparse_indices[num_decode_tokens:num_tokens],
+                sparse_indices=sm12x_replace_swa_index_sentinels(
+                    sparse_indices[num_decode_tokens:num_tokens]
+                ),
                 compressed_kv_cache=compressed_kv_cache,
                 sparse_topk_lens=sparse_topk_lens[num_decode_tokens:num_tokens],
                 seq_lens=seq_lens[num_decodes:num_reqs],
@@ -1184,7 +1211,25 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."
                 )
+            image_rows: list[tuple[int, int]] = []
             if q_chunk.shape[0] > 64:
+                # Vision-Exp: only in-image rows need the 512-wide SWA row.
+                # With the split enabled, every row first runs the 128-wide
+                # dual-cache (C4A) cubin, then in-image rows are re-launched
+                # SWA-only on the 512-wide single-cache cubin (see
+                # _launch_image_rows_swa_only). Text rows keep C4A.
+                has_image = swa_metadata.prefill_left_visible is not None
+                if has_image and extra_kv_chunk is not None:
+                    image_rows = _image_rows_in_chunk(
+                        swa_metadata.prefill_image_row_ranges,
+                        int(query_start),
+                        int(query_end),
+                    )
+                split_image_rows = (
+                    bool(image_rows)
+                    and envs.VLLM_SM12X_SPLIT_IMAGE_PREFILL
+                    and current_platform.is_device_capability_family(120)
+                )
                 (
                     swa_indices_chunk,
                     swa_lens_chunk,
@@ -1197,12 +1242,20 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     extra_kv_chunk,
                     extra_sparse_indices_chunk,
                     extra_sparse_lengths_chunk,
-                    has_image=swa_metadata.prefill_left_visible is not None,
+                    has_image=bool(image_rows) and not split_image_rows,
                 )
+                if not split_image_rows:
+                    image_rows = []
                 if extra_kv_chunk is None and extra_kv_paged is not None:
                     logger.info_once(
                         "SM12x FlashInfer: image-widened SWA prefill is "
                         "SWA-only (dual-cache cubin is SWA topk=128)"
+                    )
+                elif image_rows:
+                    logger.info_once(
+                        "SM12x FlashInfer: image prefill keeps C4A; %d in-image "
+                        "row range(s) re-launched SWA-only on the widened cubin",
+                        len(image_rows),
                     )
                 elif (
                     extra_kv_chunk is not None
@@ -1257,3 +1310,63 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 ),
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
             )
+            for row_start, row_end in image_rows:
+                self._launch_image_rows_swa_only(
+                    q,
+                    output,
+                    swa_kv_paged,
+                    swa_metadata.prefill_swa_indices,
+                    swa_metadata.prefill_swa_lens,
+                    row_start,
+                    row_end,
+                )
+
+    def _launch_image_rows_swa_only(
+        self,
+        q: torch.Tensor,
+        output: torch.Tensor,
+        swa_cache: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        row_start: int,
+        row_end: int,
+    ) -> None:
+        """Overwrite ``output[row_start:row_end]`` with widened-SWA attention.
+
+        In-image rows carry up to ``window + vision_max_n_token`` SWA
+        slots, which only the single-cache cubin accepts. Spans of more
+        than 64 rows use the prefill kernel directly; a span cut short by a
+        chunk boundary pads through the decode-form launch (SWA-only as
+        before).
+        """
+        if row_end - row_start > 64:
+            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                query=q[row_start:row_end],
+                swa_kv_cache=swa_cache,
+                workspace_buffer=self._get_workspace(q.device),
+                sparse_indices=sm12x_replace_swa_index_sentinels(
+                    swa_indices[row_start:row_end]
+                ),
+                compressed_kv_cache=None,
+                out=output[row_start:row_end],
+                bmm1_scale=self.scale,
+                sinks=self.attn_sink,
+                kv_layout="NHD",
+                swa_topk_lens=swa_lens[row_start:row_end],
+                extra_sparse_indices=None,
+                extra_sparse_topk_lens=None,
+            )
+            return
+        self._launch_per_request_decode(
+            q,
+            output,
+            swa_cache,
+            None,
+            swa_indices,
+            swa_lens,
+            None,
+            None,
+            row_start,
+            row_end,
+            is_prefill=True,
+        )

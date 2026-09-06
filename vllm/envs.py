@@ -207,6 +207,15 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
+    VLLM_SM12X_BATCHED_DECODE_NEXT_N: str = ""
+    VLLM_SM12X_SPLIT_IMAGE_PREFILL: bool = True
+    VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4: bool = False
+    VLLM_SM12X_ATTN_AUX_STREAMS: bool = False
+    VLLM_SM12X_SHARED_EXPERTS_STREAM: bool = False
+    VLLM_SM12X_WARMUP_LONG_PREFILL_TOKENS: int = 128
+    VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS: str = ""
+    VLLM_B12X_MOE_TOKEN_BUCKET: int = 256
+    VLLM_DSV4_VISION_COMPILE: bool = False
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_RS: bool = False
@@ -1594,6 +1603,55 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ids to -1 so the dispatch and experts drop them. Requires a MoE kernel that
     # treats topk_id == -1 as a skip sentinel
     "VLLM_MOE_SKIP_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_SKIP_PADDING", "1"))),
+    # SM12x (GB10) tuning knobs. All default to the conservative behavior that
+    # was validated on Spark; each one must be re-validated on the GPU before
+    # it is turned on for serving (see docker/gb10/VALIDATION.md).
+    # Comma-separated uniform decode widths (next_n) that may use the batched
+    # FlashInfer [B, next_n] launch instead of one [1, next_n] launch per request.
+    "VLLM_SM12X_BATCHED_DECODE_NEXT_N": lambda: os.getenv(
+        "VLLM_SM12X_BATCHED_DECODE_NEXT_N", ""
+    ),
+    # Vision-Exp >64-token prefill: launch the 128-wide dual-cache (C4A) cubin
+    # for the whole chunk and re-launch only in-image rows on the 512-wide
+    # single-cache cubin, instead of dropping C4A for every row. 0 restores
+    # the SWA-only behavior for image batches.
+    "VLLM_SM12X_SPLIT_IMAGE_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM12X_SPLIT_IMAGE_PREFILL", "1"))
+    ),
+    # Pad decode-form q_len 2/3 to 4 instead of 6 (halves draft padding waste).
+    "VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4": lambda: bool(
+        int(os.getenv("VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4", "0"))
+    ),
+    # Re-enable the DeepSeek-V4 attention aux streams (indexer/compressor
+    # projection overlap) on SM12x.
+    "VLLM_SM12X_ATTN_AUX_STREAMS": lambda: bool(
+        int(os.getenv("VLLM_SM12X_ATTN_AUX_STREAMS", "0"))
+    ),
+    # Re-enable the MoE shared-experts aux stream on SM12x.
+    "VLLM_SM12X_SHARED_EXPERTS_STREAM": lambda: bool(
+        int(os.getenv("VLLM_SM12X_SHARED_EXPERTS_STREAM", "0"))
+    ),
+    # Extra single-request prefill of this many tokens during V2 kernel
+    # warmup so the >64-token sparse prefill orchestrator is warmed before the
+    # first real prompt. 0 disables it.
+    "VLLM_SM12X_WARMUP_LONG_PREFILL_TOKENS": lambda: int(
+        os.getenv("VLLM_SM12X_WARMUP_LONG_PREFILL_TOKENS", "128")
+    ),
+    # Comma-separated token counts appended to the proven DSpark FULL capture
+    # set (e.g. "30" for text k=5 with 6 requests).
+    "VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS": lambda: os.getenv(
+        "VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS", ""
+    ),
+    # Round eager (non-captured) b12x MoE token counts up to a multiple of this
+    # bucket so chunked prefill does not create one frozen plan per distinct M.
+    "VLLM_B12X_MOE_TOKEN_BUCKET": lambda: int(
+        os.getenv("VLLM_B12X_MOE_TOKEN_BUCKET", "256")
+    ),
+    # torch.compile the DeepSeek-V4 vision tower blocks (fuses RMSNorm/RoPE
+    # temporaries). Opt-in until validated on the target GPU.
+    "VLLM_DSV4_VISION_COMPILE": lambda: bool(
+        int(os.getenv("VLLM_DSV4_VISION_COMPILE", "0"))
+    ),
     # Kimi-K3 only. Under sequence-parallel MoE the dense and shared-expert MLPs
     # are replicated on every rank, so each rank streams the whole weight to
     # serve its own token shard. Shard them across TP instead: the MLP then
