@@ -1035,6 +1035,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         if next_n is not None and not sm12x_use_per_request_decode(
             next_n, self._decode_query_len
         ):
+            if current_platform.is_device_capability_family(120):
+                logger.info_once(
+                    "SM12x FlashInfer: batched [%d, %d] decode launch",
+                    num_decodes,
+                    next_n,
+                )
             q = q.view(num_decodes, next_n, *q.shape[1:])
             output = output.view(num_decodes, next_n, *output.shape[1:])
             swa_indices = swa_indices.reshape(num_decodes, next_n, -1)
