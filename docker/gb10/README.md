@@ -274,7 +274,7 @@ container only when it is set, e.g.
 | Env | Default | Effect when changed |
 | --- | --- | --- |
 | `VLLM_SM12X_SPLIT_IMAGE_PREFILL` | `1` | Image prefill keeps C4A for text rows; `0` restores SWA-only for the whole chunk. |
-| `VLLM_SM12X_BATCHED_DECODE_NEXT_N` | empty | Comma list of uniform decode widths that use one batched `[B, next_n]` FlashInfer launch. `4` removes the per-request loop for Vision k=3 target steps. |
+| `VLLM_SM12X_BATCHED_DECODE_NEXT_N` | empty (`run-vision.sh` sets `4`) | Comma list of uniform decode widths that use one batched `[B, next_n]` FlashInfer launch. `4` removes the per-request loop for Vision k=3 target steps (validated: +11% at concurrency 4). |
 | `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4` | `0` | Pad decode-form q_len 2/3 to 4 instead of 6 (halves draft padding). |
 | `VLLM_SM12X_ATTN_AUX_STREAMS` | `0` | Overlap indexer/compressor projections on aux streams again. |
 | `VLLM_SM12X_SHARED_EXPERTS_STREAM` | `0` | Overlap shared experts with routed experts again. |

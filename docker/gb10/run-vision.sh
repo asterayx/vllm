@@ -42,6 +42,10 @@ if [ -z "${SPECULATIVE_CONFIG+x}" ]; then
   export SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}'
 fi
 export MAX_CUGRAPH="${MAX_CUGRAPH:-24}"
+# Batched [B, 4] FlashInfer decode for the k=3 target step. Validated on
+# 2x GB10 (validate-knobs.py: identical greedy tokens, +11% aggregate tok/s
+# at concurrency 4). Set to an empty string to fall back to per-request.
+export VLLM_SM12X_BATCHED_DECODE_NEXT_N="${VLLM_SM12X_BATCHED_DECODE_NEXT_N-4}"
 if [ -z "${CUGRAPH_CFG+x}" ]; then
   export CUGRAPH_CFG='{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,4,8,12,16,24]}'
 fi

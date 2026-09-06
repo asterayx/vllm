@@ -168,6 +168,22 @@ docker rm -f dspark-vision-tp2-rank0 dspark-vision-tp2-rank1
 ./docker/gb10/validate-knobs.py compare base.json knob.json
 ```
 
+### Spark results (2026-09-06, Vision-Exp, 2x GB10, k=3)
+
+- Default configuration boots with the third-pass changes: 128-token
+  long-prefill warmup, `image prefill keeps C4A` split, sentinel fold and
+  SDPA probe (`flash=ok, mem_efficient=ok`) all ran. `_moe_C` has the
+  12-argument `topk_softplus_sqrt` (bias_vl kernel path).
+- `VLLM_SM12X_BATCHED_DECODE_NEXT_N=4`: 3 of 4 prompts token-identical to
+  the per-request baseline (145- and 2652-token prompts included). The
+  fourth prompt was a flat-distribution prompt whose first token changed on
+  every restart in both configurations (restart-level noise; replaced in
+  the script). Single stream 0.95-1.0x, concurrency 4: 88.3 -> 98.1 tok/s
+  aggregate (1.11x). Now the `run-vision.sh` default.
+- Still to validate the same way: `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4`,
+  `VLLM_SM12X_ATTN_AUX_STREAMS`, `VLLM_SM12X_SHARED_EXPERTS_STREAM`, and
+  an image prompt set (`--images`) for the split-prefill path.
+
 ## Required Spark validation
 
 No GPU performance or full-model quality results are claimed by these

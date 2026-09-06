@@ -47,7 +47,15 @@ LONG_PARAGRAPH = (
 
 
 def _text_prompts() -> list[list[dict]]:
-    short = [{"role": "user", "content": "Reply with the word ready."}]
+    # A prompt with a peaked next-token distribution; flat prompts ("reply
+    # with one word") flip on restart-level numerical noise.
+    short = [
+        {
+            "role": "user",
+            "content": "What is the capital of France? Answer with the city "
+            "name and one sentence about it.",
+        }
+    ]
     medium = [
         {
             "role": "user",
