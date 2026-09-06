@@ -90,7 +90,7 @@ expected function and valid JSON arguments; reasoning aliases matched in the
 stream. The public Chat Completions endpoint also returned HTTP 200 with
 `finish_reason="tool_calls"` for `tool_choice="auto"`.
 
-Caches stay inside this worktree. The configuration uses eager execution, 512K context,
+Caches stay inside this worktree. The configuration uses decode CUDA Graphs, 512K context,
 8192 batched tokens, four concurrent sequences, and a fixed 16 GiB KV cache per
 GPU. The explicit cache budget takes precedence over the memory-utilization
 fraction for KV allocation. Spark shares GPU and system memory; leaving the
@@ -120,8 +120,8 @@ The baseline service was already warm; candidates restarted before testing.
 
 Repeated identical prompts did not increase prefix-cache hit counters, and
 their prefill times were essentially unchanged. The old cumulative hit ratio
-does not establish effective reuse for these MTP requests. This remains a
-separate optimization opportunity.
+does not establish effective reuse for these MTP requests. Those baseline
+observations motivated the prefix-cache fixes described below.
 
 The selected 8192 configuration also passed a proxy Responses request with
 523,760 input tokens and 17 output tokens in 253.82 s, recovering all three
@@ -152,16 +152,10 @@ and Responses function-call checks. Both draft positions recorded accepted
 tokens, confirming active two-token speculation. The service stayed healthy,
 so no one-token trial or performance comparison was performed.
 
-In this rc4 implementation, the MTP draft retains its native 262,144-token
-limit while the target remains at 524,288. Batches exceeding the drafter's
-limit skip speculation. Startup also warns that draft KV cache groups cannot
-be identified, disabling cross-request prefix-cache reuse. Fused multi-step
-drafting is unavailable for the QSA state backend; vLLM rebuilds attention
-metadata between draft steps. These fallbacks do not prevent serving, but
-mean this configuration is not a demonstrated throughput improvement.
-The MTP run reported 1,153,433 cache tokens and approximately 26 GiB available
-system memory on the head during verification. Full-length 512K generation
-was validated before MTP was enabled and was not repeated in this trial.
+Fused multi-step drafting is unavailable for the QSA state backend; vLLM
+rebuilds attention metadata between draft steps. This fallback remains in the
+Graph configuration. Two-token speculation was confirmed by accepted-token
+counter increments during the serving tests.
 
 FlashInfer autotuning is disabled in this example. On a repeated two-node
 startup, rank 0 hit its cached MoE tactics while rank 1 entered profiling and
@@ -173,6 +167,55 @@ can differ from a successful autotuned run.
 To access the head's loopback API from the local computer, keep an SSH tunnel
 open with `ssh -N -L 18029:127.0.0.1:18029 aitopatom-d6d3`, then use
 `http://127.0.0.1:18029/v1` with model name `qwen38-nvfp4`.
+
+## MTP prefix reuse and execution modes
+
+The prefix-cache changes identify Qwen MTP attention and QSA groups explicitly,
+retain the earlier target Mamba replay checkpoint required by draft lookahead,
+and split prefill at Mamba state boundaries. The last point matters because QSA
+also registers an 8-token ring while Mamba state blocks span 1600 tokens: using
+the minimum cache block for scheduling misses the reusable Mamba checkpoint.
+The checkpoint split also handles prompts ending exactly on a block boundary.
+
+The default `EXECUTION_MODE=graph` enables `FULL_DECODE_ONLY` CUDA Graphs
+without compilation. Set `EXECUTION_MODE=eager` to use eager execution,
+identically on both nodes. Capture sizes are bounded to `[1, 2, 4, 8, 12]`
+for this four-sequence, MTP-2 setup. Graph capture reported 0.19 GiB extra memory.
+
+Compilation mode 3 was also tested with one Inductor compilation thread. It
+exhausted the available memory before serving; the worker's 8 GiB memory guard
+terminated the experiment at approximately 2.8 GiB available. Compilation is
+therefore not included in the launcher's supported modes.
+
+With the complete cache fix and Graph mode, immediate identical repeats
+reused 6400 / 62400 / 259200 tokens for the same three benchmark inputs:
+
+| Input tokens | Cold first-token latency | Repeated first-token latency |
+| --- | --- | --- |
+| 8154 | 3.20 s | 0.63 s |
+| 65502 | 22.39 s | 1.28 s |
+| 262110 | 105.79 s | 2.05 s |
+
+Decode ranged from 41.59 to 46.41 tokens/s across these six requests; the
+single-pair measurements do not establish a substantial Graph-only speedup.
+The cache correctness checks, MTP generation and all tool/Responses checks
+passed. GSM8K remained 15/16 with no invalid output (36.09 s, concurrency 2).
+Minimum available memory was 22.95 GiB on the head and 27.36 GiB on the worker.
+Raw requests, SSE, per-request cache/speculation counters, timing, configuration,
+source diffs and memory records are saved under
+`.run/perf-20260906-cache-graphs/` on the test hosts and local tree, including
+unsuccessful experiments. These results are small regression samples.
+
+The affected cache and scheduler suites pass 435 tests, including regression
+cases that fail before the replay-retention and heterogeneous-block fixes:
+
+```bash
+.venv/bin/python -m pytest tests/v1/core/test_prefix_caching.py \
+  tests/v1/core/test_mamba_align_chunk_split.py \
+  tests/v1/core/test_kv_cache_utils.py \
+  tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py \
+  tests/v1/core/test_scheduler.py -q
+```
 
 ## Verification
 

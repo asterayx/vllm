@@ -22,6 +22,11 @@ if [[ ! "$mtp_tokens" =~ ^[012]$ ]]; then
     echo "MTP_TOKENS must be 0 (disabled), 1, or 2." >&2
     exit 2
 fi
+execution_mode=${EXECUTION_MODE:-graph}
+if [[ "$execution_mode" != eager && "$execution_mode" != graph ]]; then
+    echo "EXECUTION_MODE must be eager or graph." >&2
+    exit 2
+fi
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export VLLM_HOST_IP=${VLLM_HOST_IP:?Set VLLM_HOST_IP to the local interconnect IP}
@@ -59,8 +64,13 @@ args=(
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.80}"
     --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES:-17179869184}"
     --disable-custom-all-reduce
-    --enforce-eager
 )
+case "$execution_mode" in
+    eager) args+=(--enforce-eager) ;;
+    graph)
+        args+=(--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8,12]}')
+        ;;
+esac
 if (( mtp_tokens > 0 )); then
     args+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$mtp_tokens}")
 fi
