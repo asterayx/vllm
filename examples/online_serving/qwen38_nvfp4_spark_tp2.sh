@@ -54,7 +54,7 @@ args=(
     --kernel-config '{"enable_flashinfer_autotune": false}'
     --dtype bfloat16
     --max-model-len "${MAX_MODEL_LEN:-524288}"
-    --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-2048}"
+    --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-8192}"
     --max-num-seqs "${MAX_NUM_SEQS:-4}"
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.80}"
     --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES:-17179869184}"

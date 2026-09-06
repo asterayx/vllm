@@ -91,7 +91,7 @@ stream. The public Chat Completions endpoint also returned HTTP 200 with
 `finish_reason="tool_calls"` for `tool_choice="auto"`.
 
 Caches stay inside this worktree. The configuration uses eager execution, 512K context,
-2048 batched tokens, four concurrent sequences, and a fixed 16 GiB KV cache per
+8192 batched tokens, four concurrent sequences, and a fixed 16 GiB KV cache per
 GPU. The explicit cache budget takes precedence over the memory-utilization
 fraction for KV allocation. Spark shares GPU and system memory; leaving the
 cache budget implicit allocated about 33 GiB per GPU in the initial test and
@@ -100,6 +100,37 @@ Set `MAX_MODEL_LEN`, `MAX_NUM_BATCHED_TOKENS`, `MAX_NUM_SEQS`, and
 `KV_CACHE_MEMORY_BYTES` identically on both nodes when tuning. Increase the cache
 budget when increasing context length or concurrency, and check available system
 memory during startup and serving.
+
+The 2026-09-06 batch-size comparison retained MTP 2 and all other settings.
+Each row used the same synthetic prompt, temperature 0, seed 42, thinking
+disabled, and 256 generated tokens through the loopback Chat Completions API.
+Cold time to first content token was:
+
+| Batched tokens | 8,154 input tokens | 65,502 input tokens | 262,110 input tokens |
+| --- | --- | --- | --- |
+| 2048 | 2.92 s | 24.47 s | 115.99 s |
+| 4096 | 2.92 s | 23.04 s | 109.72 s |
+| 8192 | 3.33 s | 22.12 s | 106.03 s |
+
+8192 reduced the measured 64K and 256K cold first-token latency by 9.6% and
+8.6%, respectively, while decode remained around 41–43 tokens/s. The initial
+8K request did not improve; its immediate repeat took 2.78 s. These are single
+paired observations, not percentile estimates or concurrent-load benchmarks.
+The baseline service was already warm; candidates restarted before testing.
+
+Repeated identical prompts did not increase prefix-cache hit counters, and
+their prefill times were essentially unchanged. The old cumulative hit ratio
+does not establish effective reuse for these MTP requests. This remains a
+separate optimization opportunity.
+
+The selected 8192 configuration also passed a proxy Responses request with
+523,760 input tokens and 17 output tokens in 253.82 s, recovering all three
+codes at approximately 10%, 50%, and 90% of the input. MTP integer generation,
+tool-result follow-up, streamed Chat Completions tools and streamed Responses
+tools passed. This is a long-context smoke test, not a broad accuracy eval.
+Per-round request JSON, SSE responses, timing/usage JSON, metrics snapshots,
+startup logs and two-second memory samples are retained in the experiment
+directory `.run/perf-20260906/` on the test hosts and copied to the local tree.
 
 512K means 524,288 total input and output tokens per request. The checkpoint
 declares 262,144 positions; above that length the launcher applies a 2x YaRN
