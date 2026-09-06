@@ -37,6 +37,26 @@ fi
 mkdir -p "${VLLM_CACHE}" "${HF_CACHE}/flashinfer" "${B12X_CACHE}"
 docker rm -f "${NAME}" 2>/dev/null || true
 
+# SM12x tuning knobs (README "SM12x tuning knobs"): forwarded only when set
+# on the host, so unset knobs keep the in-container defaults.
+knob_args=()
+for knob in \
+  VLLM_SM12X_SPLIT_IMAGE_PREFILL \
+  VLLM_SM12X_BATCHED_DECODE_NEXT_N \
+  VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4 \
+  VLLM_SM12X_ATTN_AUX_STREAMS \
+  VLLM_SM12X_SHARED_EXPERTS_STREAM \
+  VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS \
+  VLLM_SM12X_WARMUP_LONG_PREFILL_TOKENS \
+  VLLM_B12X_MOE_TOKEN_BUCKET \
+  VLLM_DSV4_VISION_COMPILE \
+  VLLM_BATCH_INVARIANT \
+  VLLM_MOE_SKIP_PADDING; do
+  if [ -n "${!knob+x}" ]; then
+    knob_args+=(-e "${knob}")
+  fi
+done
+
 # 6 seqs * (1 + DSpark k=5) = 36; include 36 so capture is not truncated to 32.
 # Vision-Exp (run-vision.sh) overrides these for k=3 / next_n=4.
 # JSON defaults cannot live in ${VAR:-...} (bash cuts at the first `}`).
@@ -65,6 +85,7 @@ docker run -d --name "${NAME}" \
   -e VLLM_SPARK_VERSION="${VLLM_SPARK_VERSION}" \
   -e VLLM_GB10_VERSION="${VLLM_SPARK_VERSION}" \
   "${pythonpath_args[@]}" \
+  "${knob_args[@]}" \
   -e MOUNT_VLLM_SRC="${MOUNT_VLLM_SRC}" \
   -e VLLM_HOST_IP="${VLLM_HOST_IP}" \
   -e VLLM_LOGGING_COLOR=1 \

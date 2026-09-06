@@ -266,9 +266,10 @@ If the vision tower OOMs: `GPU_MEMORY_UTILIZATION=0.82 MAX_NUM_SEQS=4`.
 Defaults are the conservative paths that ran on GB10. Each knob switches
 to a faster path that has **not** been validated on the GPU; enable one at
 a time and compare greedy outputs with
-`./docker/gb10/validate-knobs.py` (see `VALIDATION.md`). Pass them through
-`docker run -e` by adding to `EXTRA_DOCKER_ARGS`-style wrappers or export
-them before `run-vision.sh` and forward with `-e`.
+`./docker/gb10/validate-knobs.py` (see `VALIDATION.md`). Export a knob on
+the host before `run-vision.sh` / `run.sh`; the script forwards it into the
+container only when it is set, e.g.
+`VLLM_SM12X_BATCHED_DECODE_NEXT_N=4 NODE_RANK=0 ./docker/gb10/run-vision.sh`.
 
 | Env | Default | Effect when changed |
 | --- | --- | --- |
