@@ -261,6 +261,27 @@ NODE_RANK=0 ./docker/gb10/run-vision.sh
 
 If the vision tower OOMs: `GPU_MEMORY_UTILIZATION=0.82 MAX_NUM_SEQS=4`.
 
+### SM12x tuning knobs (validate on Spark before enabling)
+
+Defaults are the conservative paths that ran on GB10. Each knob switches
+to a faster path that has **not** been validated on the GPU; enable one at
+a time and compare greedy outputs with
+`./docker/gb10/validate-knobs.py` (see `VALIDATION.md`). Pass them through
+`docker run -e` by adding to `EXTRA_DOCKER_ARGS`-style wrappers or export
+them before `run-vision.sh` and forward with `-e`.
+
+| Env | Default | Effect when changed |
+| --- | --- | --- |
+| `VLLM_SM12X_SPLIT_IMAGE_PREFILL` | `1` | Image prefill keeps C4A for text rows; `0` restores SWA-only for the whole chunk. |
+| `VLLM_SM12X_BATCHED_DECODE_NEXT_N` | empty | Comma list of uniform decode widths that use one batched `[B, next_n]` FlashInfer launch. `4` removes the per-request loop for Vision k=3 target steps. |
+| `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4` | `0` | Pad decode-form q_len 2/3 to 4 instead of 6 (halves draft padding). |
+| `VLLM_SM12X_ATTN_AUX_STREAMS` | `0` | Overlap indexer/compressor projections on aux streams again. |
+| `VLLM_SM12X_SHARED_EXPERTS_STREAM` | `0` | Overlap shared experts with routed experts again. |
+| `VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS` | empty | Extra DSpark FULL graph token counts, e.g. `30` gives text k=5 a 6-request graph. |
+| `VLLM_SM12X_WARMUP_LONG_PREFILL_TOKENS` | `128` | Startup prefill that warms the >64-token sparse prefill path; `0` skips it. |
+| `VLLM_B12X_MOE_TOKEN_BUCKET` | `256` | Round eager MoE token counts above the bucket up to a multiple of it (fewer frozen b12x plans). |
+| `VLLM_DSV4_VISION_COMPILE` | `0` | `torch.compile` the vision tower blocks. |
+
 ### Wait until ready
 
 ```bash
@@ -396,7 +417,7 @@ Do not bind Grafana to Wi-Fi. cloudflared originates at `127.0.0.1:3000`.
 ## Cloudflare Tunnel (create and /dash)
 
 Publish Grafana at `https://<host>/dash` and the compat proxy
-(` /v1`, `/configs`, `/healthz`) on the same host. `/dash` must be
+(`/v1`, `/configs`, `/healthz`) on the same host. `/dash` must be
 listed first. Originate the API at `127.0.0.1:30000`, **not** vLLM
 `:30001`. Do **not** add `/telemetry`. This puts an unauthenticated
 OpenAI-compatible API on the public internet.

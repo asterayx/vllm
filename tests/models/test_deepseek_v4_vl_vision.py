@@ -175,10 +175,17 @@ def test_multimodal_batching_preserves_image_and_token_order(batch_size):
             model.aligner(model.vision(image, h, w), h, w)[perm]
             for image, (h, w), perm in zip(patches, grids, perms)
         ]
-        batch_sizes = []
+        calls: list[tuple[str, int]] = []
         handle = model.vision.register_forward_pre_hook(
-            lambda module, args: batch_sizes.append(args[0].shape[0])
+            lambda module, args: calls.append(("dense", args[0].shape[0]))
         )
+        packed = model.vision.forward_packed
+
+        def _packed(patches_, grids_):
+            calls.append(("packed", len(grids_)))
+            return packed(patches_, grids_)
+
+        model.vision.forward_packed = _packed
         actual = model.embed_multimodal(
             patches=torch.cat(patches),
             vit_grid=torch.tensor(grids),
@@ -186,7 +193,107 @@ def test_multimodal_batching_preserves_image_and_token_order(batch_size):
             perm=torch.cat(perms),
         )
         handle.remove()
-    assert batch_sizes == ([1] * 5 if batch_size == 1 else [2, 1, 1, 1])
+    if batch_size == 1:
+        assert calls == [("dense", 1)] * 5
+    else:
+        # [6x6, 6x6] dense, [6x6, 7x5] packed (mixed grids), [6x6] dense.
+        assert calls == [("dense", 2), ("packed", 2), ("dense", 1)]
     assert len(actual) == len(expected)
     for result, reference in zip(actual, expected):
         torch.testing.assert_close(result, reference, rtol=1e-5, atol=1e-6)
+
+
+def test_forward_packed_matches_independent_encoding():
+    """Packing images of different grids with a block-diagonal mask must
+    equal encoding each image alone (own RoPE table, no cross-attention)."""
+    torch.manual_seed(0)
+    config = _make_config()
+    vision = DeepseekV4ViT(config)
+    grids = [(6, 6), (7, 5), (4, 10)]
+    patches = [torch.randn(h * w, 3, 14, 14) for h, w in grids]
+    with torch.no_grad():
+        expected = [vision(p, h, w) for p, (h, w) in zip(patches, grids)]
+        actual = vision.forward_packed(torch.cat(patches), grids)
+    assert len(actual) == 3
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, rtol=1e-5, atol=1e-5)
+
+
+def test_fold_sentinel_rows_writes_local_vocab_shard():
+    """After folding, embedding lookups of the five sentinel ids return the
+    learned vectors and embed_input_ids no longer applies the table."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+        VocabParallelEmbedding,
+        VocabParallelEmbeddingShardIndices,
+    )
+    from vllm.models.deepseek_v4.common.mm_preprocess import (
+        IMAGE_SENTINEL_BASE_ID,
+    )
+    from vllm.models.deepseek_v4.nvidia.vl_model import (
+        DeepseekV4ForConditionalGeneration,
+    )
+
+    hidden = 8
+    # Shard covering [IMAGE_SENTINEL_BASE_ID - 2, IMAGE_SENTINEL_BASE_ID + 3):
+    # only START/PAD/IMAGE rows live here; NEWLINE/END belong to another rank.
+    start = IMAGE_SENTINEL_BASE_ID - 2
+    end = IMAGE_SENTINEL_BASE_ID + 3
+    embed = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
+    torch.nn.Module.__init__(embed)
+    embed.quant_method = UnquantizedEmbeddingMethod()
+    embed.weight = torch.nn.Parameter(torch.zeros(end - start, hidden))
+    embed.shard_indices = VocabParallelEmbeddingShardIndices(
+        padded_org_vocab_start_index=start,
+        padded_org_vocab_end_index=end,
+        padded_added_vocab_start_index=end,
+        padded_added_vocab_end_index=end,
+        org_vocab_start_index=start,
+        org_vocab_end_index=end,
+        added_vocab_start_index=end,
+        added_vocab_end_index=end,
+    )
+    model = DeepseekV4ForConditionalGeneration.__new__(
+        DeepseekV4ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model._sentinel_rows_folded = False
+    for name in ("image_start", "image_pad", "image_newline", "image_end"):
+        setattr(model, name, torch.nn.Parameter(torch.randn(hidden)))
+    model.language_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed))
+    assert model._fold_sentinel_rows()
+    assert model._sentinel_rows_folded
+    torch.testing.assert_close(embed.weight[2], model.image_start.detach())
+    torch.testing.assert_close(embed.weight[3], model.image_pad.detach())
+    torch.testing.assert_close(embed.weight[4], model.image_pad.detach())
+    assert torch.all(embed.weight[:2] == 0)
+
+    calls = []
+
+    def _embed(ids):
+        calls.append(ids)
+        return torch.ones(ids.shape[0], hidden)
+
+    model.language_model.embed_input_ids = _embed
+    ids = torch.tensor([IMAGE_SENTINEL_BASE_ID, 5])
+    out = model.embed_input_ids(ids)
+    assert len(calls) == 1
+    assert torch.all(out == 1)
+
+
+def test_fold_sentinel_rows_skips_quantized_embedding():
+    from vllm.models.deepseek_v4.nvidia.vl_model import (
+        DeepseekV4ForConditionalGeneration,
+    )
+
+    model = DeepseekV4ForConditionalGeneration.__new__(
+        DeepseekV4ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model._sentinel_rows_folded = False
+    model.image_start = torch.nn.Parameter(torch.zeros(4))
+    model.language_model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=torch.nn.Embedding(4, 4))
+    )
+    assert not model._fold_sentinel_rows()
+    assert not model._sentinel_rows_folded

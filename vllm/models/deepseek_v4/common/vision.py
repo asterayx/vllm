@@ -13,8 +13,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 
-@lru_cache(8)
+logger = init_logger(__name__)
+
+
+@lru_cache(64)
 def get_vision_cos_sin(
     n_h: int, n_w: int, dim: int, theta: float, device: torch.device | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -57,6 +62,34 @@ class DeepseekV4PatchEmbed(nn.Module):
         return self.proj(x.flatten(-3))
 
 
+def log_vision_sdpa_backends_once(device: torch.device) -> None:
+    """Report which fused SDPA kernels the vision tower can use on ``device``.
+
+    SM121 (GB10) may lack a flash build; falling back to the math backend
+    costs ``heads * N^2 * 4`` bytes per image, which shows up as encoder
+    latency and peak memory. Logged once so the operator can check it.
+    """
+    if device.type != "cuda":
+        return
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    q = torch.randn(1, 4, 64, 64, dtype=torch.bfloat16, device=device)
+    status = []
+    for name, backend in (
+        ("flash", SDPBackend.FLASH_ATTENTION),
+        ("mem_efficient", SDPBackend.EFFICIENT_ATTENTION),
+    ):
+        try:
+            with sdpa_kernel(backend):
+                F.scaled_dot_product_attention(q, q, q)
+            status.append(f"{name}=ok")
+        except Exception:  # noqa: BLE001 - probe only
+            status.append(f"{name}=unavailable")
+    logger.info_once(
+        "DeepSeek-V4 vision SDPA backends on %s: %s", device, ", ".join(status)
+    )
+
+
 class DeepseekV4VisionAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -66,7 +99,11 @@ class DeepseekV4VisionAttention(nn.Module):
         self.wo = nn.Linear(config.vision_dim, config.vision_dim)
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         original_shape = x.shape
         if x.ndim == 2:
@@ -81,6 +118,7 @@ class DeepseekV4VisionAttention(nn.Module):
             q.transpose(-3, -2),
             k.transpose(-3, -2),
             v.transpose(-3, -2),
+            attn_mask=attn_mask,
         )
         return self.wo(o.transpose(-3, -2).reshape(original_shape))
 
@@ -105,9 +143,13 @@ class DeepseekV4VisionBlock(nn.Module):
         self.mlp = DeepseekV4VisionMLP(config)
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), cos, sin)
+        x = x + self.attn(self.norm1(x), cos, sin, attn_mask)
         return x + self.mlp(self.norm2(x))
 
 
@@ -123,6 +165,29 @@ class DeepseekV4ViT(nn.Module):
             [DeepseekV4VisionBlock(config) for _ in range(config.vision_n_layers)]
         )
         self.norm = DeepseekV4RMSNorm(config.vision_dim)
+        # Plain list: compiled wrappers share the blocks' parameters and must
+        # not register as extra submodules (weight names stay unchanged).
+        self._compiled_blocks: list[nn.Module] | None = None
+        if envs.VLLM_DSV4_VISION_COMPILE:
+            self._compiled_blocks = [
+                torch.compile(block, dynamic=True) for block in self.blocks
+            ]
+        self._sdpa_logged = False
+
+    def _run_blocks(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self._sdpa_logged:
+            self._sdpa_logged = True
+            log_vision_sdpa_backends_once(x.device)
+        blocks = self._compiled_blocks or self.blocks
+        for block in blocks:
+            x = block(x, cos, sin, attn_mask)
+        return self.norm(x)
 
     def forward(
         self, patches: torch.Tensor, n_vit_h: int, n_vit_w: int
@@ -131,9 +196,31 @@ class DeepseekV4ViT(nn.Module):
         cos, sin = get_vision_cos_sin(
             n_vit_h, n_vit_w, self.rope_dim, self.rope_theta, x.device
         )
-        for block in self.blocks:
-            x = block(x, cos, sin)
-        return self.norm(x)
+        return self._run_blocks(x, cos, sin)
+
+    def forward_packed(
+        self, patches: torch.Tensor, grids: list[tuple[int, int]]
+    ) -> tuple[torch.Tensor, ...]:
+        """Encode images of different grids in one pass.
+
+        ``patches`` concatenates the images' patches; each image attends
+        only to itself through a block-diagonal mask and keeps its own 2D
+        RoPE table. Returns one ``(n_vit_h * n_vit_w, dim)`` tensor per
+        image, equal to encoding each image alone.
+        """
+        x = self.patch_embed(patches)
+        tables = [
+            get_vision_cos_sin(h, w, self.rope_dim, self.rope_theta, x.device)
+            for h, w in grids
+        ]
+        cos = torch.cat([t[0] for t in tables])
+        sin = torch.cat([t[1] for t in tables])
+        lens = [h * w for h, w in grids]
+        assert sum(lens) == x.shape[0]
+        segment = torch.repeat_interleave(torch.arange(len(lens)), torch.tensor(lens))
+        segment = segment.to(x.device)
+        attn_mask = segment.unsqueeze(0) == segment.unsqueeze(1)
+        return self._run_blocks(x, cos, sin, attn_mask).split(lens, dim=0)
 
 
 class DeepseekV4Aligner(nn.Module):

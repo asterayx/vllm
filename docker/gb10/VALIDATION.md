@@ -96,6 +96,78 @@ passed **10 tests**. Shell syntax was checked with `bash -n`.
 The Docker image was not rebuilt, and no full-model evaluation or Spark
 performance measurement was possible on this host.
 
+## Third pass: review fixes (2026-09-06)
+
+Branch `claude/spark-vision-fixes-r2` on top of `codex/spark-vision-fixes`
+(`04bd89aae`). AI assistance: Claude Code. CPU-only host, no GPU; every
+kernel-path change below is gated or covered by unit tests, and the
+knobs table in `README.md` lists what still needs GPU confirmation.
+
+Correctness:
+
+- **Image prefill keeps compressed attention for text rows.** A >64-token
+  prefill chunk with an image now launches the 128-wide dual-cache (C4A)
+  cubin for every row and re-launches only the in-image rows SWA-only on
+  the 512-wide single-cache cubin. Before, the whole chunk (every request
+  in it) was SWA-only. In-image rows still lose C4A (no dual-cache cubin
+  accepts the widened window); short (`<=64`, unaligned) prefill spans are
+  unchanged. `VLLM_SM12X_SPLIT_IMAGE_PREFILL=0` restores the old path.
+- **Image spans never read past the written KV.** The SWA index kernel
+  clamps the in-image right window to `seq_len`, and `run-vision.sh`
+  passes `--disable-chunked-mm-input` so an image is prefilled in one
+  chunk (prefix-cache hits inside a span are covered by the clamp).
+- **Chat images stay where the client put them.** The renderer parses
+  messages with `content_format="openai"`; the tokenizer inlines
+  `<｜deepseek_image｜>` per part (no leading placeholders, no `\n` joins).
+  Before, every image was moved to the front of the user turn.
+- **Hash-layer image routing** (image sentinel rows use
+  `topk(sqrtsoftplus + bias_vl)` instead of the hash table) is now locked
+  by a CPU test of the fallback path; the reference `inference/model.py`
+  was not reachable from this host, so the semantics remain a structural
+  inference (the checkpoint ships `bias_vl` on hash layers).
+  `check-extensions.py` now fails the image build when `_moe_C` lacks the
+  `bias_vl` argument (otherwise every image row is re-routed in torch on
+  every layer).
+- **Draft padded q=3->6 with C4A**, batched `[B,4]` decode and q=3->4 are
+  still unvalidated. `docker/gb10/validate-knobs.py` compares greedy
+  outputs and speed between a baseline server and one started with a knob.
+
+Performance:
+
+- FlashInfer sentinel repair runs once per launch (the wrapper repeated it).
+- `input_ids` and the padding mask are padded once per forward; MoE layers
+  slice. `b12x` MoE plans above 256 tokens are bucketed.
+- Vision: sentinel vectors are folded into the embedding rows after load
+  (no per-step table/where); images with different grids in one encoder
+  call are packed with a block-diagonal mask; RoPE cache holds 64 grids;
+  the SDPA backends available on the device are logged once;
+  `VLLM_DSV4_VISION_COMPILE=1` compiles the tower blocks.
+- `wo_a` UE8M0 scales are upcast once at load for Humming/Marlin.
+- Aux streams (attention, shared experts), batched decode, q=3->4, extra
+  DSpark capture tokens are exposed as env knobs (defaults unchanged).
+- Startup runs one 128-token prefill on SM12x so the >64-token sparse
+  prefill path is compiled before the first real prompt.
+- DSpark logs a warning when it ends up with no graphs (text k=5).
+
+CPU validation on this host (uv venv, PyPI torch 2.14 without a driver):
+the SM12x, FlashInfer API, vision, weights, tokenizer, b12x, warmup and
+router suites pass except three pre-existing CUDA-only failures
+(`test_cudagraph_manager::test_full_capture_sets_graph_pool_id_before_cuda_graph`,
+`test_b12x::test_b12x_moe_config_support[mxfp4-w4a8-relu2]`,
+`test_b12x::test_b12x_moe_reload_reprepares_current_parameters`), which
+fail identically on the parent commit.
+
+Spark procedure for each knob:
+
+```bash
+NODE_RANK=0 ./docker/gb10/run-vision-image.sh          # baseline
+./docker/gb10/validate-knobs.py run --out base.json --images ~/val-images
+docker rm -f dspark-vision-tp2-rank0 dspark-vision-tp2-rank1
+# add -e VLLM_SM12X_BATCHED_DECODE_NEXT_N=4 (etc.) to the docker run
+./docker/gb10/validate-knobs.py run --out knob.json --images ~/val-images
+./docker/gb10/validate-knobs.py compare base.json knob.json
+```
+
 ## Required Spark validation
 
 No GPU performance or full-model quality results are claimed by these

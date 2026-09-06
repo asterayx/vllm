@@ -21,12 +21,16 @@ Thin multimodal wrapper around the text-only ``DeepseekV4ForCausalLM``:
 """
 
 from collections.abc import Iterable, Iterator
-from itertools import groupby
 
 import torch
 from torch import nn
 
 import vllm.envs as envs
+from vllm.logger import init_logger
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
@@ -51,6 +55,8 @@ from ..common.mm_preprocess import (
 )
 from ..common.vision import DeepseekV4Aligner, DeepseekV4ViT
 from .model import _make_deepseek_v4_weights_mapper
+
+logger = init_logger(__name__)
 
 
 def _make_deepseek_v4_vl_weights_mapper(
@@ -111,6 +117,10 @@ class DeepseekV4ForConditionalGeneration(
         self.vision_encoder_batch_size = (
             1 if envs.VLLM_BATCH_INVARIANT else config.vision_encoder_batch_size
         )
+        # Set once the four learned sentinel vectors are written into the
+        # embedding rows of their reserved ids; embed_input_ids then skips
+        # the per-step table lookup / torch.where.
+        self._sentinel_rows_folded = False
         self.multimodal_config = model_config.multimodal_config
         assert self.multimodal_config is not None
 
@@ -204,27 +214,41 @@ class DeepseekV4ForConditionalGeneration(
         embeds: list[torch.Tensor] = []
         vit_offset = 0
         llm_offset = 0
-        grids = zip(vit_grid.tolist(), llm_grid.tolist(), strict=True)
-        for ((n_vit_h, n_vit_w), (n_llm_h, n_llm_w)), items in groupby(grids):
-            n_vit = n_vit_h * n_vit_w
-            n_llm = n_llm_h * n_llm_w
-            remaining = sum(1 for _ in items)
-            while remaining:
-                batch_size = min(remaining, self.vision_encoder_batch_size)
-                batch = patches[vit_offset : vit_offset + batch_size * n_vit]
-                batch = batch.unflatten(0, (batch_size, n_vit))
+        grids = list(zip(vit_grid.tolist(), llm_grid.tolist(), strict=True))
+        index = 0
+        while index < len(grids):
+            group = grids[index : index + self.vision_encoder_batch_size]
+            n_vits = [h * w for (h, w), _ in group]
+            n_llms = [h * w for _, (h, w) in group]
+            group_patches = patches[vit_offset : vit_offset + sum(n_vits)]
+            if all(item == group[0] for item in group):
+                # Same grid: one dense batch (identical RoPE table).
+                (n_vit_h, n_vit_w), _ = group[0]
+                batch = group_patches.unflatten(0, (len(group), n_vits[0]))
                 image_embeds = self.aligner(
                     self.vision(batch, n_vit_h, n_vit_w), n_vit_h, n_vit_w
                 )
-                item_perm = perm[llm_offset : llm_offset + batch_size * n_llm]
-                item_perm = item_perm.view(batch_size, n_llm, 1)
+                item_perm = perm[llm_offset : llm_offset + sum(n_llms)]
+                item_perm = item_perm.view(len(group), n_llms[0], 1)
                 ordered = image_embeds.gather(
                     1, item_perm.expand(-1, -1, image_embeds.shape[-1])
                 )
                 embeds.extend(ordered.unbind(0))
-                vit_offset += batch_size * n_vit
-                llm_offset += batch_size * n_llm
-                remaining -= batch_size
+            else:
+                # Mixed grids: one packed pass with a block-diagonal mask.
+                features = self.vision.forward_packed(
+                    group_patches, [vit for vit, _ in group]
+                )
+                offset = llm_offset
+                for feat, ((n_vit_h, n_vit_w), _), n_llm in zip(
+                    features, group, n_llms, strict=True
+                ):
+                    image_embeds = self.aligner(feat, n_vit_h, n_vit_w)
+                    embeds.append(image_embeds[perm[offset : offset + n_llm]])
+                    offset += n_llm
+            vit_offset += sum(n_vits)
+            llm_offset += sum(n_llms)
+            index += len(group)
         return tuple(embeds)
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
@@ -251,7 +275,9 @@ class DeepseekV4ForConditionalGeneration(
         # reserved tokens (their embedding rows are always overwritten below).
         inputs_embeds = self.language_model.embed_input_ids(input_ids)
 
-        if self.image_start is not None:
+        if self.image_start is not None and not getattr(
+            self, "_sentinel_rows_folded", False
+        ):
             # Branch-free sentinel overwrite: safe inside compiled/captured
             # regions (no data-dependent control flow).
             sentinel_mask = image_sentinel_mask(input_ids)
@@ -326,6 +352,7 @@ class DeepseekV4ForConditionalGeneration(
         loaded_params = loader.load_weights(mapped_weights())
         # The child's load_weights already ran its post-load finalization.
         self._weights_finalized = True
+        self._fold_sentinel_rows()
         return loaded_params
 
     def process_weights_after_loading(self) -> None:
@@ -333,5 +360,55 @@ class DeepseekV4ForConditionalGeneration(
         # format). Under DummyModelLoader the child's load_weights — and
         # hence its finalize step — is bypassed, so run it here instead.
         if getattr(self, "_weights_finalized", False):
+            self._fold_sentinel_rows()
             return
         self.language_model.process_weights_after_loading()
+        self._fold_sentinel_rows()
+
+    def _fold_sentinel_rows(self) -> bool:
+        """Write the learned sentinel vectors into their embedding rows.
+
+        The five borrowed reserved ids never carry a meaningful checkpoint
+        embedding, so their rows are replaced by ``image_start`` /
+        ``image_pad`` (also for the IMAGE slot, which the multimodal merge
+        overwrites) / ``image_newline`` / ``image_end``. The embedding
+        lookup then yields the sentinel vectors directly and
+        ``embed_input_ids`` skips its per-step mask/gather/where. Only the
+        vocab shard holding a row writes it (TP vocab-parallel embedding).
+        """
+        if getattr(self, "image_start", None) is None:
+            return False
+        if getattr(self, "_sentinel_rows_folded", False):
+            return True
+        language_model = getattr(self.language_model, "model", None)
+        embed = getattr(language_model, "embed_tokens", None)
+        if not isinstance(embed, VocabParallelEmbedding) or not isinstance(
+            embed.quant_method, UnquantizedEmbeddingMethod
+        ):
+            logger.info_once(
+                "DeepSeek-V4 vision: keeping runtime sentinel embedding table "
+                "(embed_tokens is %s)",
+                type(embed).__name__,
+            )
+            return False
+        weight = embed.weight
+        if weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            return False
+        assert self.image_pad is not None
+        assert self.image_newline is not None and self.image_end is not None
+        table = (
+            self.image_start,
+            self.image_pad,
+            self.image_pad,
+            self.image_newline,
+            self.image_end,
+        )
+        start = embed.shard_indices.org_vocab_start_index
+        end = embed.shard_indices.org_vocab_end_index
+        with torch.no_grad():
+            for offset, vector in enumerate(table):
+                vocab_id = IMAGE_SENTINEL_BASE_ID + offset
+                if start <= vocab_id < end:
+                    weight[vocab_id - start].copy_(vector.to(weight.dtype))
+        self._sentinel_rows_folded = True
+        return True
