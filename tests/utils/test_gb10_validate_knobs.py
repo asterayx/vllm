@@ -39,3 +39,29 @@ def test_text_prompts_cover_short_long_and_multi_turn():
     assert len(prompts[3]) == 3
     assert len(prompts[2][0]["content"]) > 4000
     assert module._image_prompts(None) == []
+
+
+def test_compare_flags_near_tie_divergence():
+    module = _load()
+    base = [
+        {
+            "prompt_index": 0,
+            "tokens": ["a", "b"],
+            "margins": [2.0, 0.01],
+            "seconds": 1.0,
+        }
+    ]
+    other = [
+        {
+            "prompt_index": 0,
+            "tokens": ["a", "c"],
+            "margins": [2.0, 0.02],
+            "seconds": 1.0,
+        }
+    ]
+    (line,) = module.compare_results(base, other)
+    assert line.startswith("MISMATCH prompt 0: diverge at token 1")
+    assert "near tie" in line
+    base[0]["margins"][1] = 1.5
+    (line,) = module.compare_results(base, other)
+    assert "gap 1.500" in line and "near tie" not in line

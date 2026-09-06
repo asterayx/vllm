@@ -34,6 +34,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# Divergences at positions where top-1 and top-2 are closer than this are
+# attributed to kernel-level numerical noise (e.g. a different FlashInfer
+# autotune tactic after a restart), not to a behavior change.
+NEAR_TIE_NATS = 0.1
+
 LONG_PARAGRAPH = (
     "The DGX Spark pairs a Grace CPU with a Blackwell GPU in one package. "
     "Its unified memory lets a single node hold a large MoE checkpoint while "
@@ -108,7 +113,7 @@ def _chat(url: str, model: str, messages: list[dict], max_tokens: int) -> dict:
         "seed": 0,
         "max_tokens": max_tokens,
         "logprobs": True,
-        "top_logprobs": 1,
+        "top_logprobs": 2,
         "chat_template_kwargs": {"thinking": False},
     }
     request = urllib.request.Request(
@@ -121,13 +126,21 @@ def _chat(url: str, model: str, messages: list[dict], max_tokens: int) -> dict:
         payload = json.loads(response.read())
     elapsed = time.perf_counter() - start
     choice = payload["choices"][0]
-    tokens = [
-        entry["token"] for entry in (choice.get("logprobs") or {}).get("content", [])
-    ]
+    entries = (choice.get("logprobs") or {}).get("content", [])
+    tokens = [entry["token"] for entry in entries]
+    # Gap between the chosen token and the runner-up (nats). A divergence at
+    # a position with a tiny gap is numerical noise, not a routing change.
+    margins = []
+    for entry in entries:
+        top = sorted(
+            (alt["logprob"] for alt in entry.get("top_logprobs", [])), reverse=True
+        )
+        margins.append(round(top[0] - top[1], 4) if len(top) >= 2 else None)
     usage = payload.get("usage", {})
     return {
         "text": choice["message"]["content"],
         "tokens": tokens,
+        "margins": margins,
         "completion_tokens": usage.get("completion_tokens"),
         "prompt_tokens": usage.get("prompt_tokens"),
         "seconds": elapsed,
@@ -137,6 +150,28 @@ def _chat(url: str, model: str, messages: list[dict], max_tokens: int) -> dict:
 def _model_name(url: str) -> str:
     with urllib.request.urlopen(f"{url}/v1/models", timeout=60) as response:
         return json.loads(response.read())["data"][0]["id"]
+
+
+def _concurrent_run(
+    url: str, model: str, prompts: list[list[dict]], concurrency: int, max_tokens: int
+) -> dict:
+    """Run every prompt ``concurrency`` times at once; report aggregate speed."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    jobs = [messages for messages in prompts for _ in range(concurrency)]
+    start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        results = list(
+            pool.map(lambda messages: _chat(url, model, messages, max_tokens), jobs)
+        )
+    wall = time.perf_counter() - start
+    total = sum(r["completion_tokens"] or 0 for r in results)
+    return {
+        "concurrency": concurrency,
+        "wall_seconds": wall,
+        "completion_tokens": total,
+        "tokens_per_second": total / max(wall, 1e-6),
+    }
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -162,9 +197,19 @@ def cmd_run(args: argparse.Namespace) -> int:
             f"{result['seconds']:.2f}s {rate:.1f} tok/s",
             flush=True,
         )
-    Path(args.out).write_text(
-        json.dumps({"model": model, "results": results}, indent=1)
-    )
+    payload: dict = {"model": model, "results": results}
+    if args.concurrency > 1:
+        stats = _concurrent_run(
+            args.url, model, prompts, args.concurrency, args.max_tokens
+        )
+        payload["concurrent"] = stats
+        print(
+            f"[concurrency {stats['concurrency']}] {stats['completion_tokens']} "
+            f"tokens in {stats['wall_seconds']:.2f}s = "
+            f"{stats['tokens_per_second']:.1f} tok/s aggregate",
+            flush=True,
+        )
+    Path(args.out).write_text(json.dumps(payload, indent=1))
     print("wrote", args.out)
     return 0
 
@@ -184,19 +229,35 @@ def compare_results(base: list[dict], other: list[dict]) -> list[str]:
         first = next(
             (i for i, (x, y) in enumerate(zip(ta, tb)) if x != y), min(len(ta), len(tb))
         )
+        margins = a.get("margins") or []
+        margin = margins[first] if first < len(margins) else None
+        note = ""
+        if margin is not None:
+            note = f", top1-top2 gap {margin:.3f} nats"
+            if margin < NEAR_TIE_NATS:
+                note += " (near tie: numerical noise)"
         lines.append(
             f"MISMATCH prompt {a['prompt_index']}: diverge at token {first} "
-            f"({ta[first : first + 3]!r} vs {tb[first : first + 3]!r}), "
+            f"({ta[first : first + 3]!r} vs {tb[first : first + 3]!r}){note}, "
             f"{speed:.2f}x faster"
         )
     return lines
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
-    base = json.loads(Path(args.base).read_text())["results"]
-    other = json.loads(Path(args.other).read_text())["results"]
+    base_doc = json.loads(Path(args.base).read_text())
+    other_doc = json.loads(Path(args.other).read_text())
+    base = base_doc["results"]
+    other = other_doc["results"]
     lines = compare_results(base, other)
     print("\n".join(lines))
+    if "concurrent" in base_doc and "concurrent" in other_doc:
+        ca, cb = base_doc["concurrent"], other_doc["concurrent"]
+        print(
+            f"concurrency {ca['concurrency']}: {ca['tokens_per_second']:.1f} -> "
+            f"{cb['tokens_per_second']:.1f} tok/s aggregate "
+            f"({cb['tokens_per_second'] / max(ca['tokens_per_second'], 1e-6):.2f}x)"
+        )
     mismatches = sum(line.startswith("MISMATCH") for line in lines)
     print(f"{len(lines) - mismatches}/{len(lines)} prompts identical")
     return 1 if mismatches > args.allow_mismatch else 0
@@ -211,6 +272,13 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--out", required=True)
     run.add_argument("--images", type=Path, default=None)
     run.add_argument("--max-tokens", type=int, default=64)
+    run.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="also run every prompt this many times at once and report "
+        "aggregate tok/s (the batched-decode knob only pays off here)",
+    )
     run.set_defaults(func=cmd_run)
     compare = sub.add_parser("compare")
     compare.add_argument("base")
