@@ -82,10 +82,12 @@ def _split(
     use_eagle: bool = True,
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
+    config_block_size: int | None = None,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
+        cache_config=SimpleNamespace(block_size=config_block_size or MAMBA_BLOCK_SIZE),
+        mamba_block_size=MAMBA_BLOCK_SIZE,
         use_eagle=use_eagle,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
@@ -99,12 +101,20 @@ def _split(
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 
 
+@pytest.mark.parametrize("use_eagle,expected", [(False, 8000), (True, 6400)])
+def test_mamba_split_ignores_smaller_qsa_ring_blocks(use_eagle, expected):
+    """A QSA ring's tiny block must not move the Mamba replay checkpoint."""
+    (request,) = create_requests(1, num_tokens=8154, block_size=ATTN_BLOCK_SIZE)
+    assert _split(request, 8154, use_eagle=use_eagle, config_block_size=8) == expected
+
+
 @pytest.mark.parametrize(
     ("prompt_len", "num_new_tokens", "use_eagle", "expected"),
     [
         (2002, 2002, False, 2002),
         (3602, 2000, False, 2000),
         (3602, 3602, True, MAMBA_BLOCK_SIZE),
+        (4800, 4800, True, MAMBA_BLOCK_SIZE),
     ],
 )
 def test_internal_checkpoint_split(

@@ -152,9 +152,15 @@ class KVCacheCoordinator(ABC):
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
 
-        # A positive retention interval must be a multiple of the base hit granularity
-        # (``scheduler_block_size``) to land on real cache-hit boundaries.
-        # 0 = keep only the latest replay boundary; None = dense;
+        # Target Mamba must retain the earlier state selected after a draft
+        # attention group drops its lookahead block, even though Mamba itself
+        # is not a draft group.
+        if use_eagle:
+            for manager in self.single_type_managers:
+                if isinstance(manager.kv_cache_spec, MambaSpec):
+                    manager.replay_boundary_margin = self.scheduler_block_size
+        # A positive interval must align to real cache-hit boundaries.
+        # 0 keeps only replay boundaries; None retains checkpoints densely.
         self.retention_interval = kv_cache_config.prefix_cache_retention_interval
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config

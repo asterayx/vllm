@@ -1161,6 +1161,7 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
     # Create minimal mock with just the needed attributes
     mock = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
+        mamba_block_size=block_size,
         max_num_scheduled_tokens=3 * block_size,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle=False,
@@ -4224,6 +4225,45 @@ def test_mamba_reachable_block_mask_pins_shared_prefix():
     # No boundary given -> unchanged replay-only behavior.
     assert retained(0, 0) == {14}
     assert retained(0, None) == {14}
+
+
+@pytest.mark.parametrize("use_eagle", [False, True])
+@pytest.mark.parametrize("prompt_length", [255, 256])
+def test_mamba_first_repeat_reuses_speculative_replay_boundary(
+    use_eagle, prompt_length
+):
+    """Sparse retention must keep the state before the draft's dropped tail."""
+    block_size = 16
+    config = _make_hybrid_kv_cache_config(
+        block_size, 200, ["full", "mamba_align", "full"]
+    )
+    config.kv_cache_groups[-1].is_eagle_group = use_eagle
+    if use_eagle:
+        config.kv_cache_groups[1].kv_cache_spec = replace(
+            config.kv_cache_groups[1].kv_cache_spec, num_speculative_blocks=2
+        )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=0,
+        use_eagle=use_eagle,
+    )
+    tokens = list(range(prompt_length))
+    request = make_request("producer", tokens, block_size, sha256)
+    boundary = (prompt_length - 1) // block_size * block_size
+    if use_eagle:
+        boundary -= block_size
+    for end in (boundary, prompt_length):
+        assert manager.allocate_slots(request, end - request.num_computed_tokens)
+        request.num_computed_tokens = end
+        manager.cache_blocks(request, end)
+    manager.free(request)
+
+    repeated = make_request("repeat", tokens, block_size, sha256)
+    _, hit_length, _ = manager.get_computed_blocks(repeated)
+    assert hit_length == boundary
 
 
 def test_mamba_shared_prefix_survives_zero_retention():

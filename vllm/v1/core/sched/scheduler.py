@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -319,6 +320,14 @@ class Scheduler(SchedulerInterface):
         )
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
+        mamba_block_sizes = [
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        self.mamba_block_size = (
+            math.lcm(*mamba_block_sizes) if mamba_block_sizes else self.block_size
+        )
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
         # Blocks that async KV loads will overwrite this step, skipped from
         # zeroing since the zeroing could race the out-of-band write.
@@ -409,13 +418,17 @@ class Scheduler(SchedulerInterface):
         if start >= prefill_end:
             return num_new_tokens
 
-        block_size = self.cache_config.block_size
+        # The minimum cache block may belong to a tiny QSA ring. Checkpoints
+        # must align to the Mamba state blocks.
+        block_size = self.mamba_block_size
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
         if self.use_eagle:
-            last_cache_position = max(last_cache_position - block_size, 0)
+            last_cache_position = max(
+                ((request.num_tokens - 1) // block_size - 1) * block_size, 0
+            )
 
         end = start + num_new_tokens
         use_internal_checkpoint = (

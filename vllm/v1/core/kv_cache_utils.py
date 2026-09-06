@@ -1814,7 +1814,7 @@ def _annotate_eagle_groups(
 ) -> None:
     """Flag the KV cache groups that hold drafter attention layers.
 
-    Two detection rules, in order of preference:
+    Detection rules:
 
     1. Spec-driven. ``non_causal_multi_token_decode`` is declared on
        MLAAttentionSpec and set by drafter attention layers that run a
@@ -1832,6 +1832,9 @@ def _annotate_eagle_groups(
        ``use_deepseek_v4_fallback`` False. The caller gates this fallback on
        the configured model type.
        FIXME(yifan): avoid/generalize this hacky check.
+    3. Qwen4Exp MTP registers its attention and QSA state caches under
+       ``mtp.layers.``. Flag every group containing those layers, including
+       groups shared with target attention, while leaving target Mamba alone.
 
     Args:
         vllm_config: Config supplying the speculative method, if any.
@@ -1844,10 +1847,19 @@ def _annotate_eagle_groups(
     if spec_config is None or not spec_config.use_eagle():
         return
 
+    model_config = vllm_config.model_config
+    qwen4_mtp = (
+        spec_config.method == "mtp"
+        and model_config is not None
+        and model_config.hf_config.model_type in ("qwen4_exp", "qwen4_exp_text")
+    )
     for group in kv_cache_groups:
         if any(
             getattr(spec, "non_causal_multi_token_decode", False)
             for spec in iter_layer_specs(group.kv_cache_spec)
+        ) or (
+            qwen4_mtp
+            and any(name.startswith("mtp.layers.") for name in group.layer_names)
         ):
             group.is_eagle_group = True
 

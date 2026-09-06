@@ -3333,6 +3333,38 @@ def test_draft_group_annotated_on_hybrid_general_path():
     assert "draft.attn.0" in flagged[0].layer_names
 
 
+@pytest.mark.parametrize("model_type", ["qwen4_exp", "qwen4_exp_text", "other"])
+@pytest.mark.parametrize("enable_mtp", [True, False])
+@pytest.mark.parametrize("shared_spec", [True, False])
+def test_qwen4_mtp_groups_preserve_target_mamba_reuse(
+    model_type, enable_mtp, shared_spec
+):
+    """Draft attention and QSA groups need tail exclusion; target Mamba does not."""
+    config = _spec_decode_grouping_config(method="mtp", model_type=model_type)
+    if not enable_mtp:
+        config.speculative_config = None
+    specs = _hybrid_specs_with_draft(draft=False, draft_shares_target_spec=shared_spec)
+    draft_names = {
+        "mtp.layers.48.self_attn.attn",
+        "mtp.layers.48.self_attn.indexer.compressed_key_cache",
+    }
+    specs.update({name: new_mla_spec(block_size=64) for name in draft_names})
+    specs["mtp.layers.48.self_attn.indexer.compressed_key_cache"] = replace(
+        new_mla_spec(block_size=64), tokens_per_state=4
+    )
+    groups = get_kv_cache_groups(config, specs)
+
+    for group in groups:
+        expected = (
+            enable_mtp
+            and model_type != "other"
+            and bool(draft_names.intersection(group.layer_names))
+        )
+        assert group.is_eagle_group == expected
+        if isinstance(group.kv_cache_spec, MambaSpec):
+            assert not group.is_eagle_group
+
+
 def test_mamba_groups_never_flagged_even_when_draft_shares_a_group():
     # Packed uniform-type groups can contain distinct target and draft layer
     # specs; the combined group still holds volatile draft KV and must be

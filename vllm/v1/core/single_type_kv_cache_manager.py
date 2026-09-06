@@ -75,6 +75,7 @@ class SingleTypeKVCacheManager(ABC):
         # Hybrid fine-grained lookup may lower this after all participating
         # managers have been validated by the coordinator.
         self.cache_hit_alignment_tokens = scheduler_block_size
+        self.replay_boundary_margin = 0
         # The block size for this manager; used for actual block allocation.
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
@@ -457,6 +458,10 @@ class SingleTypeKVCacheManager(ABC):
         # retention: the replay boundary (``num_prompt - 1``, capped by
         # ``get_computed_blocks``) and any detected shared-prefix junction.
         reachable_boundaries = [request.num_prompt_tokens - 1]
+        if self.replay_boundary_margin:
+            reachable_boundaries.append(
+                max(0, request.num_prompt_tokens - 1 - self.replay_boundary_margin)
+            )
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
 
