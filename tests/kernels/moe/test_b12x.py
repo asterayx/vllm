@@ -1243,3 +1243,30 @@ def test_b12x_moe_cuda_graph_replay(
     assert torch.isfinite(expected).all()
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_b12x_plan_tokens_bucket_large_eager_counts(monkeypatch):
+    """Chunked-prefill token counts above the bucket round up to a multiple of
+    it; small counts, exactly planned counts and capture stay exact."""
+    experts = B12xExperts(
+        make_dummy_moe_config(
+            num_experts=4,
+            experts_per_token=2,
+            hidden_dim=128,
+            intermediate_size=64,
+        ),
+        _quant_config("mxfp4", None),
+    )
+    monkeypatch.setattr(b12x.envs, "VLLM_B12X_MOE_TOKEN_BUCKET", 256)
+    monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: False)
+    assert experts._plan_tokens(8) == 8
+    assert experts._plan_tokens(256) == 256
+    assert experts._plan_tokens(257) == 512
+    assert experts._plan_tokens(4097) == 4352
+    experts._exact_plan_tokens.add(300)
+    assert experts._plan_tokens(300) == 300
+    monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: True)
+    assert experts._plan_tokens(301) == 301
+    monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(b12x.envs, "VLLM_B12X_MOE_TOKEN_BUCKET", 0)
+    assert experts._plan_tokens(301) == 301

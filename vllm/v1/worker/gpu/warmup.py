@@ -8,9 +8,11 @@ from typing import Any
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm import PoolingParams, SamplingParams
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.sm12x import (
     sm12x_kernel_warmup_prefill_len,
@@ -430,3 +432,86 @@ def warmup_kernels(
     worker_execute_model(cleanup_output)
     model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()
+
+    sm12x_long_prefill_warmup(model_runner, worker_execute_model, worker_sample_tokens)
+
+
+def sm12x_long_prefill_warmup_tokens(model_runner: GPUModelRunner) -> int:
+    """Tokens for the SM12x >64-token prefill warmup step (0 = skip).
+
+    The mixed warmup and the main warmup prefill are shortened to pad-safe
+    widths on SM12x, so without this step the sparse prefill orchestrator
+    (>64 tokens per chunk) is first JIT-compiled and autotuned by the first
+    real long prompt.
+    """
+    num_tokens = envs.VLLM_SM12X_WARMUP_LONG_PREFILL_TOKENS
+    if (
+        num_tokens <= 64
+        or model_runner.is_pooling_model
+        or model_runner.is_encoder_only
+        or not current_platform.is_device_capability_family(120)
+    ):
+        return 0
+    num_tokens = min(
+        num_tokens,
+        model_runner.scheduler_config.max_num_batched_tokens,
+        model_runner.model_config.max_model_len,
+    )
+    return num_tokens if num_tokens > 64 else 0
+
+
+def sm12x_long_prefill_warmup(
+    model_runner: GPUModelRunner,
+    worker_execute_model: Callable[[SchedulerOutput], Any],
+    worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+) -> bool:
+    """Run one single-request prefill of >64 tokens on SM12x."""
+    num_tokens = sm12x_long_prefill_warmup_tokens(model_runner)
+    if num_tokens == 0:
+        return False
+    kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
+    block_count = _warmup_block_counter(model_runner)
+    block_counts = [block_count(num_tokens, g.kv_cache_spec) for g in kv_cache_groups]
+    if sum(block_counts) > max(0, model_runner.kv_cache_config.num_blocks - 1):
+        logger.warning_once(
+            "SM12x long-prefill warmup skipped: %d tokens need %d KV blocks",
+            num_tokens,
+            sum(block_counts),
+        )
+        return False
+    logger.info_once("SM12x long-prefill warmup: %d tokens", num_tokens)
+    next_block_id = 1
+    block_ids = []
+    for n in block_counts:
+        block_ids.append(list(range(next_block_id, next_block_id + n)))
+        next_block_id += n
+    req_id = "_sm12x_long_prefill_warmup_"
+    prompt_token_ids = list(range(num_tokens))
+    new_req = NewRequestData.from_request(
+        Request(
+            req_id,
+            prompt_token_ids,
+            SamplingParams.for_sampler_warmup(),
+            None,
+            mm_features=[],
+        ),
+        block_ids=tuple(block_ids),
+        prefill_token_ids=prompt_token_ids,
+    )
+    prefill_output = SchedulerOutput.make_empty()
+    prefill_output.scheduled_new_reqs = [new_req]
+    prefill_output.num_scheduled_tokens = {req_id: num_tokens}
+    prefill_output.total_num_scheduled_tokens = num_tokens
+    prefill_output.num_common_prefix_blocks = [0] * len(kv_cache_groups)
+
+    model_runner.kv_connector.set_disabled(True)
+    try:
+        worker_execute_model(prefill_output)
+        worker_sample_tokens(None)
+        cleanup_output = SchedulerOutput.make_empty()
+        cleanup_output.finished_req_ids = {req_id}
+        worker_execute_model(cleanup_output)
+    finally:
+        model_runner.kv_connector.set_disabled(False)
+    torch.accelerator.synchronize()
+    return True

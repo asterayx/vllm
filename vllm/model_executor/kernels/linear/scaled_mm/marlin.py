@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
+from .BlockScaledMMLinearKernel import upcast_ue8m0_weight_scale_if_needed
 from .ScaledMMLinearKernel import (
     FP8ScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
@@ -93,6 +94,8 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         # FP8 block layout. Marlin packing changes (N, K) into a workspace
         # format and DeepGEMM then asserts m/n/k.
         if getattr(layer, "is_bmm", False):
+            for bmm_scale_name in ("weight_scale_inv", "weight_scale"):
+                upcast_ue8m0_weight_scale_if_needed(layer, bmm_scale_name)
             return
         # Non-block: callers must pass weight in (K, N) layout.
 

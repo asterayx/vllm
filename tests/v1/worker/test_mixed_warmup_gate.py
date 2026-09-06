@@ -78,3 +78,35 @@ def test_mixed_warmup_sm12x_seeds_at_safe_prefill_width(monkeypatch):
         "_v2_mixed_warmup_decode_": 1,
         "_v2_mixed_warmup_prefill_": 2,
     }
+
+
+def test_sm12x_long_prefill_warmup_token_gate(monkeypatch):
+    """The extra >64-token prefill warmup only runs on SM12x, is capped by the
+    scheduler/model limits, and is skipped when it would not exceed 64."""
+    from vllm.v1.worker.gpu import warmup as warmup_mod
+
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        is_encoder_only=False,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        model_config=SimpleNamespace(max_model_len=4096),
+    )
+    monkeypatch.setattr(
+        warmup_mod.current_platform,
+        "is_device_capability_family",
+        lambda fam: False,
+    )
+    assert warmup_mod.sm12x_long_prefill_warmup_tokens(runner) == 0
+    monkeypatch.setattr(
+        warmup_mod.current_platform,
+        "is_device_capability_family",
+        lambda fam: fam == 120,
+    )
+    assert warmup_mod.sm12x_long_prefill_warmup_tokens(runner) == 128
+    monkeypatch.setattr(warmup_mod.envs, "VLLM_SM12X_WARMUP_LONG_PREFILL_TOKENS", 0)
+    assert warmup_mod.sm12x_long_prefill_warmup_tokens(runner) == 0
+    monkeypatch.setattr(warmup_mod.envs, "VLLM_SM12X_WARMUP_LONG_PREFILL_TOKENS", 9999)
+    assert warmup_mod.sm12x_long_prefill_warmup_tokens(runner) == 4096
+    runner.scheduler_config.max_num_batched_tokens = 64
+    assert warmup_mod.sm12x_long_prefill_warmup_tokens(runner) == 0
+    assert not warmup_mod.sm12x_long_prefill_warmup(runner, _fail, _fail)

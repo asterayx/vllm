@@ -84,8 +84,10 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.sm12x import (
     sm12x_align_is_padding,
+    sm12x_align_tokens,
     sm12x_disable_attn_aux_streams,
     sm12x_disable_eager_scratch_pool,
+    sm12x_match_token_rows,
     sm12x_pad_token_rows,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -755,8 +757,10 @@ class DeepseekV4MoE(nn.Module):
         hidden_states, orig_tokens = sm12x_pad_token_rows(
             hidden_states.reshape(org_shape[0], -1), what="MoE"
         )
-        if input_ids is not None and hidden_states.shape[0] != orig_tokens:
-            input_ids = sm12x_pad_token_rows(input_ids.reshape(-1))[0]
+        if input_ids is not None and input_ids.shape[0] != hidden_states.shape[0]:
+            input_ids = sm12x_match_token_rows(
+                input_ids.reshape(-1), hidden_states.shape[0]
+            )
         with sm12x_align_is_padding(hidden_states.shape[0]):
             router_logits, _ = self.gate(hidden_states)
             topk_weights, topk_ids = fused_topk_bias(
@@ -800,8 +804,10 @@ class DeepseekV4MoE(nn.Module):
         hidden_states, orig_tokens = sm12x_pad_token_rows(
             hidden_states.reshape(org_shape[0], -1), what="MoE"
         )
-        if input_ids is not None and hidden_states.shape[0] != orig_tokens:
-            input_ids = sm12x_pad_token_rows(input_ids.reshape(-1))[0]
+        if input_ids is not None and input_ids.shape[0] != hidden_states.shape[0]:
+            input_ids = sm12x_match_token_rows(
+                input_ids.reshape(-1), hidden_states.shape[0]
+            )
         with sm12x_align_is_padding(hidden_states.shape[0]):
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
@@ -1215,28 +1221,36 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
-            hidden_states, residual, post_mix, res_mix = layer(
-                hidden_states,
-                positions,
-                input_ids,
-                post_mix,
-                res_mix,
-                residual,
-            )
-            if idx + 1 in self.aux_hidden_state_layers:
-                # Reconstruct the aux hidden state for draft models
-                aux_recon = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
+        # SM12x: pad token ids and grow the padding mask once per forward so
+        # the MoE layers slice instead of re-padding on every layer.
+        padded_num_tokens = sm12x_align_tokens(hidden_states.shape[0])
+        if input_ids is not None and input_ids.shape[0] < padded_num_tokens:
+            input_ids = sm12x_match_token_rows(input_ids, padded_num_tokens)
+        with sm12x_align_is_padding(padded_num_tokens):
+            for idx, layer in enumerate(
+                islice(self.layers, self.start_layer, self.end_layer),
+                start=self.start_layer,
+            ):
+                hidden_states, residual, post_mix, res_mix = layer(
+                    hidden_states,
+                    positions,
+                    input_ids,
+                    post_mix,
+                    res_mix,
+                    residual,
                 )
-                aux_hidden_state = aux_recon.mean(dim=1)
-                if self.use_sequence_parallel:
-                    aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
-                aux_hidden_states.append(aux_hidden_state)
-                final_aux_recon = aux_recon
+                if idx + 1 in self.aux_hidden_state_layers:
+                    # Reconstruct the aux hidden state for draft models
+                    aux_recon = mhc_post_tilelang(
+                        hidden_states, residual, post_mix, res_mix
+                    )
+                    aux_hidden_state = aux_recon.mean(dim=1)
+                    if self.use_sequence_parallel:
+                        aux_hidden_state = sp_all_gather(aux_hidden_state)[
+                            :full_num_tokens
+                        ]
+                    aux_hidden_states.append(aux_hidden_state)
+                    final_aux_recon = aux_recon
         if layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:

@@ -13,6 +13,7 @@ from vllm.model_executor.layers.quantization.utils.humming_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_humming
 
+from .BlockScaledMMLinearKernel import upcast_ue8m0_weight_scale_if_needed
 from .ScaledMMLinearKernel import (
     FP8ScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
@@ -49,6 +50,10 @@ class HummingFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "is_bmm", False):
+            # DSv4 wo_a keeps the checkpoint block layout for fp8_einsum, but
+            # its UE8M0 scale is upcast once here instead of every forward.
+            for scale_name in ("weight_scale_inv", "weight_scale"):
+                upcast_ue8m0_weight_scale_if_needed(layer, scale_name)
             return
         from vllm.utils.humming import dtypes
 

@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -32,7 +33,7 @@ from vllm.utils.b12x import (
 )
 from vllm.utils.sm12x import (
     sm12x_align_tokens,
-    sm12x_pad_token_rows,
+    sm12x_pad_prefill_token_rows,
     sm12x_replace_moe_topk_sentinels,
 )
 
@@ -229,6 +230,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._source_parameters_released = False
         self._unit_scales: dict[torch.device, torch.Tensor] = {}
         self._plans: dict[tuple[int, int, MoEActivation, bool], Any] = {}
+        # Token counts planned exactly (warmup / capture shapes). Other eager
+        # counts above VLLM_B12X_MOE_TOKEN_BUCKET round up to a multiple of
+        # it so chunked prefill does not freeze one plan per distinct M.
+        self._exact_plan_tokens: set[int] = set()
         self._apply_router_weight_on_input = False
 
     def _unit_scale(self, device: torch.device, num_experts: int) -> torch.Tensor:
@@ -565,6 +570,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             return plan
         if _is_current_stream_capturing():
             raise RuntimeError("b12x MoE plans must be created before CUDA capture")
+        self._exact_plan_tokens.add(key[0])
 
         limit, alpha, beta = self._swiglu_params(activation)
         prepared = self._prepared()
@@ -586,6 +592,19 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
         self._plans[key] = plan
         return plan
+
+    def _plan_tokens(self, num_tokens: int) -> int:
+        """Token count of the plan that serves ``num_tokens`` real rows."""
+        tokens = sm12x_align_tokens(num_tokens)
+        bucket = envs.VLLM_B12X_MOE_TOKEN_BUCKET
+        if (
+            bucket <= 1
+            or tokens <= bucket
+            or tokens in self._exact_plan_tokens
+            or _is_current_stream_capturing()
+        ):
+            return tokens
+        return -(-tokens // bucket) * bucket
 
     def get_b12x_warmup_unit(
         self,
@@ -711,7 +730,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         del N, global_num_experts, local_num_experts, expert_tokens_meta
         plan = self._plan(
-            tokens=sm12x_align_tokens(M),
+            tokens=self._plan_tokens(M),
             topk=topk,
             activation=activation,
             apply_router_weight_on_input=self._apply_router_weight_on_input,
@@ -754,14 +773,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         topk_ids, topk_weights = sm12x_replace_moe_topk_sentinels(
             topk_ids, topk_weights
         )
-        hidden_states, orig_tokens = sm12x_pad_token_rows(
-            hidden_states, what="b12x MoE"
-        )
-        if hidden_states.shape[0] != orig_tokens:
-            topk_ids = sm12x_pad_token_rows(topk_ids)[0]
-            topk_weights = sm12x_pad_token_rows(topk_weights)[0]
+        orig_tokens = int(hidden_states.shape[0])
+        plan_tokens = self._plan_tokens(orig_tokens)
+        if plan_tokens != orig_tokens:
+            hidden_states = sm12x_pad_prefill_token_rows(hidden_states, plan_tokens)
+            topk_ids = sm12x_pad_prefill_token_rows(topk_ids, plan_tokens)
+            topk_weights = sm12x_pad_prefill_token_rows(topk_weights, plan_tokens)
             topk_weights[orig_tokens:] = 0
-        plan_tokens = int(hidden_states.shape[0])
         plan = self._plan(
             tokens=plan_tokens,
             topk=int(topk_ids.shape[1]),
