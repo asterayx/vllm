@@ -30,6 +30,7 @@ import json
 import mimetypes
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -139,7 +140,15 @@ def _model_name(url: str) -> str:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    model = args.model or _model_name(args.url)
+    try:
+        model = args.model or _model_name(args.url)
+    except urllib.error.URLError as exc:
+        print(
+            f"cannot reach {args.url}: {exc.reason}. Start the serve containers "
+            "first (docker/gb10/smoke.sh) or pass --url http://<head-ip>:30001.",
+            file=sys.stderr,
+        )
+        return 2
     prompts = _text_prompts() + _image_prompts(args.images)
     results = []
     for index, messages in enumerate(prompts):
