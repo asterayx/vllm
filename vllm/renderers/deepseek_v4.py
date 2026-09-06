@@ -18,6 +18,15 @@ from .params import ChatParams
 
 
 class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
+    """Chat renderer for the DeepSeek-V4 encoding.
+
+    Messages are parsed with ``content_format="openai"`` so multimodal parts
+    stay in place as ``{"type": "image"}`` dicts; the tokenizer then inlines
+    ``<｜deepseek_image｜>`` at each part's position. ``"string"`` would move
+    every placeholder to the front of the user turn, which is not the
+    layout the Vision checkpoint was trained on.
+    """
+
     def __init__(
         self,
         config: VllmConfig,
@@ -40,7 +49,7 @@ class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
         conversation, mm_data, mm_uuids = parse_chat_messages(
             messages,
             self.model_config,
-            content_format="string",
+            content_format="openai",
             media_io_kwargs=params.media_io_kwargs,
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
@@ -67,7 +76,7 @@ class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
         conversation, mm_data, mm_uuids = await parse_chat_messages_async(
             messages,
             self.model_config,
-            content_format="string",
+            content_format="openai",
             media_io_kwargs=params.media_io_kwargs,
             mm_processor_kwargs=params.mm_processor_kwargs,
         )

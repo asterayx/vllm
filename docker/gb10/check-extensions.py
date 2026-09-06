@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Fail if CUDA torch, vLLM metadata, or _C_stable_libtorch is missing."""
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ def _libcuda_available() -> bool:
         except OSError:
             continue
     return False
+
 
 def _repo_root(script: Path) -> Path:
     env = os.environ.get("VLLM_ROOT")
@@ -83,3 +87,19 @@ if not _libcuda_available():
 
 mod = importlib.import_module("vllm._C_stable_libtorch")
 print("imported", getattr(mod, "__file__", mod), flush=True)
+
+# The Vision-Exp MoE router needs the 12-arg topk_softplus_sqrt (bias_vl).
+# A 10-arg build silently falls back to a per-layer torch rewrite of every
+# image row.
+try:
+    moe = importlib.import_module("vllm._moe_C_stable_libtorch")
+    print("imported", getattr(moe, "__file__", moe), flush=True)
+    schema = torch.ops._moe_C.topk_softplus_sqrt.default._schema
+    arg_names = [arg.name for arg in schema.arguments]
+    assert "bias_vl" in arg_names, (
+        f"_moe_C.topk_softplus_sqrt lacks bias_vl (args: {arg_names}); "
+        "rebuild csrc/libtorch_stable/moe for the Vision router"
+    )
+    print("topk_softplus_sqrt args", arg_names, flush=True)
+except ModuleNotFoundError as exc:
+    print("moe extension import skipped:", exc, flush=True)

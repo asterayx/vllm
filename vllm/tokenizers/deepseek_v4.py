@@ -7,9 +7,28 @@ from transformers import TokenizersBackend
 
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
 
-from .deepseek_v4_encoding import encode_messages
+from .deepseek_v4_encoding import encode_messages, flatten_content_blocks
 from .hf import HfTokenizer, get_cached_tokenizer
 from .protocol import TokenizerLike
+
+
+def _flatten_openai_contents(
+    messages: list["ChatCompletionMessageParam"],
+) -> list[dict[str, Any]]:
+    """Inline ``content_format="openai"`` part lists as text.
+
+    Image parts become ``<｜deepseek_image｜>`` at their own position; text
+    parts are joined without separators. Tool messages keep their list
+    content (``merge_tool_messages`` renders it).
+    """
+    flattened: list[dict[str, Any]] = []
+    for msg in messages:
+        content = msg.get("content")  # type: ignore[union-attr]
+        if isinstance(content, list) and msg.get("role") != "tool":
+            msg = dict(msg)  # type: ignore[arg-type]
+            msg["content"] = flatten_content_blocks(content)
+        flattened.append(msg)  # type: ignore[arg-type]
+    return flattened
 
 
 def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
@@ -35,7 +54,7 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             thinking_mode = "thinking" if thinking_enabled else "chat"
 
             conversation = kwargs.get("conversation", messages)
-            messages = conversation.copy()
+            messages = _flatten_openai_contents(conversation)  # type: ignore[assignment]
             if tools is not None and len(tools) > 0:
                 messages.insert(0, {"role": "system"})
                 messages[0]["tools"] = tools  # type: ignore[typeddict-unknown-key]

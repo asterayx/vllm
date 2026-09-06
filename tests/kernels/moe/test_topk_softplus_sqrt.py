@@ -630,9 +630,7 @@ def test_legacy_kernel_overwrites_image_rows_with_bias_vl():
         renormalize=False,
         routed_scaling_factor=1.0,
         input_ids=input_ids,
-        hash_indices_table=torch.zeros(
-            lo + 8, topk, dtype=torch.int32
-        ),
+        hash_indices_table=torch.zeros(lo + 8, topk, dtype=torch.int32),
         bias_vl=bias_vl,
         image_sentinel_lo=lo,
     )
@@ -640,3 +638,60 @@ def test_legacy_kernel_overwrites_image_rows_with_bias_vl():
     torch.testing.assert_close(topk_indices[image].to(torch.int64), ref_i[image].long())
     torch.testing.assert_close(topk_weights[image], ref_w[image], atol=2e-5, rtol=2e-5)
     assert torch.count_nonzero(topk_indices[~image]) == 0
+
+
+def test_hash_layer_image_rows_route_by_bias_vl_on_cpu():
+    """Vision-Exp hash layers: image sentinel rows bypass the hash table and
+    select experts by sqrtsoftplus(score) + bias_vl with raw-score weights;
+    text rows keep the hash table. Locks the routing the model wires up
+    (nvidia/model.py) for both the CUDA kernel and the 10-arg fallback."""
+    torch.manual_seed(0)
+    num_tokens, num_experts, topk, vocab = 12, 64, 4, 256
+    sentinel_lo = 200
+    gating = torch.randn(num_tokens, num_experts)
+    bias_vl = torch.randn(num_experts)
+    table = torch.stack([torch.randperm(num_experts)[:topk] for _ in range(vocab)])
+    input_ids = torch.randint(0, sentinel_lo, (num_tokens,))
+    input_ids[::3] = sentinel_lo + torch.arange(4)[: len(input_ids[::3])] % 5
+    # Ids just above the sentinel block are ordinary tokens.
+    input_ids[1] = sentinel_lo + 5
+
+    ref_w, ref_i = _torch_topk_softplus_sqrt(
+        gating,
+        topk,
+        renormalize=True,
+        routed_scaling_factor=2.5,
+        input_ids=input_ids,
+        hash_indices_table=table,
+        bias_vl=bias_vl,
+        image_sentinel_lo=sentinel_lo,
+    )
+    # Start from the pure hash result and apply the fallback rewrite.
+    scores = F.softplus(gating).sqrt()
+    topk_i = table[input_ids].to(torch.int32)
+    topk_w = scores.gather(1, topk_i.long())
+    topk_w = topk_w / topk_w.sum(-1, keepdim=True) * 2.5
+    ops._overwrite_image_rows_with_bias_vl(
+        topk_w,
+        topk_i,
+        gating,
+        input_ids,
+        bias_vl,
+        sentinel_lo,
+        True,
+        2.5,
+        None,
+    )
+    image_rows = (input_ids >= sentinel_lo) & (input_ids < sentinel_lo + 5)
+    assert image_rows.sum() >= 3 and not image_rows[1]
+    torch.testing.assert_close(topk_i.sort(-1).values, ref_i.sort(-1).values)
+    torch.testing.assert_close(
+        topk_w.gather(1, topk_i.argsort(-1)),
+        ref_w.gather(1, ref_i.argsort(-1)),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.equal(
+        topk_i[~image_rows].sort(-1).values,
+        table[input_ids[~image_rows]].sort(-1).values.to(torch.int32),
+    )

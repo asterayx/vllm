@@ -373,3 +373,44 @@ def test_deepseek_v4_image_sentinel_ids_match_tokenizer():
         ]
     )
     assert image_sentinel_mask(ids).tolist() == [False, True, True, False, False]
+
+
+def test_deepseek_v4_openai_content_keeps_placeholders_in_place():
+    """The serving renderer parses with content_format="openai"; the
+    tokenizer must inline each image at its own position (no leading
+    placeholders, no newline joins)."""
+    conversation = [
+        {"role": "system", "content": [{"type": "text", "text": "sys"}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "first:"},
+                {"type": "image"},
+                {"type": "text", "text": "second:"},
+                {"type": "image"},
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "?"}]},
+    ]
+    prompt = _tokenizer().apply_chat_template(
+        conversation=conversation,
+        messages=conversation,
+        tokenize=False,
+        thinking=False,
+    )
+    assert "<｜User｜>first:<｜deepseek_image｜>second:<｜deepseek_image｜>" in prompt
+    assert "<｜User｜><｜deepseek_image｜>?" in prompt
+    assert "ok" in prompt
+    assert "[{" not in prompt
+    assert "\n<｜deepseek_image｜>" not in prompt
+
+
+def test_deepseek_v4_renderer_parses_openai_content_format(monkeypatch):
+    import inspect
+
+    from vllm.renderers import deepseek_v4 as renderer_mod
+
+    source = inspect.getsource(renderer_mod.DeepseekV4Renderer)
+    assert 'content_format="openai"' in source
+    assert 'content_format="string"' not in source
