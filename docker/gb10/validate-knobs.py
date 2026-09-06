@@ -229,8 +229,13 @@ def compare_results(base: list[dict], other: list[dict]) -> list[str]:
         first = next(
             (i for i, (x, y) in enumerate(zip(ta, tb)) if x != y), min(len(ta), len(tb))
         )
-        margins = a.get("margins") or []
-        margin = margins[first] if first < len(margins) else None
+        # Older result files lack margins; use whichever side recorded them.
+        margin = None
+        for doc in (a, b):
+            margins = doc.get("margins") or []
+            if first < len(margins) and margins[first] is not None:
+                margin = margins[first]
+                break
         note = ""
         if margin is not None:
             note = f", top1-top2 gap {margin:.3f} nats"

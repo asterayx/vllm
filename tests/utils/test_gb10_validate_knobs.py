@@ -65,3 +65,18 @@ def test_compare_flags_near_tie_divergence():
     base[0]["margins"][1] = 1.5
     (line,) = module.compare_results(base, other)
     assert "gap 1.500" in line and "near tie" not in line
+
+
+def test_compare_uses_margins_from_either_side():
+    module = _load()
+    base = [{"prompt_index": 0, "tokens": ["a", "b"], "seconds": 1.0}]
+    other = [
+        {
+            "prompt_index": 0,
+            "tokens": ["a", "c"],
+            "margins": [2.0, 0.02],
+            "seconds": 1.0,
+        }
+    ]
+    (line,) = module.compare_results(base, other)
+    assert "near tie" in line
