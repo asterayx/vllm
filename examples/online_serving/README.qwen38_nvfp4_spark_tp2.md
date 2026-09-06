@@ -53,6 +53,37 @@ The launcher puts `.venv/bin` on `PATH` so FlashInfer can find `ninja` during
 kernel compilation. It defaults to four compilation jobs; override `MAX_JOBS`
 to adjust this limit.
 
+## Persist the head network configuration
+
+The tested head uses NetworkManager. For these three dedicated links, save
+static addresses and automatic activation with the existing connection names:
+
+```bash
+sudo nmcli connection modify enP7s7 \
+  connection.autoconnect yes connection.autoconnect-priority 100 \
+  ipv4.method manual ipv4.addresses 192.168.99.10/24 \
+  ipv4.gateway "" ipv4.never-default yes
+
+sudo nmcli connection modify enP2p1s0f1np1 \
+  connection.autoconnect yes connection.autoconnect-priority 100 \
+  ipv4.method manual ipv4.addresses 192.168.101.10/24 \
+  ipv4.gateway "" ipv4.never-default yes \
+  802-3-ethernet.mtu 9000
+
+sudo nmcli connection modify enp1s0f1np1 \
+  connection.autoconnect yes connection.autoconnect-priority 100 \
+  ipv4.method manual ipv4.addresses 192.168.100.10/24 \
+  ipv4.gateway "" ipv4.never-default yes \
+  802-3-ethernet.mtu 9000
+```
+
+`/24` is netmask `255.255.255.0`. These profiles do not install a default
+route; the tested head uses Wi-Fi for its default route. NetworkManager is
+already enabled at boot. `connection modify` saves persistently by default;
+when the current addresses and MTUs are already correct, no immediate
+reconnection is needed. See the [NetworkManager nmcli documentation](https://networkmanager.pages.freedesktop.org/NetworkManager/NetworkManager/nmcli.html).
+Interface names are case-sensitive. These commands describe the head only.
+
 ## Launch
 
 Run rank 1 on the worker, then rank 0 on the head. Set the interconnect IPs and
@@ -184,8 +215,10 @@ for this four-sequence, MTP-2 setup. Graph capture reported 0.19 GiB extra memor
 
 Compilation mode 3 was also tested with one Inductor compilation thread. It
 exhausted the available memory before serving; the worker's 8 GiB memory guard
-terminated the experiment at approximately 2.8 GiB available. Compilation is
-therefore not included in the launcher's supported modes.
+terminated the experiment at approximately 2.8 GiB available. The head's guard
+recorded only 286 MiB available and also stopped its test process group; SSH
+was temporarily unresponsive. Compilation is therefore not included in the
+launcher's supported modes.
 
 With the complete cache fix and Graph mode, immediate identical repeats
 reused 6400 / 62400 / 259200 tokens for the same three benchmark inputs:
@@ -201,6 +234,16 @@ single-pair measurements do not establish a substantial Graph-only speedup.
 The cache correctness checks, MTP generation and all tool/Responses checks
 passed. GSM8K remained 15/16 with no invalid output (36.09 s, concurrency 2).
 Minimum available memory was 22.95 GiB on the head and 27.36 GiB on the worker.
+After restoring the release configuration, the proxy Responses API passed
+both 512K recall requests: 523760 input tokens, 17 output tokens, with all three
+codes correct. Cold total latency was 256.89 s; the identical repeat reused
+521600 tokens and completed in 3.21 s (first content token at 2.92 s).
+Both requests recorded 12 draft tokens and 12 accepted tokens, confirming MTP
+was active at this extended context length. Final GSM8K remained 15/16 with
+no invalid output; all cache and tool checks passed. The public Chat Completions
+endpoint returned HTTP 200 and `OK` in 1.13 s. This remains a synthetic long-context
+smoke test with experimental 2x YaRN, not a native 512K accuracy guarantee.
+
 Raw requests, SSE, per-request cache/speculation counters, timing, configuration,
 source diffs and memory records are saved under
 `.run/perf-20260906-cache-graphs/` on the test hosts and local tree, including
