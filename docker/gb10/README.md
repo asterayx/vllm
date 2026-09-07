@@ -302,6 +302,30 @@ and runs `summarize-profile.py` on rank 0's trace: GPU time per category
 token, and the top kernels. The full torch table is in
 `profiler_out_0.txt`. Do not leave the profiler enabled for serving.
 
+What the single-stream Vision profile attributes (all at the HBM floor, so
+the only lever left is bytes, i.e. FP8 weights): lm_head 529 MB per rank,
+2.4 ms per target step; DSpark markov head 63 MB per draft step; the 41
+compressor `fused_wkv_wgate` 16 MB projections, ~3 ms per step. The MoE
+gate and indexer projections cost 6-14 us each and need no work.
+
+### NCCL all-reduce latency
+
+NCCL was 13% of single-stream GPU time (~100 us per 128 KB all-reduce, two
+per layer). `bench-allreduce.sh` measures that message in isolation with
+the server's NCCL environment, so `NCCL_*` settings can be compared in
+seconds instead of a server restart. Stop the server first, then on each
+node (the same `MASTER_ADDR` you serve with):
+
+```bash
+MASTER_ADDR=192.168.101.12 NODE_RANK=0 ./docker/gb10/bench-allreduce.sh
+MASTER_ADDR=192.168.101.12 NODE_RANK=1 ./docker/gb10/bench-allreduce.sh
+# any NCCL_* on the host is forwarded, e.g.
+NCCL_PROTO=Simple MASTER_ADDR=... NODE_RANK=0 ./docker/gb10/bench-allreduce.sh
+```
+
+A setting that wins here goes into `run.sh` via the same `NCCL_*` variable
+and then through `validate-knobs.py` like any other knob.
+
 ### Wait until ready
 
 ```bash
@@ -610,6 +634,9 @@ curl -fsSI https://token.asteraix.com/dash | head
 | `run-vision-image.sh` / `run-image.sh` | Official serve (no source mount) |
 | `run-vision.sh` / `run.sh` | Dev serve (bind-mount host tree) |
 | `smoke.sh` | Wait for routes, `GET /v1/models` |
+| `profile-decode.sh` / `summarize-profile.py` | Torch-profile decode steps, GPU time by category |
+| `validate-knobs.py` | Greedy outputs + tok/s before/after a knob change |
+| `bench-allreduce.sh` / `bench-allreduce.py` | 2-node NCCL all-reduce latency for decode message sizes |
 | `compat-proxy/` | Production `reasoning` alias + config downloads |
 | `../observability/dual_node/deploy.sh` | Prometheus, Grafana, `node_exporter` |
 
