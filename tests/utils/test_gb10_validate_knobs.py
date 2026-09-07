@@ -80,3 +80,24 @@ def test_compare_uses_margins_from_either_side():
     ]
     (line,) = module.compare_results(base, other)
     assert "near tie" in line
+
+
+def test_spec_decode_stats_from_counter_deltas():
+    module = _load()
+    before = {
+        "vllm:spec_decode_num_drafts_total": 100.0,
+        "vllm:spec_decode_num_draft_tokens_total": 300.0,
+        "vllm:spec_decode_num_accepted_tokens_total": 200.0,
+    }
+    after = {
+        "vllm:spec_decode_num_drafts_total": 150.0,
+        "vllm:spec_decode_num_draft_tokens_total": 450.0,
+        "vllm:spec_decode_num_accepted_tokens_total": 320.0,
+    }
+    stats = module.spec_decode_stats(before, after)
+    assert stats is not None
+    assert stats["drafts"] == 50
+    assert abs(stats["acceptance_rate"] - 120 / 150) < 1e-9
+    assert abs(stats["mean_acceptance_length"] - (1 + 120 / 50)) < 1e-9
+    assert module.spec_decode_stats(None, after) is None
+    assert module.spec_decode_stats(before, before) is None

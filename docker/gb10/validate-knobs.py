@@ -182,6 +182,44 @@ def _concurrent_run(
     }
 
 
+_SPEC_COUNTERS = (
+    "vllm:spec_decode_num_drafts_total",
+    "vllm:spec_decode_num_draft_tokens_total",
+    "vllm:spec_decode_num_accepted_tokens_total",
+)
+
+
+def _spec_counters(url: str) -> dict[str, float] | None:
+    """Cumulative speculative-decoding counters from /metrics, or None."""
+    try:
+        with urllib.request.urlopen(f"{url}/metrics", timeout=60) as response:
+            text = response.read().decode()
+    except (urllib.error.URLError, OSError):
+        return None
+    totals: dict[str, float] = {}
+    for line in text.splitlines():
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        if name in _SPEC_COUNTERS and not line.startswith("#"):
+            totals[name] = totals.get(name, 0.0) + float(line.rsplit(" ", 1)[1])
+    return totals if len(totals) == len(_SPEC_COUNTERS) else None
+
+
+def spec_decode_stats(
+    before: dict[str, float] | None, after: dict[str, float] | None
+) -> dict[str, float] | None:
+    """Acceptance rate and mean accepted tokens per draft between two reads."""
+    if before is None or after is None:
+        return None
+    drafts, draft_tokens, accepted = (after[k] - before[k] for k in _SPEC_COUNTERS)
+    if drafts <= 0 or draft_tokens <= 0:
+        return None
+    return {
+        "drafts": drafts,
+        "acceptance_rate": accepted / draft_tokens,
+        "mean_acceptance_length": 1.0 + accepted / drafts,
+    }
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     try:
         model = args.model or _model_name(args.url)
@@ -193,6 +231,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         return 2
     prompts = _text_prompts() + _image_prompts(args.images)
+    spec_before = _spec_counters(args.url)
     results = []
     for index, messages in enumerate(prompts):
         result = _chat(args.url, model, messages, args.max_tokens)
@@ -206,6 +245,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             flush=True,
         )
     payload: dict = {"model": model, "results": results}
+    spec = spec_decode_stats(spec_before, _spec_counters(args.url))
+    if spec is not None:
+        payload["spec_decode"] = spec
+        print(
+            f"[spec decode] {spec['drafts']:.0f} drafts, acceptance "
+            f"{spec['acceptance_rate'] * 100:.1f}%, mean acceptance length "
+            f"{spec['mean_acceptance_length']:.2f}",
+            flush=True,
+        )
     if args.concurrency > 1:
         stats = _concurrent_run(
             args.url, model, prompts, args.concurrency, args.max_tokens
@@ -264,6 +312,14 @@ def cmd_compare(args: argparse.Namespace) -> int:
     other = other_doc["results"]
     lines = compare_results(base, other)
     print("\n".join(lines))
+    if "spec_decode" in base_doc and "spec_decode" in other_doc:
+        sa, sb = base_doc["spec_decode"], other_doc["spec_decode"]
+        print(
+            f"spec decode acceptance: {sa['acceptance_rate'] * 100:.1f}% -> "
+            f"{sb['acceptance_rate'] * 100:.1f}%, mean acceptance length "
+            f"{sa['mean_acceptance_length']:.2f} -> "
+            f"{sb['mean_acceptance_length']:.2f}"
+        )
     if "concurrent" in base_doc and "concurrent" in other_doc:
         ca, cb = base_doc["concurrent"], other_doc["concurrent"]
         print(
