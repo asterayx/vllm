@@ -285,9 +285,10 @@ container only when it is set, e.g.
 
 ### Profile a decode step
 
-Start both ranks with `VLLM_PROFILE_DIR=<host dir>` (mounted at
-`/root/profiles`, enables the torch profiler and `/start_profile`), then on
-the head:
+Start **both** ranks with `VLLM_PROFILE_DIR=<host dir>` (mounted at
+`/root/profiles`, enables the torch profiler and `/start_profile`; each node
+parses its own `--profiler-config`, so a worker started without it makes
+`/start_profile` fail with HTTP 500), then on the head:
 
 ```bash
 VLLM_PROFILE_DIR=~/vllm-profiles NODE_RANK=0 ./docker/gb10/run-vision.sh

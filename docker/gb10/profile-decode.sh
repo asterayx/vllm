@@ -51,7 +51,22 @@ newest_worker_trace() {
 }
 
 before="$(newest_worker_trace)"
-curl -fsS -X POST --max-time 60 "${URL}/start_profile" >/dev/null
+post() {  # post <path> <timeout>; prints the server response on failure
+  local body status
+  body="$(mktemp)"
+  status="$(curl -sS -X POST --max-time "$2" -o "${body}" -w '%{http_code}' "${URL}$1")"
+  if [ "${status}" != "200" ]; then
+    echo "POST $1 failed: HTTP ${status}" >&2
+    cat "${body}" >&2
+    echo >&2
+    echo "both ranks must be started with VLLM_PROFILE_DIR (each node parses its own --profiler-config)" >&2
+    rm -f "${body}"
+    return 1
+  fi
+  rm -f "${body}"
+}
+
+post /start_profile 60
 echo "profiling ${CONCURRENCY}x${PROFILE_REQUESTS} requests of ${MAX_TOKENS} tokens"
 total=0
 for _ in $(seq "${PROFILE_REQUESTS}"); do
@@ -67,7 +82,7 @@ for _ in $(seq "${PROFILE_REQUESTS}"); do
   done
   rm -rf "${tmp}"
 done
-curl -fsS -X POST --max-time 600 "${URL}/stop_profile" >/dev/null
+post /stop_profile 600
 echo "generated ${total} tokens under the profiler"
 
 # Rank 0's trace is written by the head container into the mounted dir.
