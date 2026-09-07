@@ -25,14 +25,21 @@ model="$(curl -fsS --max-time 30 "${URL}/v1/models" | "$PY" -c 'import json,sys;
 echo "model ${model}; traces -> ${PROFILE_DIR}"
 
 request() {  # request <max_tokens> -> completion token count on stdout
-  curl -fsS --max-time 900 "${URL}/v1/chat/completions" \
+  local body status
+  body="$(mktemp)"
+  status="$(curl -sS --max-time 900 -o "${body}" -w '%{http_code}' \
+    "${URL}/v1/chat/completions" \
     -H 'Content-Type: application/json' \
-    -d "$(cat <<JSON
-{"model":"${model}","temperature":0,"seed":0,"max_tokens":$1,
- "chat_template_kwargs":{"thinking":false},
- "messages":[{"role":"user","content":"Write a detailed explanation of how a hash table handles collisions, with examples."}]}
-JSON
-)" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["usage"]["completion_tokens"])'
+    -d "{\"model\":\"${model}\",\"temperature\":0,\"seed\":0,\"max_tokens\":$1,\"chat_template_kwargs\":{\"thinking\":false},\"messages\":[{\"role\":\"user\",\"content\":\"Write a detailed explanation of how a hash table handles collisions, with examples.\"}]}")"
+  if [ "${status}" != "200" ]; then
+    echo "chat request failed: HTTP ${status}" >&2
+    cat "${body}" >&2
+    echo >&2
+    rm -f "${body}"
+    return 1
+  fi
+  "$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["usage"]["completion_tokens"])' "${body}"
+  rm -f "${body}"
 }
 
 echo "warm request (not profiled)"
