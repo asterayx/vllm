@@ -207,15 +207,23 @@ docker rm -f dspark-vision-tp2-rank0 dspark-vision-tp2-rank1
   ~100 us to the 32 KB cost. Batches of >=16 real tokens are unchanged.
   Only taken when FusedMoE really skipped its reduce
   (`moe_config.skip_final_all_reduce`), so EP/all2all configurations keep
-  the old path. Validate with `validate-knobs.py` (baseline
-  `VLLM_SM12X_REDUCE_REAL_ROWS=0`) and `profile-decode.sh` (NCCL share).
+  the old path. **Validated on Spark 2026-09-07** (`validate-knobs.py`,
+  `NCCL_PROTO=` on both runs): prompts identical or diverging only at
+  0.000-nat ties and the restart-level thinking prefix of prompt 0; single
+  stream +5% / +10% / +16% on the three comparable prompts; concurrency 4
+  unchanged (88.1 tok/s, 16 real rows have no padding).
 - **`NCCL_PROTO=Simple`** (now the `run.sh` default). `bench-allreduce.sh`
   kernel times on the two Sparks: NCCL's own choice is 98 us at 128 KB,
   112 us at 512 KB and 321 us at 2 MB; Simple is 38 / 74 / 117 us. Only
   32 KB prefers the default (23 vs 31 us). Per decode step (86 all-reduces)
   that is +0.7 ms single stream after real-rows, -5 ms at concurrency 4,
-  and -17 ms per 256-token prefill chunk. Validate end to end with
-  `validate-knobs.py` (`NCCL_PROTO=` empty as the baseline).
+  and -17 ms per 256-token prefill chunk. **Validated on Spark
+  2026-09-07** on top of real-rows: single stream +2% / -2% on the two
+  comparable prompts, concurrency 4 88.1 -> 100.8 tok/s aggregate (1.14x);
+  divergences at 0.125-0.25 nats are the same restart-level noise seen
+  between two runs of one configuration. `NCCL_IB_QPS_PER_CONNECTION`,
+  `NCCL_IB_SPLIT_DATA_ON_QPS`, `NCCL_NET_GDR_LEVEL` and
+  `NCCL_MIN_NCHANNELS` were within noise on this point-to-point link.
 - Still to validate the same way: `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4`,
   `VLLM_SM12X_ATTN_AUX_STREAMS`, `VLLM_SM12X_SHARED_EXPERTS_STREAM`, and
   an image prompt set (`--images`) for the split-prefill path.
