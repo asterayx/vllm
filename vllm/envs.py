@@ -212,6 +212,7 @@ if TYPE_CHECKING:
     VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4: bool = False
     VLLM_SM12X_ATTN_AUX_STREAMS: bool = False
     VLLM_SM12X_SHARED_EXPERTS_STREAM: bool = False
+    VLLM_SM12X_REDUCE_REAL_ROWS: bool = True
     VLLM_SM12X_WARMUP_LONG_PREFILL_TOKENS: int = 128
     VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS: str = ""
     VLLM_B12X_MOE_TOKEN_BUCKET: int = 256
@@ -1630,6 +1631,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Re-enable the MoE shared-experts aux stream on SM12x.
     "VLLM_SM12X_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_SM12X_SHARED_EXPERTS_STREAM", "0"))
+    ),
+    # TP all-reduce only the real token rows of the DeepSeek-V4 MoE output
+    # instead of the 16-row SM12x padded block (a 4-token DSpark step then
+    # sends 32 KB per layer instead of 128 KB). 0 restores the in-FusedMoE
+    # all-reduce of the padded block.
+    "VLLM_SM12X_REDUCE_REAL_ROWS": lambda: bool(
+        int(os.getenv("VLLM_SM12X_REDUCE_REAL_ROWS", "1"))
     ),
     # Extra single-request prefill of this many tokens during V2 kernel
     # warmup so the >64-token sparse prefill orchestrator is warmed before the

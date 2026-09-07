@@ -15,9 +15,11 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_fused_post_pre_tilelang,
@@ -89,11 +91,14 @@ from vllm.utils.sm12x import (
     sm12x_disable_eager_scratch_pool,
     sm12x_match_token_rows,
     sm12x_pad_token_rows,
+    sm12x_reduce_real_rows,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
+
+logger = init_logger(__name__)
 
 
 class DeepseekV4MLP(nn.Module):
@@ -644,6 +649,9 @@ class DeepseekV4MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
+        # SM12x: the fused MoE runs on a 16-row padded block; all-reduce the
+        # real rows here instead of the padded block inside FusedMoE.
+        self._reduce_real_rows = False
         if self.use_mega_moe:
             self._init_mega_moe_experts(vllm_config, config, prefix)
         else:
@@ -717,9 +725,15 @@ class DeepseekV4MoE(nn.Module):
         self.physical_expert_start = self.experts_start_idx
         self.physical_expert_end = self.experts_end_idx
 
+        reduce_real_rows = (
+            sm12x_reduce_real_rows()
+            and self.tp_size > 1
+            and not self.use_sequence_parallel
+        )
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
             gate=self.gate,
+            reduce_results=not reduce_real_rows,
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -739,6 +753,15 @@ class DeepseekV4MoE(nn.Module):
             num_redundant_experts=eplb_config.num_redundant_experts,
             is_sequence_parallel=self.use_sequence_parallel,
         )
+        if reduce_real_rows:
+            # FusedMoE ignores reduce_results=False under EP/all2all; only
+            # take over the all-reduce when it really skipped it.
+            self._reduce_real_rows = bool(self.experts.moe_config.skip_final_all_reduce)
+            if self._reduce_real_rows:
+                logger.info_once(
+                    "SM12x MoE: all-reducing real token rows after the padded "
+                    "fused MoE block."
+                )
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
@@ -814,7 +837,10 @@ class DeepseekV4MoE(nn.Module):
                 router_logits=hidden_states,
                 input_ids=input_ids,
             )
-        return final_hidden_states[:orig_tokens].view(org_shape)
+        final_hidden_states = final_hidden_states[:orig_tokens]
+        if self._reduce_real_rows:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        return final_hidden_states.view(org_shape)
 
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:

@@ -248,6 +248,16 @@ def sm12x_disable_attn_aux_streams() -> bool:
     return current_platform.is_device_capability_family(120)
 
 
+def sm12x_reduce_real_rows() -> bool:
+    """All-reduce only the real token rows of the padded MoE output
+    (``VLLM_SM12X_REDUCE_REAL_ROWS``)."""
+    if not envs.VLLM_SM12X_REDUCE_REAL_ROWS:
+        return False
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        120
+    )
+
+
 def sm12x_disable_shared_experts_stream() -> bool:
     """SM12x custom GEMMs IMA'd on the shared-experts aux stream during
     PIECEWISE dummy capture. ``VLLM_SM12X_SHARED_EXPERTS_STREAM=1``

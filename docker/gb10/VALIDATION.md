@@ -195,6 +195,20 @@ docker rm -f dspark-vision-tp2-rank0 dspark-vision-tp2-rank1
   a bf16 matrix that is not the gate or the compressor. Cutting that share
   means reading fewer bytes (FP8 weights), not a different kernel. The
   commit was reverted; see the git history for the kernel.
+- **MoE all-reduce on real rows** (`VLLM_SM12X_REDUCE_REAL_ROWS`, default
+  on). `bench-allreduce.sh` on the two Sparks: a 32 KB all-reduce
+  (`[4, 4096]` bf16, the real rows of a single-stream DSpark k=3 step) is
+  22 us wall, the 128 KB one (`[16, 4096]`, the SM12x padded MoE block) is
+  214 us (512 KB is 101 us, so 128 KB also sits in a bad NCCL protocol
+  band). The fused MoE now runs with `reduce_results=False` and
+  `DeepseekV4MoE._forward_fused_moe` all-reduces `[:orig_tokens]` after
+  the padded block; the attention `wo_b` all-reduce was already on real
+  rows. Expected: most of the 43 MoE all-reduces per step drop from
+  ~100 us to the 32 KB cost. Batches of >=16 real tokens are unchanged.
+  Only taken when FusedMoE really skipped its reduce
+  (`moe_config.skip_final_all_reduce`), so EP/all2all configurations keep
+  the old path. Validate with `validate-knobs.py` (baseline
+  `VLLM_SM12X_REDUCE_REAL_ROWS=0`) and `profile-decode.sh` (NCCL share).
 - Still to validate the same way: `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4`,
   `VLLM_SM12X_ATTN_AUX_STREAMS`, `VLLM_SM12X_SHARED_EXPERTS_STREAM`, and
   an image prompt set (`--images`) for the split-prefill path.

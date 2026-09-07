@@ -14,6 +14,7 @@ import time
 
 import torch
 import torch.distributed as dist
+from torch.profiler import ProfilerActivity, profile
 
 INTERESTING_ENV = (
     "NCCL_PROTO",
@@ -63,6 +64,28 @@ def bench(shape: tuple[int, int], iters: int, use_graph: bool) -> float:
     return (time.perf_counter() - t) / iters * 1e6
 
 
+def kernel_time(shape: tuple[int, int], iters: int = 50) -> float:
+    """Average NCCL kernel duration (us) as CUPTI sees it, no CPU overhead."""
+    x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    for _ in range(10):
+        dist.all_reduce(x)
+    torch.accelerator.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            dist.all_reduce(x)
+        torch.accelerator.synchronize()
+    kernels = [
+        e
+        for e in prof.key_averages()
+        if "nccl" in e.key.lower() and e.self_device_time_total > 0
+    ]
+    if not kernels:
+        return float("nan")
+    return sum(e.self_device_time_total for e in kernels) / sum(
+        e.count for e in kernels
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hidden", type=int, default=4096)
@@ -96,11 +119,13 @@ def main() -> None:
         for tokens, label in rows:
             shape = (tokens, args.hidden)
             us = bench(shape, args.iters, use_graph)
+            kus = kernel_time(shape) if not use_graph else float("nan")
             if rank == 0:
                 mb = tokens * args.hidden * 2 / 2**20
                 print(
-                    f"  [{tokens:5d}, {args.hidden}] {mb:7.2f} MB  {us:8.1f} us "
-                    f"({mb / us * 1e6 / 1024:6.2f} GB/s)  {label}"
+                    f"  [{tokens:5d}, {args.hidden}] {mb:7.2f} MB  wall {us:7.1f} us"
+                    f"  kernel {kus:7.1f} us ({mb / kus * 1e6 / 1024:6.2f} GB/s)"
+                    f"  {label}"
                 )
     dist.destroy_process_group()
 

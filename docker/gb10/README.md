@@ -278,6 +278,7 @@ container only when it is set, e.g.
 | `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4` | `0` | Pad decode-form q_len 2/3 to 4 instead of 6 (halves draft padding). |
 | `VLLM_SM12X_ATTN_AUX_STREAMS` | `0` | Overlap indexer/compressor projections on aux streams again. |
 | `VLLM_SM12X_SHARED_EXPERTS_STREAM` | `0` | Overlap shared experts with routed experts again. |
+| `VLLM_SM12X_REDUCE_REAL_ROWS` | `1` | TP all-reduce only the real token rows of the MoE output, not the 16-row padded block (a 4-token DSpark step sends 32 KB per layer instead of 128 KB). `0` restores the in-FusedMoE reduce. |
 | `VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS` | empty | Extra DSpark FULL graph token counts, e.g. `30` gives text k=5 a 6-request graph. |
 | `VLLM_SM12X_WARMUP_LONG_PREFILL_TOKENS` | `128` | Startup prefill that warms the >64-token sparse prefill path; `0` skips it. |
 | `VLLM_B12X_MOE_TOKEN_BUCKET` | `256` | Round eager MoE token counts above the bucket up to a multiple of it (fewer frozen b12x plans). |
