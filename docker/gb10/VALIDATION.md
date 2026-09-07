@@ -209,6 +209,13 @@ docker rm -f dspark-vision-tp2-rank0 dspark-vision-tp2-rank1
   (`moe_config.skip_final_all_reduce`), so EP/all2all configurations keep
   the old path. Validate with `validate-knobs.py` (baseline
   `VLLM_SM12X_REDUCE_REAL_ROWS=0`) and `profile-decode.sh` (NCCL share).
+- **`NCCL_PROTO=Simple`** (now the `run.sh` default). `bench-allreduce.sh`
+  kernel times on the two Sparks: NCCL's own choice is 98 us at 128 KB,
+  112 us at 512 KB and 321 us at 2 MB; Simple is 38 / 74 / 117 us. Only
+  32 KB prefers the default (23 vs 31 us). Per decode step (86 all-reduces)
+  that is +0.7 ms single stream after real-rows, -5 ms at concurrency 4,
+  and -17 ms per 256-token prefill chunk. Validate end to end with
+  `validate-knobs.py` (`NCCL_PROTO=` empty as the baseline).
 - Still to validate the same way: `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4`,
   `VLLM_SM12X_ATTN_AUX_STREAMS`, `VLLM_SM12X_SHARED_EXPERTS_STREAM`, and
   an image prompt set (`--images`) for the split-prefill path.

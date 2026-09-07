@@ -70,6 +70,14 @@ for knob in \
 done
 # NCCL protocol/algorithm overrides measured with bench-allreduce.sh
 # (README "NCCL all-reduce latency"). The IB/RoCE settings below stay fixed.
+# Simple beats NCCL's own choice from 128 KB up on the two-Spark RoCE link
+# (128 KB: 38 vs 98 us, 2 MB: 117 vs 321 us) and loses 8 us at 32 KB.
+# NCCL_PROTO= (empty) hands the choice back to NCCL.
+if [ -z "${NCCL_PROTO+x}" ]; then
+  export NCCL_PROTO=Simple
+elif [ -z "${NCCL_PROTO}" ]; then
+  unset NCCL_PROTO
+fi
 for knob in NCCL_PROTO NCCL_ALGO NCCL_IB_QPS_PER_CONNECTION NCCL_IB_SPLIT_DATA_ON_QPS \
   NCCL_NET_GDR_LEVEL NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS NCCL_BUFFSIZE; do
   if [ -n "${!knob+x}" ]; then

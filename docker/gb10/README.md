@@ -278,6 +278,7 @@ container only when it is set, e.g.
 | `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4` | `0` | Pad decode-form q_len 2/3 to 4 instead of 6 (halves draft padding). |
 | `VLLM_SM12X_ATTN_AUX_STREAMS` | `0` | Overlap indexer/compressor projections on aux streams again. |
 | `VLLM_SM12X_SHARED_EXPERTS_STREAM` | `0` | Overlap shared experts with routed experts again. |
+| `NCCL_PROTO` | `Simple` (`run.sh`) | NCCL protocol; empty string lets NCCL choose (LL at 32 KB is 8 us faster, everything larger is 2-3x slower). |
 | `VLLM_SM12X_REDUCE_REAL_ROWS` | `1` | TP all-reduce only the real token rows of the MoE output, not the 16-row padded block (a 4-token DSpark step sends 32 KB per layer instead of 128 KB). `0` restores the in-FusedMoE reduce. |
 | `VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS` | empty | Extra DSpark FULL graph token counts, e.g. `30` gives text k=5 a 6-request graph. |
 | `VLLM_SM12X_WARMUP_LONG_PREFILL_TOKENS` | `128` | Startup prefill that warms the >64-token sparse prefill path; `0` skips it. |
@@ -329,12 +330,13 @@ A setting that wins here goes into `run.sh` via the same `NCCL_*` variable
 forwarded when set) and then through `validate-knobs.py` like any other
 knob.
 
-Measured 2026-09-07 (eager wall time, two Sparks over RoCE): the default
-protocol choice is wrong for this link. LL is picked at 128 KB (214 us vs
-46 us with `NCCL_PROTO=Simple`) and LL128 at 2 MB (318 us vs 118 us);
-only the 32 KB message prefers the default (22 us vs 36 us). Batched decode
-and prefill therefore want `NCCL_PROTO=Simple`; single-stream decode with
-`VLLM_SM12X_REDUCE_REAL_ROWS` sends only 32 KB messages and loses a little.
+Measured 2026-09-07 (NCCL kernel time, two Sparks over RoCE): NCCL's own
+protocol choice loses from 128 KB up. 128 KB: 98 us vs 38 us with
+`NCCL_PROTO=Simple`; 512 KB: 112 vs 74; 2 MB: 321 vs 117; 16 MB equal.
+Only the 32 KB message prefers the default (23 vs 31 us). `run.sh` therefore
+sets `NCCL_PROTO=Simple` (batched decode and prefill win by far; a
+single-stream step with `VLLM_SM12X_REDUCE_REAL_ROWS` pays ~0.7 ms);
+`NCCL_PROTO=` (empty) restores NCCL's choice.
 
 ### Wait until ready
 
