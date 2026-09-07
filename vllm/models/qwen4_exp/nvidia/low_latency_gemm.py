@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
     SkinnyGemmConfig,
     shape_dynamic_skinny_gemm,
@@ -22,6 +23,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
 
 QWEN4_EXP_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
     # GDN fused QKVZ projection, TP=4.
@@ -79,8 +82,125 @@ QWEN4_EXP_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
 }
 
 
+# GB10 TP2 cold-L2 CUDA-graph measurements; unsupported shapes retain linear.
+QWEN4_EXP_GEMM_PLANS_SM121: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
+    (48, 2560): {
+        1: SkinnyGemmConfig(1, 128, 1, k_unroll=2, vector_width=4),
+        2: SkinnyGemmConfig(2, 128, 1, k_unroll=2, vector_width=4),
+        3: SkinnyGemmConfig(3, 128, 1, k_unroll=2, vector_width=4),
+        4: SkinnyGemmConfig(4, 128, 1, k_unroll=2, vector_width=4),
+        8: SkinnyGemmConfig(8, 128, 1, k_unroll=2, vector_width=4),
+        12: SkinnyGemmConfig(12, 128, 1, k_unroll=2, vector_width=4),
+    },
+    (320, 10240): {
+        1: SkinnyGemmConfig(1, 32, 2, k_unroll=2, vector_width=8),
+        2: SkinnyGemmConfig(2, 32, 2, k_unroll=2, vector_width=8),
+        3: SkinnyGemmConfig(3, 64, 2, k_unroll=2, vector_width=8),
+        4: SkinnyGemmConfig(4, 64, 4, k_unroll=2, vector_width=4),
+        8: SkinnyGemmConfig(8, 128, 2, k_unroll=2, vector_width=4),
+        12: SkinnyGemmConfig(12, 128, 2, k_unroll=2, vector_width=4),
+    },
+    (336, 10240): {
+        1: SkinnyGemmConfig(1, 32, 2, k_unroll=2, vector_width=8),
+        2: SkinnyGemmConfig(2, 32, 2, k_unroll=2, vector_width=8),
+        3: SkinnyGemmConfig(3, 32, 2, k_unroll=2, vector_width=8),
+        8: SkinnyGemmConfig(8, 64, 2, k_unroll=2, vector_width=8),
+        12: SkinnyGemmConfig(12, 128, 2, k_unroll=2, vector_width=4),
+    },
+    (512, 2560): {
+        1: SkinnyGemmConfig(1, 32, 1, k_unroll=2, vector_width=2),
+        2: SkinnyGemmConfig(2, 32, 1, k_unroll=2, vector_width=2),
+        3: SkinnyGemmConfig(3, 32, 1, k_unroll=2, vector_width=2),
+        4: SkinnyGemmConfig(4, 32, 1, k_unroll=2, vector_width=2),
+        8: SkinnyGemmConfig(8, 32, 1, k_unroll=2, vector_width=2),
+    },
+    (640, 2560): {
+        1: SkinnyGemmConfig(1, 128, 1, k_unroll=2, vector_width=4),
+        2: SkinnyGemmConfig(2, 128, 1, k_unroll=2, vector_width=4),
+        3: SkinnyGemmConfig(3, 128, 1, k_unroll=2, vector_width=4),
+        4: SkinnyGemmConfig(4, 128, 1, k_unroll=2, vector_width=4),
+        8: SkinnyGemmConfig(8, 128, 1, k_unroll=2, vector_width=4),
+        12: SkinnyGemmConfig(12, 128, 1, k_unroll=2, vector_width=4),
+    },
+    (1280, 2560): {
+        1: SkinnyGemmConfig(1, 32, 2, k_unroll=2, vector_width=2),
+        2: SkinnyGemmConfig(2, 32, 2, k_unroll=2, vector_width=2),
+        3: SkinnyGemmConfig(3, 32, 2, k_unroll=2, vector_width=2),
+        4: SkinnyGemmConfig(4, 32, 2, k_unroll=2, vector_width=2),
+        8: SkinnyGemmConfig(8, 32, 2, k_unroll=2, vector_width=2),
+        12: SkinnyGemmConfig(12, 32, 2, k_unroll=2, vector_width=2),
+    },
+    (2560, 320): {
+        3: SkinnyGemmConfig(3, 32, 1, k_unroll=2, vector_width=2),
+        4: SkinnyGemmConfig(4, 32, 1, k_unroll=2, vector_width=2),
+    },
+    (2560, 2560): {
+        1: SkinnyGemmConfig(1, 128, 1, k_unroll=2, vector_width=4),
+        2: SkinnyGemmConfig(2, 128, 1, k_unroll=2, vector_width=4),
+        3: SkinnyGemmConfig(3, 128, 1, k_unroll=2, vector_width=4),
+        4: SkinnyGemmConfig(4, 128, 1, k_unroll=2, vector_width=4),
+        8: SkinnyGemmConfig(8, 128, 1, k_unroll=2, vector_width=4),
+        12: SkinnyGemmConfig(12, 128, 1, k_unroll=2, vector_width=4),
+    },
+    (2560, 3072): {
+        1: SkinnyGemmConfig(1, 128, 1, k_unroll=2, vector_width=4),
+        2: SkinnyGemmConfig(2, 128, 1, k_unroll=2, vector_width=4),
+        3: SkinnyGemmConfig(3, 128, 4, k_unroll=4, vector_width=4),
+        4: SkinnyGemmConfig(4, 128, 4, k_unroll=4, vector_width=4),
+        8: SkinnyGemmConfig(8, 128, 1, k_unroll=2, vector_width=4),
+        12: SkinnyGemmConfig(12, 128, 2, k_unroll=2, vector_width=4),
+    },
+    (6656, 2560): {
+        1: SkinnyGemmConfig(1, 128, 1, k_unroll=2, vector_width=4),
+        2: SkinnyGemmConfig(2, 128, 1, k_unroll=2, vector_width=4),
+        3: SkinnyGemmConfig(3, 128, 4, k_unroll=4, vector_width=4),
+        4: SkinnyGemmConfig(4, 128, 4, k_unroll=4, vector_width=4),
+        8: SkinnyGemmConfig(8, 128, 4, k_unroll=4, vector_width=4),
+        12: SkinnyGemmConfig(12, 128, 1, k_unroll=2, vector_width=4),
+    },
+    (8192, 2560): {
+        1: SkinnyGemmConfig(1, 128, 1, k_unroll=2, vector_width=4),
+        2: SkinnyGemmConfig(2, 128, 1, k_unroll=2, vector_width=4),
+        3: SkinnyGemmConfig(3, 128, 1, k_unroll=2, vector_width=4),
+        4: SkinnyGemmConfig(4, 128, 1, k_unroll=2, vector_width=4),
+        8: SkinnyGemmConfig(8, 128, 1, k_unroll=2, vector_width=4),
+        12: SkinnyGemmConfig(12, 128, 1, k_unroll=2, vector_width=4),
+    },
+    (10240, 320): {
+        1: SkinnyGemmConfig(1, 32, 1, k_unroll=2, vector_width=2),
+        2: SkinnyGemmConfig(2, 32, 1, k_unroll=2, vector_width=2),
+        3: SkinnyGemmConfig(3, 32, 1, k_unroll=2, vector_width=2),
+        4: SkinnyGemmConfig(4, 32, 1, k_unroll=2, vector_width=2),
+        8: SkinnyGemmConfig(8, 32, 1, k_unroll=2, vector_width=2),
+        12: SkinnyGemmConfig(12, 32, 1, k_unroll=2, vector_width=2),
+    },
+    (10240, 2560): {
+        1: SkinnyGemmConfig(1, 128, 1, k_unroll=2, vector_width=4),
+        2: SkinnyGemmConfig(2, 128, 1, k_unroll=2, vector_width=4),
+        3: SkinnyGemmConfig(3, 128, 1, k_unroll=2, vector_width=4),
+        4: SkinnyGemmConfig(4, 128, 1, k_unroll=2, vector_width=4),
+        8: SkinnyGemmConfig(8, 128, 4, k_unroll=4, vector_width=4),
+        12: SkinnyGemmConfig(12, 128, 1, k_unroll=2, vector_width=4),
+    },
+    (124160, 2560): {
+        1: SkinnyGemmConfig(1, 128, 1, k_unroll=2, vector_width=4),
+    },
+}
+
+
 def _is_sm103() -> bool:
     return current_platform.is_device_capability((10, 3))
+
+
+def _gemm_plans() -> dict[tuple[int, int], dict[int, SkinnyGemmConfig]]:
+    if _is_sm103():
+        return QWEN4_EXP_GEMM_PLANS
+    if (
+        current_platform.is_device_capability((12, 1))
+        and envs.VLLM_QWEN4_EXP_SM121_GEMM
+    ):
+        return QWEN4_EXP_GEMM_PLANS_SM121
+    return {}
 
 
 def _is_packed_row_major(tensor: torch.Tensor) -> bool:
@@ -124,7 +244,7 @@ class Qwen4ExpLowLatencyEmbeddingMethod(
 
 
 def _qwen4_exp_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    plan = QWEN4_EXP_GEMM_PLANS.get((weight.shape[0], weight.shape[1]))
+    plan = _gemm_plans().get((weight.shape[0], weight.shape[1]))
     config = None if plan is None else plan.get(x.shape[0])
     if (
         config is not None
@@ -152,12 +272,14 @@ def enable_qwen4_exp_low_latency_gemm(
     module: nn.Module,
     dtype: torch.dtype,
 ) -> None:
-    if dtype != torch.bfloat16 or not _is_sm103():
+    if dtype != torch.bfloat16 or not _gemm_plans():
         return
     if not shape_dynamic_skinny_gemm.is_available():
         return
 
     warmup_configs: set[SkinnyGemmConfig] = set()
+    enabled_shapes: set[tuple[int, int]] = set()
+    enabled_projections = 0
     for child in module.modules():
         is_linear = (
             isinstance(child, LinearBase)
@@ -172,7 +294,7 @@ def enable_qwen4_exp_low_latency_gemm(
         weight = getattr(child, "weight", None)
         if weight is None or weight.dim() != 2:
             continue
-        plan = QWEN4_EXP_GEMM_PLANS.get((weight.shape[0], weight.shape[1]))
+        plan = _gemm_plans().get((weight.shape[0], weight.shape[1]))
         if plan is None:
             continue
         if is_linear:
@@ -180,6 +302,13 @@ def enable_qwen4_exp_low_latency_gemm(
         else:
             child.quant_method = Qwen4ExpLowLatencyEmbeddingMethod()
         warmup_configs.update(plan.values())
+        enabled_shapes.add((weight.shape[0], weight.shape[1]))
+        enabled_projections += 1
 
     if warmup_configs:
         shape_dynamic_skinny_gemm.request_warmup_configs(dtype, warmup_configs)
+        logger.info(
+            "Enabled Qwen4Exp low-latency BF16 GEMM for %d projections: %s",
+            enabled_projections,
+            sorted(enabled_shapes),
+        )

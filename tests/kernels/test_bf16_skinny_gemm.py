@@ -17,6 +17,7 @@ from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
 from vllm.models.deepseek_v32.nvidia import glm52_low_latency_gemm as glm52_gemm
 from vllm.models.kimi_k3.nvidia import low_latency_gemm as k3_gemm
 from vllm.models.kimi_k3.nvidia.low_latency_gemm import KIMI_K3_PROJECTIONS
+from vllm.models.qwen4_exp.nvidia import low_latency_gemm as qwen_gemm
 
 # Keyed by local (N, K): (cute token counts, dsv3 token counts). 1536x7168 is
 # the unified shared_gate_up_proj/mla_g_proj entry (dsv3 M1..16).
@@ -53,6 +54,45 @@ EXPECTED_SELECTIONS = {
 }
 
 K3ProjectionTable = dict[tuple[int, int], k3_gemm.ProjectionSpec]
+
+
+@pytest.mark.parametrize(
+    "capability,enabled,m,routed",
+    [
+        ((12, 1), True, 3, True),
+        ((12, 1), False, 3, False),
+        ((12, 1), True, 7, False),
+        ((10, 3), True, 3, False),
+        ((12, 0), True, 3, False),
+    ],
+)
+def test_qwen_gb10_routes_only_measured_shapes(
+    monkeypatch, capability, enabled, m, routed
+):
+    """Opt-out, unmeasured rows and other GPUs retain ordinary linear."""
+    monkeypatch.setattr(
+        qwen_gemm.current_platform, "is_device_capability", lambda cc: cc == capability
+    )
+    monkeypatch.setattr(qwen_gemm.envs, "VLLM_QWEN4_EXP_SM121_GEMM", enabled)
+    monkeypatch.setattr(qwen_gemm, "_runtime_ok", lambda x, w: True)
+    calls = []
+
+    class Kernel:
+        @staticmethod
+        def is_available():
+            return True
+
+        def __call__(self, x, weight, config):
+            calls.append(config)
+            return torch.nn.functional.linear(x, weight)
+
+    monkeypatch.setattr(qwen_gemm, "shape_dynamic_skinny_gemm", Kernel())
+    x, weight = torch.randn(m, 2560), torch.randn(48, 2560)
+    actual = qwen_gemm._qwen4_exp_low_latency_gemm(x, weight)
+    torch.testing.assert_close(actual, torch.nn.functional.linear(x, weight))
+    assert bool(calls) == routed
+
+
 K3_GPU_TABLES = (
     ((10, 3), k3_gemm.KIMI_K3_PROJECTIONS),
     ((9, 0), k3_gemm.KIMI_K3_PROJECTIONS_SM90),

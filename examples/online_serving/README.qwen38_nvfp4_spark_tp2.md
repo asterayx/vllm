@@ -432,10 +432,96 @@ These are single-request observations, not a load-test distribution.
 Head kernel-time sums per step were approximately 26.6–26.8 ms for BF16
 WMMA GEMM, 7.0–7.1 ms for BF16 GEMV, 8.2–8.6 ms for NVFP4 grouped GEMM,
 and 4.2–5.9 ms for NCCL. All captured decode collectives used Ring/LL.
-The existing model-specific skinny GEMM dispatch only enables SM103 and its
-plans primarily target TP4; GB10/TP2 shape-specific tuning is a candidate,
-not a validated replacement. Raw traces and request records are retained
+At the profiling baseline, the model-specific skinny GEMM dispatch only
+enabled SM103 and primarily targeted TP4. The GB10/TP2 follow-up below
+measures and validates a separate SM121 dispatch table. Raw traces and request records are retained
 under `.run/profile-20260907/` in the deployment experiment archive.
+
+## GB10 TP2 BF16 dispatch
+
+SM121 now uses a separate table of 73 measured `(N, K, M)` plans spanning 14
+local projection shapes, reusing the existing CuTeDSL skinny GEMM. Unmeasured
+shapes or token counts retain `F.linear`; the SM103 table is unchanged.
+Set `VLLM_QWEN4_EXP_SM121_GEMM=0` on both nodes to disable this new path.
+
+The 2026-09-07 cold-L2 CUPTI sweep initially selected 74 plans with more than
+10% improvement across both timing rounds. Independent checks on both GB10s
+passed against FP32 accumulation; one plan with negligible worker benefit
+was removed. The installed 73 plans exactly match the retained measurements.
+The first attempt without CUPTI was excluded because event fallback did not
+satisfy the cold-L2 measurement contract.
+
+With MTP2, two measured requests after warmup improved from 42.54/41.14 to
+45.71/45.75 tokens/s at 8K, and from 42.71/39.75 to 47.00/44.02 at 64K.
+The small sample and differing MTP acceptance rates prevent attributing all
+of this gain to GEMM. Cold 64K prefill remained approximately 20.1 seconds.
+GSM8K first-16/5-shot scored 15/16 with no invalid responses; cache isolation,
+continuous generation, tool follow-up, and Chat/Responses smoke checks passed.
+
+The same optimized dispatch was tested with MTP disabled, one draft token,
+and two draft tokens. The values below are the mean of two decode requests
+after warmup, with 256 output tokens each. All three configurations scored
+15/16 on the same GSM8K subset, with no invalid responses.
+
+| Draft tokens | 8K decode tokens/s | 64K decode tokens/s |
+| --- | ---: | ---: |
+| 0 | 29.67 | 29.55 |
+| 1 | 41.24 | 41.16 |
+| 2 | 45.73 | 45.51 |
+
+Keep `MTP_TOKENS=2` for sustained output. Disabling MTP reduced cache-hit
+first-token latency (8K approximately 0.22–0.27 seconds versus 0.63–0.64 with
+MTP2), so short-answer latency can favor a different choice. These synthetic
+single-request observations are not concurrency or p95 measurements.
+Adding QSA metadata updates alone would not merge the first draft-prefill
+and remaining decode graphs for MTP2; no such cache change is included.
+
+Eight NCCL configurations passed collective correctness checks. A 15,360-byte
+AllReduce measured 24.56 microseconds with automatic selection (24.70 on
+repeat), 24.51 with Ring/LL, 67.50 with Tree/LL, 30.85 with Ring/Simple, and
+32.74 with Ring/LL128. Each single-NIC configuration measured approximately
+26.4–26.5 microseconds. Keep automatic selection and both RoCE links; these
+small-message results do not justify globally forcing another protocol.
+
+## Reproducing GB10 TP2 tuning
+
+Stop the serving processes before running independent GPU microbenchmarks.
+`benchmarks/kernels/benchmark_qwen_spark_gemm.py` sweeps the actual TP2 BF16
+projection shapes with FP32 reference checks and cold-L2 CUDA-graph CUPTI
+measurements. It requires the optional `cupti-python` package compatible with
+the installed CUDA runtime; install it in a separate benchmark environment,
+since its dependency constraints can change `cuda-bindings`. The benchmark
+fails if CUPTI cannot import rather than accepting event-timer fallback.
+
+```bash
+.venv/bin/python benchmarks/kernels/benchmark_qwen_spark_gemm.py \
+  --output .run/gemm-tuning
+```
+
+`--plans selected.json` restricts independent verification to a list of
+`{"m": ..., "n": ..., "k": ..., "config": ...}` records; `config` contains
+`SkinnyGemmConfig` fields. `--rows` and `--shapes` restrict the sweep. Preserve
+both measurement rounds and error records rather than selecting from a
+single fastest sample.
+
+The collective benchmark runs once on each node with the same master address
+and port, and the appropriate rank (0 or 1). It checks AllReduce/AllGather
+correctness, retains two distinct-address CUDA graphs, and records 60 samples
+per message size, reporting the maximum of both ranks for each sample.
+
+```bash
+MASTER_ADDR=192.168.100.10 \
+NCCL_SOCKET_IFNAME=enp1s0f1np1 GLOO_SOCKET_IFNAME=enp1s0f1np1 \
+.venv/bin/python benchmarks/kernels/benchmark_spark_collectives.py \
+  --rank "$RANK" --output ".run/collectives-rank${RANK}"
+```
+
+Set identical `NCCL_ALGO`/`NCCL_PROTO` on both nodes to compare forced choices,
+or leave them unset for automatic selection. Capture initialization logs with
+`NCCL_DEBUG=INFO`, `NCCL_DEBUG_SUBSYS=INIT,NET,TUNING`, and a unique
+`NCCL_DEBUG_FILE`. A CPU-submitted barrier followed by separately submitted
+events can include host scheduling gaps; this benchmark captures the barrier
+and timing events in the same graph to keep that gap outside the interval.
 
 AI assistance was used for this branch. The backported implementation and tests
 retain their upstream provenance above.
