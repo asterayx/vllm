@@ -283,6 +283,24 @@ container only when it is set, e.g.
 | `VLLM_B12X_MOE_TOKEN_BUCKET` | `256` | Round eager MoE token counts above the bucket up to a multiple of it (fewer frozen b12x plans). |
 | `VLLM_DSV4_VISION_COMPILE` | `0` | `torch.compile` the vision tower blocks. |
 
+### Profile a decode step
+
+Start both ranks with `VLLM_PROFILE_DIR=<host dir>` (mounted at
+`/root/profiles`, enables the torch profiler and `/start_profile`), then on
+the head:
+
+```bash
+VLLM_PROFILE_DIR=~/vllm-profiles NODE_RANK=0 ./docker/gb10/run-vision.sh
+VLLM_PROFILE_DIR=~/vllm-profiles ./docker/gb10/profile-decode.sh
+# CONCURRENCY=4 MAX_TOKENS=128 to profile a batched decode
+```
+
+`profile-decode.sh` sends one warm request, profiles a few greedy requests,
+and runs `summarize-profile.py` on rank 0's trace: GPU time per category
+(attention / MoE / mHC / dense GEMM / NCCL / glue), GPU ms per generated
+token, and the top kernels. The full torch table is in
+`profiler_out_0.txt`. Do not leave the profiler enabled for serving.
+
 ### Wait until ready
 
 ```bash

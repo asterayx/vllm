@@ -180,6 +180,9 @@ docker rm -f dspark-vision-tp2-rank0 dspark-vision-tp2-rank1
   every restart in both configurations (restart-level noise; replaced in
   the script). Single stream 0.95-1.0x, concurrency 4: 88.3 -> 98.1 tok/s
   aggregate (1.11x). Now the `run-vision.sh` default.
+- `docker/gb10/profile-decode.sh` + `summarize-profile.py` give the GPU
+  time split of a decode step (needs `VLLM_PROFILE_DIR` at start). Use it
+  before changing kernel defaults further.
 - Still to validate the same way: `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4`,
   `VLLM_SM12X_ATTN_AUX_STREAMS`, `VLLM_SM12X_SHARED_EXPERTS_STREAM`, and
   an image prompt set (`--images`) for the split-prefill path.

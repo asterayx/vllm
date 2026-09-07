@@ -35,6 +35,17 @@ else
 fi
 
 mkdir -p "${VLLM_CACHE}" "${HF_CACHE}/flashinfer" "${B12X_CACHE}"
+
+# Torch profiler: VLLM_PROFILE_DIR=<host dir> mounts it at /root/profiles and
+# enables /start_profile /stop_profile (see docker/gb10/profile-decode.sh).
+profile_mount=()
+profile_args=()
+if [ -n "${VLLM_PROFILE_DIR:-}" ]; then
+  mkdir -p "${VLLM_PROFILE_DIR}"
+  profile_mount=(-v "${VLLM_PROFILE_DIR}:/root/profiles")
+  profile_args=(--profiler-config '{"profiler":"torch","torch_profiler_dir":"/root/profiles","torch_profiler_with_stack":false}')
+  echo "profiler: traces -> ${VLLM_PROFILE_DIR}"
+fi
 docker rm -f "${NAME}" 2>/dev/null || true
 
 # SM12x tuning knobs (README "SM12x tuning knobs"): forwarded only when set
@@ -85,6 +96,7 @@ docker run -d --name "${NAME}" \
   -e VLLM_SPARK_VERSION="${VLLM_SPARK_VERSION}" \
   -e VLLM_GB10_VERSION="${VLLM_SPARK_VERSION}" \
   "${pythonpath_args[@]}" \
+  "${profile_mount[@]}" \
   "${knob_args[@]}" \
   -e MOUNT_VLLM_SRC="${MOUNT_VLLM_SRC}" \
   -e VLLM_HOST_IP="${VLLM_HOST_IP}" \
@@ -251,6 +263,7 @@ PY
   --linear-backend "${LINEAR_BACKEND}" \
   --moe-backend "${MOE_BACKEND}" \
   --compilation-config "${CUGRAPH_CFG}" \
+  "${profile_args[@]}" \
   ${EXTRA_VLLM_ARGS:-} \
   ${HEADLESS}
 
