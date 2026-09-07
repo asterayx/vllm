@@ -278,6 +278,7 @@ container only when it is set, e.g.
 | `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4` | `0` | Pad decode-form q_len 2/3 to 4 instead of 6 (halves draft padding). |
 | `VLLM_SM12X_ATTN_AUX_STREAMS` | `0` | Overlap indexer/compressor projections on aux streams again. |
 | `VLLM_SM12X_SHARED_EXPERTS_STREAM` | `0` | Overlap shared experts with routed experts again. |
+| `VLLM_SM12X_SKINNY_GEMM` | `1` | M<=32 bf16 projections (MoE gate, compressor `wkv/wgate`, indexer `weights_proj`) use a split-K Triton GEMM instead of cuBLAS' 16-CTA wmma kernel. `0` restores cuBLAS. |
 | `VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS` | empty | Extra DSpark FULL graph token counts, e.g. `30` gives text k=5 a 6-request graph. |
 | `VLLM_SM12X_WARMUP_LONG_PREFILL_TOKENS` | `128` | Startup prefill that warms the >64-token sparse prefill path; `0` skips it. |
 | `VLLM_B12X_MOE_TOKEN_BUCKET` | `256` | Round eager MoE token counts above the bucket up to a multiple of it (fewer frozen b12x plans). |

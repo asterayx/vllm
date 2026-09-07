@@ -9,6 +9,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.platforms import current_platform
+from vllm.utils.sm12x import sm12x_use_skinny_gemm
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -25,6 +26,8 @@ class GateLinear(ReplicatedLinear):
        (H, E) in {(3072, 256), (6144, 128), (6144, 256)})
     4. experimental bf16x3 CuteDSL kernel (opt-in, SM100, bf16 in, fp32 weight)
     5. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
+    5b. SM12x split-K Triton GEMM (bf16 weight, M<=32; cuBLAS runs a
+       16-CTA wmma kernel there)
     6. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
@@ -129,6 +132,10 @@ class GateLinear(ReplicatedLinear):
             and self.out_dtype == torch.float32
         )
 
+        self.allow_sm12x_skinny_gemm = (
+            not bias and self.weight.dtype == torch.bfloat16 and sm12x_use_skinny_gemm()
+        )
+
         # cuteDSL ll_bf16_gemm eligibility. Any dims supported, but SM90+ required bc:
         # 1. PDL support. Both dot-product and split-K kernels.
         # 2. Thread Block Clusters. Split-K kernel for cross-CTA reduction.
@@ -222,6 +229,17 @@ class GateLinear(ReplicatedLinear):
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return output, None
+
+        # Tier 5b: SM12x split-K Triton GEMM (bf16 weight, M<=32)
+        if self.allow_sm12x_skinny_gemm:
+            from vllm.model_executor.kernels.linear.sm12x_skinny_gemm import (
+                skinny_gemm_applicable,
+                skinny_linear,
+            )
+
+            if skinny_gemm_applicable(x, self.weight):
+                out_dtype = self.out_dtype or x.dtype
+                return skinny_linear(x, self.weight, out_dtype), None
 
         # Tier 6: F.linear (ReplicatedLinear)
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
