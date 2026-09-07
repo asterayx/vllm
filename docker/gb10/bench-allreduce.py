@@ -67,6 +67,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--iters", type=int, default=400)
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="also time the all-reduce inside a CUDA graph (kernel time is "
+        "the same; this only checks that capture works)",
+    )
     args = parser.parse_args()
 
     dist.init_process_group("nccl")
@@ -84,7 +90,7 @@ def main() -> None:
         (256, "prefill chunk"),
         (2048, "long prefill chunk"),
     ]
-    for use_graph in (False, True):
+    for use_graph in (False, True) if args.graph else (False,):
         if rank == 0:
             print(f"\n{'CUDA graph' if use_graph else 'eager'} all_reduce bf16:")
         for tokens, label in rows:
