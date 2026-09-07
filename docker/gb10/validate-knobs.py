@@ -232,16 +232,27 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 2
     prompts = _text_prompts() + _image_prompts(args.images)
     spec_before = _spec_counters(args.url)
+    spec_prev = spec_before
     results = []
     for index, messages in enumerate(prompts):
         result = _chat(args.url, model, messages, args.max_tokens)
         result["prompt_index"] = index
+        spec_now = _spec_counters(args.url)
+        prompt_spec = spec_decode_stats(spec_prev, spec_now)
+        spec_prev = spec_now
+        if prompt_spec is not None:
+            result["spec_decode"] = prompt_spec
         results.append(result)
         rate = (result["completion_tokens"] or 0) / max(result["seconds"], 1e-6)
+        accept = (
+            f" acceptance {prompt_spec['acceptance_rate'] * 100:.1f}%"
+            if prompt_spec is not None
+            else ""
+        )
         print(
             f"[{index}] prompt_tokens={result['prompt_tokens']} "
             f"completion_tokens={result['completion_tokens']} "
-            f"{result['seconds']:.2f}s {rate:.1f} tok/s",
+            f"{result['seconds']:.2f}s {rate:.1f} tok/s{accept}",
             flush=True,
         )
     payload: dict = {"model": model, "results": results}
@@ -276,10 +287,16 @@ def compare_results(base: list[dict], other: list[dict]) -> list[str]:
     for a, b in zip(base, other, strict=True):
         ta, tb = a["tokens"], b["tokens"]
         speed = a["seconds"] / max(b["seconds"], 1e-6)
+        accept = ""
+        if "spec_decode" in a and "spec_decode" in b:
+            accept = (
+                f", acceptance {a['spec_decode']['acceptance_rate'] * 100:.1f}%"
+                f" -> {b['spec_decode']['acceptance_rate'] * 100:.1f}%"
+            )
         if ta == tb:
             lines.append(
                 f"OK       prompt {a['prompt_index']}: {len(ta)} tokens, "
-                f"{speed:.2f}x faster"
+                f"{speed:.2f}x faster{accept}"
             )
             continue
         first = next(
