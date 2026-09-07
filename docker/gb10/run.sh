@@ -59,10 +59,19 @@ for knob in \
   VLLM_SM12X_SHARED_EXPERTS_STREAM \
   VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS \
   VLLM_SM12X_WARMUP_LONG_PREFILL_TOKENS \
+  VLLM_SM12X_REDUCE_REAL_ROWS \
   VLLM_B12X_MOE_TOKEN_BUCKET \
   VLLM_DSV4_VISION_COMPILE \
   VLLM_BATCH_INVARIANT \
   VLLM_MOE_SKIP_PADDING; do
+  if [ -n "${!knob+x}" ]; then
+    knob_args+=(-e "${knob}")
+  fi
+done
+# NCCL protocol/algorithm overrides measured with bench-allreduce.sh
+# (README "NCCL all-reduce latency"). The IB/RoCE settings below stay fixed.
+for knob in NCCL_PROTO NCCL_ALGO NCCL_IB_QPS_PER_CONNECTION NCCL_IB_SPLIT_DATA_ON_QPS \
+  NCCL_NET_GDR_LEVEL NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS NCCL_BUFFSIZE; do
   if [ -n "${!knob+x}" ]; then
     knob_args+=(-e "${knob}")
   fi

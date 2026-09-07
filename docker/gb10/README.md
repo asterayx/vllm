@@ -325,7 +325,16 @@ NCCL_PROTO=Simple MASTER_ADDR=... NODE_RANK=0 ./docker/gb10/bench-allreduce.sh
 ```
 
 A setting that wins here goes into `run.sh` via the same `NCCL_*` variable
-and then through `validate-knobs.py` like any other knob.
+(`NCCL_PROTO`, `NCCL_ALGO`, QPS, GDR, channel and buffer settings are
+forwarded when set) and then through `validate-knobs.py` like any other
+knob.
+
+Measured 2026-09-07 (eager wall time, two Sparks over RoCE): the default
+protocol choice is wrong for this link. LL is picked at 128 KB (214 us vs
+46 us with `NCCL_PROTO=Simple`) and LL128 at 2 MB (318 us vs 118 us);
+only the 32 KB message prefers the default (22 us vs 36 us). Batched decode
+and prefill therefore want `NCCL_PROTO=Simple`; single-stream decode with
+`VLLM_SM12X_REDUCE_REAL_ROWS` sends only 32 KB messages and loses a little.
 
 ### Wait until ready
 
