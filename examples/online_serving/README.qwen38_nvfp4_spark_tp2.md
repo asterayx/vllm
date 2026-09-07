@@ -380,5 +380,62 @@ HTTP 200 for models, JSON Responses, streamed Responses, and Chat Completions;
 both Responses modes returned `OK`, and Chat Completions preserved `reasoning`
 while adding `reasoning_content`. Repository pre-commit checks passed.
 
+## Bounded decode profiling
+
+`benchmarks/benchmark_spark_decode_profile.py` records warmup, baseline,
+profiled, and post-capture requests at four context lengths. It starts the
+profiler after receiving the first output token, excluding prefill. Requests,
+raw SSE, metrics, and timings are saved in the specified output directory.
+Run this against an otherwise idle deployment.
+
+On each node, wrap the normal launcher with Nsight Systems, preserving the
+environment variables from the launch commands above (`RANK` is 0 or 1):
+
+```bash
+nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
+  --cuda-graph-trace=node --capture-range=cudaProfilerApi \
+  --capture-range-end=repeat:4 --kill=none --output="rank${RANK}" \
+  bash examples/online_serving/qwen38_nvfp4_spark_tp2.sh "$RANK" \
+  --profiler-config '{"profiler":"cuda","delay_iterations":4,"max_iterations":24,"detailed_trace_annotation":true}'
+```
+
+Once the API is ready, run on the head:
+
+```bash
+.venv/bin/python benchmarks/benchmark_spark_decode_profile.py \
+  --model-path "$HOME/models/Qwen3.8-Flash-Next-NVFP4" \
+  --output .run/decode-profile/requests
+```
+
+Optional `NCCL_DEBUG=INFO`, `NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH,TUNING`, and a
+per-rank `NCCL_DEBUG_FILE` retain transport and algorithm-selection evidence.
+The four capture ranges are ordered 8K, 64K, 256K, then approximately 512K.
+Stop the instrumented deployment normally to finalize the Nsight reports,
+then restore the normal launcher. Use `--phases warmup baseline post` to
+measure a server without profiler support. Nsight creates a separate process
+group for the application; memory guards must cover that group.
+
+Profiled request latency includes collection and trace-flush overhead.
+Baseline/post requests in the instrumented process still have injection
+libraries loaded; compare against a restored process before attributing a
+performance difference to the model. Kernel-time sums include overlapping
+streams and must not be interpreted as wall-clock latency. CPU sampling is
+disabled in this recipe, so it does not provide CPU stack attribution.
+
+The 2026-09-07 GB10/TP2 run completed all 16 requests (256 output tokens each)
+and produced eight valid traces. Each trace contained 24 decode-only steps,
+62,448 kernels, and 2,664 NCCL kernels. Collection-disabled baseline/post
+decode rates were 41.61/42.22, 42.14/44.15, 41.55/39.29, and 38.97/40.83
+tokens/s for 8K, 64K, 256K, and approximately 512K respectively.
+These are single-request observations, not a load-test distribution.
+
+Head kernel-time sums per step were approximately 26.6–26.8 ms for BF16
+WMMA GEMM, 7.0–7.1 ms for BF16 GEMV, 8.2–8.6 ms for NVFP4 grouped GEMM,
+and 4.2–5.9 ms for NCCL. All captured decode collectives used Ring/LL.
+The existing model-specific skinny GEMM dispatch only enables SM103 and its
+plans primarily target TP4; GB10/TP2 shape-specific tuning is a candidate,
+not a validated replacement. Raw traces and request records are retained
+under `.run/profile-20260907/` in the deployment experiment archive.
+
 AI assistance was used for this branch. The backported implementation and tests
 retain their upstream provenance above.
