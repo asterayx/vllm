@@ -183,6 +183,18 @@ docker rm -f dspark-vision-tp2-rank0 dspark-vision-tp2-rank1
 - `docker/gb10/profile-decode.sh` + `summarize-profile.py` give the GPU
   time split of a decode step (needs `VLLM_PROFILE_DIR` at start). Use it
   before changing kernel defaults further.
+- **Not worth doing: a split-K Triton GEMM for the M<=32 bf16 projections**
+  (gate, compressor `fused_wkv_wgate`, indexer `weights_proj`). Measured on
+  GB10 with cold L2 (256 MB of rotating weight copies, CUDA graph replay,
+  K=4096): cuBLAS reads at 154-214 GB/s (N=256: 12.6 us, N=1024: 45 us,
+  73-78% of the 273 GB/s peak); the Triton kernel was 15% faster only at
+  N=1024 and 30% slower at N=256. The hot-L2 numbers (6-20 us) are not
+  representative of the model, where each weight is read once per step.
+  The 50 us cuBLAS kernel in the decode profile is the 8 MB compressor
+  projection at the bandwidth floor; the 114 us one reads ~21 MB, so it is
+  a bf16 matrix that is not the gate or the compressor. Cutting that share
+  means reading fewer bytes (FP8 weights), not a different kernel. The
+  commit was reverted; see the git history for the kernel.
 - Still to validate the same way: `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4`,
   `VLLM_SM12X_ATTN_AUX_STREAMS`, `VLLM_SM12X_SHARED_EXPERTS_STREAM`, and
   an image prompt set (`--images`) for the split-prefill path.
