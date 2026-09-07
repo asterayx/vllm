@@ -230,15 +230,18 @@ docker rm -f dspark-vision-tp2-rank0 dspark-vision-tp2-rank1
   concurrency 1.01x (decode attention is latency-bound at [1,4] and [1,6]
   alike); `VLLM_SM12X_SHARED_EXPERTS_STREAM=1` single stream 1.00x,
   concurrency 0.97x (both expert paths are bandwidth-bound, the second
-  stream only adds event synchronization).
+  stream only adds event synchronization); `VLLM_SM12X_ATTN_AUX_STREAMS=1`
+  single stream 1.00x, concurrency 0.86x (the three side projections are
+  too small to hide anything and the fan-out/join events stall the main
+  stream on batched steps).
 - Measurement note: single-stream tok/s of the 2652-token prompt includes
   its prefill, so a second `validate-knobs.py run` against the same server
   hits the prefix cache and reads ~70% faster. Compare single-stream
   numbers only between first runs after a restart; the concurrency
   aggregate is warmed by the single-stream phase in every run and stays
   comparable.
-- Still to validate the same way: `VLLM_SM12X_ATTN_AUX_STREAMS`, and an
-  image prompt set (`--images`) for the split-prefill path.
+- Still to validate the same way: an image prompt set (`--images`) for
+  the split-prefill path.
 
 ## Required Spark validation
 

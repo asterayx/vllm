@@ -275,9 +275,9 @@ container only when it is set, e.g.
 | --- | --- | --- |
 | `VLLM_SM12X_SPLIT_IMAGE_PREFILL` | `1` | Image prefill keeps C4A for text rows; `0` restores SWA-only for the whole chunk. |
 | `VLLM_SM12X_BATCHED_DECODE_NEXT_N` | empty (`run-vision.sh` sets `4`) | Comma list of uniform decode widths that use one batched `[B, next_n]` FlashInfer launch. `4` removes the per-request loop for Vision k=3 target steps (validated: +11% at concurrency 4). |
-| `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4` | `0` | Pad decode-form q_len 2/3 to 4 instead of 6 (halves draft padding). |
-| `VLLM_SM12X_ATTN_AUX_STREAMS` | `0` | Overlap indexer/compressor projections on aux streams again. |
-| `VLLM_SM12X_SHARED_EXPERTS_STREAM` | `0` | Overlap shared experts with routed experts again. |
+| `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4` | `0` | Pad decode-form q_len 2/3 to 4 instead of 6. Measured neutral (0.99x / 1.01x); leave off. |
+| `VLLM_SM12X_ATTN_AUX_STREAMS` | `0` | Overlap indexer/compressor projections on aux streams. Measured 0.86x at concurrency 4; leave off. |
+| `VLLM_SM12X_SHARED_EXPERTS_STREAM` | `0` | Overlap shared experts with routed experts. Measured 0.97x at concurrency 4; leave off. |
 | `NCCL_PROTO` | `Simple` (`run.sh`) | NCCL protocol; empty string lets NCCL choose (LL at 32 KB is 8 us faster, everything larger is 2-3x slower). |
 | `VLLM_SM12X_REDUCE_REAL_ROWS` | `1` | TP all-reduce only the real token rows of the MoE output, not the 16-row padded block (a 4-token DSpark step sends 32 KB per layer instead of 128 KB). `0` restores the in-FusedMoE reduce. |
 | `VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS` | empty | Extra DSpark FULL graph token counts, e.g. `30` gives text k=5 a 6-request graph. |
