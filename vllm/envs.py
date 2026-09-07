@@ -212,7 +212,6 @@ if TYPE_CHECKING:
     VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4: bool = False
     VLLM_SM12X_ATTN_AUX_STREAMS: bool = False
     VLLM_SM12X_SHARED_EXPERTS_STREAM: bool = False
-    VLLM_SM12X_SKINNY_GEMM: bool = True
     VLLM_SM12X_WARMUP_LONG_PREFILL_TOKENS: int = 128
     VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS: str = ""
     VLLM_B12X_MOE_TOKEN_BUCKET: int = 256
@@ -1631,12 +1630,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Re-enable the MoE shared-experts aux stream on SM12x.
     "VLLM_SM12X_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_SM12X_SHARED_EXPERTS_STREAM", "0"))
-    ),
-    # Run M<=32 bf16 decode projections (MoE gate, DSv4 compressor and indexer
-    # weights) through a split-K Triton GEMM instead of the latency-bound
-    # cuBLAS wmma kernel cuBLAS picks on GB10. 0 restores cuBLAS.
-    "VLLM_SM12X_SKINNY_GEMM": lambda: bool(
-        int(os.getenv("VLLM_SM12X_SKINNY_GEMM", "1"))
     ),
     # Extra single-request prefill of this many tokens during V2 kernel
     # warmup so the >64-token sparse prefill orchestrator is warmed before the

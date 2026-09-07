@@ -183,21 +183,6 @@ docker rm -f dspark-vision-tp2-rank0 dspark-vision-tp2-rank1
 - `docker/gb10/profile-decode.sh` + `summarize-profile.py` give the GPU
   time split of a decode step (needs `VLLM_PROFILE_DIR` at start). Use it
   before changing kernel defaults further.
-- **Skinny bf16 GEMMs** (`VLLM_SM12X_SKINNY_GEMM`, default on). The
-  single-stream profile spent 13% of GPU time in three cuBLAS
-  `cutlass_80_wmma ... 16x16_128x2` launches (114/64/50 us each for
-  M=16, K=4096): the MoE gate (N=256), the compressor `fused_wkv_wgate`
-  (fp32 out) and the indexer compressor/`weights_proj`. cuBLAS grids those
-  as N/16 CTAs, so they run on 16 of 48 SMs, 5-6x above the HBM floor. The
-  split-K Triton kernel in `sm12x_skinny_gemm.py` streams the weight over
-  ~128 CTAs and reduces fp32 partials in a fixed order (deterministic, no
-  atomics). The first eager call per shape is checked against `torch.mm`
-  and the path disables itself on mismatch. Expected: `dense_gemm` share
-  drops by ~9 points of step time. Validate with `validate-knobs.py`
-  (baseline with `VLLM_SM12X_SKINNY_GEMM=0`) and `profile-decode.sh`; the
-  bf16 kernel numerics are covered by
-  `tests/kernels/test_sm12x_skinny_gemm.py::test_cuda_bf16_matches_cublas`
-  on the GPU (the CPU interpreter has no bf16).
 - Still to validate the same way: `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4`,
   `VLLM_SM12X_ATTN_AUX_STREAMS`, `VLLM_SM12X_SHARED_EXPERTS_STREAM`, and
   an image prompt set (`--images`) for the split-prefill path.

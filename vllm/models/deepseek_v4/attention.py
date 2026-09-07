@@ -15,10 +15,6 @@ from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.model_executor.kernels.linear.sm12x_skinny_gemm import (
-    skinny_gemm_applicable,
-    skinny_linear,
-)
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -62,7 +58,6 @@ from vllm.utils.sm12x import (
     sm12x_extend_prefill_slots,
     sm12x_pad_prefill_token_rows,
     sm12x_should_fill_prefill_slots,
-    sm12x_use_skinny_gemm,
 )
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
@@ -97,13 +92,6 @@ def _fill_short_context_topk_indices(
         tl.where(offsets < num_compressed, offsets, -1),
         mask=offsets < TOP_K,
     )
-
-
-def _bf16_mm_fp32(x: torch.Tensor, weight: torch.Tensor, skinny: bool) -> torch.Tensor:
-    """``x @ weight.T`` with an fp32 output; split-K Triton on SM12x decode."""
-    if skinny and skinny_gemm_applicable(x, weight):
-        return skinny_linear(x, weight, torch.float32)
-    return torch.mm(x, weight.T, out_dtype=torch.float32)
 
 
 def _resolve_dsv4_kv_cache_dtype(
@@ -333,7 +321,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         # Will be None on ROCm for now.
         self.aux_stream_list = aux_stream_list
-        self._use_sm12x_skinny_gemm = sm12x_use_skinny_gemm()
         # [0]: GEMM start / post-GEMM event0. [1..3]: GEMM done events;
         # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
         # before post-GEMM starts.
@@ -556,15 +543,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # is the fan-out start event; ln_events[1..3] are per-aux done events.
         # On ROCm, aux_streams is None and execute_in_parallel runs serially.
         aux_fns: list[Callable[[], Any] | None] = [None, None, None]
-        skinny = self._use_sm12x_skinny_gemm
 
         if self.compressor is not None:
             # Local ref so the closure keeps a non-None type for mypy.
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
-                return _bf16_mm_fp32(
-                    hidden_states, compressor.fused_wkv_wgate.weight, skinny
+                return torch.mm(
+                    hidden_states,
+                    compressor.fused_wkv_wgate.weight.T,
+                    out_dtype=torch.float32,
                 )
 
             aux_fns[0] = compressor_kv_score
@@ -573,16 +561,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             indexer = self.indexer
 
             def indexer_weights_proj() -> torch.Tensor:
-                weight = indexer.weights_proj.weight
-                if skinny and skinny_gemm_applicable(hidden_states, weight):
-                    return skinny_linear(hidden_states, weight, hidden_states.dtype)
                 # ReplicatedLinear returns (output, bias); bias is None.
                 weights, _ = indexer.weights_proj(hidden_states)
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
-                return _bf16_mm_fp32(
-                    hidden_states, indexer.compressor.fused_wkv_wgate.weight, skinny
+                return torch.mm(
+                    hidden_states,
+                    indexer.compressor.fused_wkv_wgate.weight.T,
+                    out_dtype=torch.float32,
                 )
 
             aux_fns[1] = indexer_weights_proj

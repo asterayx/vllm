@@ -248,16 +248,6 @@ def sm12x_disable_attn_aux_streams() -> bool:
     return current_platform.is_device_capability_family(120)
 
 
-def sm12x_use_skinny_gemm() -> bool:
-    """Split-K Triton GEMM for M<=32 bf16 projections on SM12x
-    (``VLLM_SM12X_SKINNY_GEMM``)."""
-    if not envs.VLLM_SM12X_SKINNY_GEMM:
-        return False
-    return current_platform.is_cuda() and current_platform.is_device_capability_family(
-        120
-    )
-
-
 def sm12x_disable_shared_experts_stream() -> bool:
     """SM12x custom GEMMs IMA'd on the shared-experts aux stream during
     PIECEWISE dummy capture. ``VLLM_SM12X_SHARED_EXPERTS_STREAM=1``
