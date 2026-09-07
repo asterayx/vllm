@@ -224,9 +224,21 @@ docker rm -f dspark-vision-tp2-rank0 dspark-vision-tp2-rank1
   between two runs of one configuration. `NCCL_IB_QPS_PER_CONNECTION`,
   `NCCL_IB_SPLIT_DATA_ON_QPS`, `NCCL_NET_GDR_LEVEL` and
   `NCCL_MIN_NCHANNELS` were within noise on this point-to-point link.
-- Still to validate the same way: `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4`,
-  `VLLM_SM12X_ATTN_AUX_STREAMS`, `VLLM_SM12X_SHARED_EXPERTS_STREAM`, and
-  an image prompt set (`--images`) for the split-prefill path.
+- **Stay off** (Spark 2026-09-07, `validate-knobs.py --concurrency 4`
+  against the new defaults; no crashes, outputs identical up to restart
+  noise): `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4=1` single stream 0.99x,
+  concurrency 1.01x (decode attention is latency-bound at [1,4] and [1,6]
+  alike); `VLLM_SM12X_SHARED_EXPERTS_STREAM=1` single stream 1.00x,
+  concurrency 0.97x (both expert paths are bandwidth-bound, the second
+  stream only adds event synchronization).
+- Measurement note: single-stream tok/s of the 2652-token prompt includes
+  its prefill, so a second `validate-knobs.py run` against the same server
+  hits the prefix cache and reads ~70% faster. Compare single-stream
+  numbers only between first runs after a restart; the concurrency
+  aggregate is warmed by the single-stream phase in every run and stays
+  comparable.
+- Still to validate the same way: `VLLM_SM12X_ATTN_AUX_STREAMS`, and an
+  image prompt set (`--images`) for the split-prefill path.
 
 ## Required Spark validation
 
