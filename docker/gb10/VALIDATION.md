@@ -234,6 +234,16 @@ docker rm -f dspark-vision-tp2-rank0 dspark-vision-tp2-rank1
   single stream 1.00x, concurrency 0.86x (the three side projections are
   too small to hide anything and the fan-out/join events stall the main
   stream on batched steps).
+- **Draft acceptance is unchanged by the new defaults.** A real coding
+  session on the new defaults showed drafted throughput 41-42.6 tok/s
+  (37-39 before: the step got ~10% faster) but only 37-50% draft
+  acceptance against 88% on an earlier session. `validate-knobs.py` now
+  records per-prompt acceptance from the `vllm:spec_decode_*` counters:
+  the two content-identical prompts accept 78.6% / 89.5% on the new
+  defaults, matching the 76.6% aggregate with real-rows and batched decode
+  off. Low acceptance in a session is the content (and any client-side
+  temperature), not the serving path; the restart-noisy prompt 0 is
+  excluded from that comparison for the same reason.
 - Measurement note: single-stream tok/s of the 2652-token prompt includes
   its prefill, so a second `validate-knobs.py run` against the same server
   hits the prefix cache and reads ~70% faster. Compare single-stream
