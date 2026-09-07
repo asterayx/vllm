@@ -32,11 +32,6 @@ export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-v4-flash-vision-exp}"
 export NAME="${NAME:-dspark-vision-tp2-rank${NODE_RANK:-0}}"
 # Do not put JSON inside ${VAR:-...}: bash ends the expansion at the
 # first `}` and produced `...probabilistic"}}`.
-# Server-side sampling defaults (see run.sh). SAMPLING_DEFAULTS= keeps the
-# checkpoint's temperature 1.0 / top_p 1.0.
-if [ -z "${SAMPLING_DEFAULTS+x}" ]; then
-  export SAMPLING_DEFAULTS='{"temperature":0.2,"top_p":0.95}'
-fi
 if [ -z "${EXTRA_VLLM_ARGS+x}" ]; then
   # --disable-chunked-mm-input keeps every image span inside one prefill
   # chunk: the in-image visibility window is bidirectional and must not

@@ -278,7 +278,6 @@ container only when it is set, e.g.
 | `VLLM_SM12X_DECODE_Q_ALIGN_ALLOW_4` | `0` | Pad decode-form q_len 2/3 to 4 instead of 6. Measured neutral (0.99x / 1.01x); leave off. |
 | `VLLM_SM12X_ATTN_AUX_STREAMS` | `0` | Overlap indexer/compressor projections on aux streams. Measured 0.86x at concurrency 4; leave off. |
 | `VLLM_SM12X_SHARED_EXPERTS_STREAM` | `0` | Overlap shared experts with routed experts. Measured 0.97x at concurrency 4; leave off. |
-| `SAMPLING_DEFAULTS` | `{"temperature":0.2,"top_p":0.95}` (`run-vision.sh`) | Passed as `--override-generation-config`: sampling for requests that carry no temperature/top_p. The checkpoint's `generation_config.json` is a transformers placeholder (temperature 1.0, top_p 1.0) that halves draft acceptance on high-entropy text. Empty keeps the checkpoint values; explicit request parameters always win. |
 | `NCCL_PROTO` | `Simple` (`run.sh`) | NCCL protocol; empty string lets NCCL choose (LL at 32 KB is 8 us faster, everything larger is 2-3x slower). |
 | `VLLM_SM12X_REDUCE_REAL_ROWS` | `1` | TP all-reduce only the real token rows of the MoE output, not the 16-row padded block (a 4-token DSpark step sends 32 KB per layer instead of 128 KB). `0` restores the in-FusedMoE reduce. |
 | `VLLM_SM12X_DSPARK_EXTRA_CAPTURE_TOKENS` | empty | Extra DSpark FULL graph token counts, e.g. `30` gives text k=5 a 6-request graph. |

@@ -68,16 +68,6 @@ for knob in \
     knob_args+=(-e "${knob}")
   fi
 done
-# Default sampling for clients that send no temperature/top_p. The
-# checkpoint's generation_config.json is a transformers placeholder
-# ("_from_model_config": true, temperature 1.0, top_p 1.0), and sampling
-# the full distribution halves DSpark draft acceptance on high-entropy
-# text. Explicit request parameters still win. Empty keeps the checkpoint.
-sampling_args=()
-if [ -n "${SAMPLING_DEFAULTS:-}" ]; then
-  sampling_args=(--override-generation-config "${SAMPLING_DEFAULTS}")
-fi
-
 # NCCL protocol/algorithm overrides measured with bench-allreduce.sh
 # (README "NCCL all-reduce latency"). The IB/RoCE settings below stay fixed.
 # Simple beats NCCL's own choice from 128 KB up on the two-Spark RoCE link
@@ -291,7 +281,6 @@ PY
   --moe-backend "${MOE_BACKEND}" \
   --compilation-config "${CUGRAPH_CFG}" \
   "${profile_args[@]}" \
-  "${sampling_args[@]}" \
   ${EXTRA_VLLM_ARGS:-} \
   ${HEADLESS}
 

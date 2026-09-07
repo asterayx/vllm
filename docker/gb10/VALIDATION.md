@@ -244,15 +244,6 @@ docker rm -f dspark-vision-tp2-rank0 dspark-vision-tp2-rank1
   off. Low acceptance in a session is the content (and any client-side
   temperature), not the serving path; the restart-noisy prompt 0 is
   excluded from that comparison for the same reason.
-- **Server-side sampling defaults** (`SAMPLING_DEFAULTS`, `run-vision.sh`
-  sets temperature 0.2 / top_p 0.95). The checkpoint's
-  `generation_config.json` is `_from_model_config: true` with temperature
-  1.0 and top_p 1.0, so a client that sends no sampling parameters (Grok
-  Build via the compat proxy does not) samples the full distribution; that
-  is the most likely cause of the 37-50% acceptance in the coding session
-  above. To validate: rerun the same session and compare `Draft
-  acceptance rate` and `Avg generation throughput`; `SAMPLING_DEFAULTS=`
-  (empty) restores the checkpoint values.
 - Measurement note: single-stream tok/s of the 2652-token prompt includes
   its prefill, so a second `validate-knobs.py run` against the same server
   hits the prefix cache and reads ~70% faster. Compare single-stream
