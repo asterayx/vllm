@@ -64,26 +64,38 @@ def bench(shape: tuple[int, int], iters: int, use_graph: bool) -> float:
     return (time.perf_counter() - t) / iters * 1e6
 
 
-def kernel_time(shape: tuple[int, int], iters: int = 50) -> float:
-    """Average NCCL kernel duration (us) as CUPTI sees it, no CPU overhead."""
+def kernel_time(shape: tuple[int, int], iters: int = 50, skip: int = 20) -> float:
+    """Average NCCL kernel duration (us) as CUPTI sees it, no CPU overhead.
+
+    An NCCL kernel spins until the peer's data arrives, so the first
+    launches after the profiler starts (the ranks start it at different
+    times) are dropped and the ranks are barriered inside the profile.
+    """
     x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
     for _ in range(10):
         dist.all_reduce(x)
     torch.accelerator.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(skip):
+            dist.all_reduce(x)
+        torch.accelerator.synchronize()
+        dist.barrier()
         for _ in range(iters):
             dist.all_reduce(x)
         torch.accelerator.synchronize()
-    kernels = [
-        e
-        for e in prof.key_averages()
-        if "nccl" in e.key.lower() and e.self_device_time_total > 0
-    ]
-    if not kernels:
-        return float("nan")
-    return sum(e.self_device_time_total for e in kernels) / sum(
-        e.count for e in kernels
+    kernels = sorted(
+        (
+            e
+            for e in prof.events()
+            if e.device_type.name == "CUDA" and "nccl" in e.name.lower()
+        ),
+        key=lambda e: e.time_range.start,
     )
+    if len(kernels) < iters:
+        return float("nan")
+    # dist.barrier() is itself an NCCL kernel; the last `iters` are the loop.
+    tail = kernels[-iters:]
+    return sum(e.time_range.elapsed_us() for e in tail) / len(tail)
 
 
 def main() -> None:
