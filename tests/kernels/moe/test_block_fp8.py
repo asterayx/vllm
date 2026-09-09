@@ -363,29 +363,23 @@ def _dequant_block_fp8(
     return w_fp8.to(torch.float32) * s[:n, :k]
 
 
-@pytest.mark.parametrize("tp_rank", [0, 1, 2, 3])
+@pytest.mark.parametrize(
+    "tp_size,tp_rank", [(2, 0), (2, 1), (4, 0), (4, 1), (4, 2), (4, 3)]
+)
 @torch.inference_mode()
-def test_w8a8_block_fp8_fused_moe_refined_block_scales(tp_rank, workspace_init):
-    """TP-misaligned blockwise FP8 MoE (e.g. Qwen4Exp, intermediate
-    640 at TP=4 -> 160 per rank, not divisible by the checkpoint's 128 block).
-
-    The per-rank scale grid is refined from 128 to 32 (lossless: each 32-block
-    lies inside one global 128-block) so the Triton kernel can consume exact
-    per-shard scales. Simulates one TP rank's shard and checks:
-      1. the refined+sharded scales dequantize exactly like the global scales;
-      2. the Triton fused MoE kernel with block_shape=[32, 32] matches the
-         native-torch blockwise reference on the same shard.
-    """
+def test_w8a8_block_fp8_fused_moe_refined_block_scales(
+    tp_size, tp_rank, workspace_init
+):
+    """Check lossless scale refinement and Triton output for TP=2/4 shards."""
     torch.manual_seed(0)
     dtype = torch.bfloat16
     M, E, topk = 8, 4, 2
     hidden = 256
     inter_full = 640
-    tp_size = 4
-    n_shard = inter_full // tp_size  # 160
+    n_shard = inter_full // tp_size
     ckpt_block = [128, 128]
-    refined_block = [32, 32]
-    factor = ckpt_block[0] // refined_block[0]  # 4
+    refined_block = [128 // tp_size, 128 // tp_size]
+    factor = ckpt_block[0] // refined_block[0]
 
     a = torch.randn((M, hidden), dtype=dtype) / 10
     score = torch.randn((M, E), dtype=dtype)
@@ -409,34 +403,33 @@ def test_w8a8_block_fp8_fused_moe_refined_block_scales(tp_rank, workspace_init):
     )
     w2 = w2_full[:, :, lo:hi]
 
-    # Refine the global 128-block scales to 32 blocks, then take the shard's
-    # slice -- mirrors the Fp8MoEMethod/RoutedExperts loading path.
-    w1_s32 = w1_s_full.repeat_interleave(factor, dim=-2).repeat_interleave(
+    # Refine before sharding, as in the Fp8MoEMethod/RoutedExperts loader.
+    w1_refined = w1_s_full.repeat_interleave(factor, dim=-2).repeat_interleave(
         factor, dim=-1
     )
-    nb = n_shard // refined_block[0]  # 5 local 32-blocks per projection
-    gate_hi = w1_s32.shape[1] // 2
+    nb = n_shard // refined_block[0]
+    gate_hi = w1_refined.shape[1] // 2
     w1_s = torch.cat(
         [
-            w1_s32[:, tp_rank * nb : (tp_rank + 1) * nb],
-            w1_s32[:, gate_hi + tp_rank * nb : gate_hi + (tp_rank + 1) * nb],
+            w1_refined[:, tp_rank * nb : (tp_rank + 1) * nb],
+            w1_refined[:, gate_hi + tp_rank * nb : gate_hi + (tp_rank + 1) * nb],
         ],
         dim=1,
     )
-    w2_s32 = w2_s_full.repeat_interleave(factor, dim=-2).repeat_interleave(
+    w2_refined = w2_s_full.repeat_interleave(factor, dim=-2).repeat_interleave(
         factor, dim=-1
     )
-    w2_s = w2_s32[:, :, tp_rank * nb : (tp_rank + 1) * nb]
+    w2_s = w2_refined[:, :, tp_rank * nb : (tp_rank + 1) * nb]
 
     # The refined per-shard scales must reproduce the global-scale dequant
     # exactly (dequant full-width, then slice to the shard).
     for e in range(E):
-        d32 = _dequant_block_fp8(w1[e, :n_shard], w1_s[e, :nb], refined_block)
+        refined = _dequant_block_fp8(w1[e, :n_shard], w1_s[e, :nb], refined_block)
         d128 = _dequant_block_fp8(w1_full[e], w1_s_full[e], ckpt_block)[lo:hi]
-        assert torch.equal(d32, d128)
-        d32 = _dequant_block_fp8(w2[e], w2_s[e], refined_block)
+        assert torch.equal(refined, d128)
+        refined = _dequant_block_fp8(w2[e], w2_s[e], refined_block)
         d128 = _dequant_block_fp8(w2_full[e], w2_s_full[e], ckpt_block)[:, lo:hi]
-        assert torch.equal(d32, d128)
+        assert torch.equal(refined, d128)
 
     quant_config = fp8_w8a8_moe_quant_config(
         w1_scale=w1_s,

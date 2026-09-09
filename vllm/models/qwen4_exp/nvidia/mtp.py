@@ -136,6 +136,21 @@ def _make_draft_vllm_config(
                 "exclude_modules",
                 _remap_ignored_layers(exclude_modules, mtp_start_layer_idx),
             )
+        quantized_layers = getattr(draft_quant_config, "quantized_layers", None)
+        if quantized_layers:
+            setattr(  # noqa: B010
+                draft_quant_config,
+                "quantized_layers",
+                dict(
+                    zip(
+                        _remap_ignored_layers(
+                            list(quantized_layers), mtp_start_layer_idx
+                        ),
+                        quantized_layers.values(),
+                        strict=True,
+                    )
+                ),
+            )
 
     draft_vllm_config = replace(
         vllm_config,

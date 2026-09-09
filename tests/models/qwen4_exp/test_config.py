@@ -45,6 +45,48 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     return Qwen4ExpTextConfig(**values)
 
 
+def test_mtp_mixed_quantization_remaps_draft_layers_without_mutating_target():
+    """Draft runtime layer 48 must retain checkpoint layer 0's FP8 method."""
+    from copy import deepcopy
+
+    from tests.quantization.test_modelopt import _mixed_precision_config
+    from vllm.models.qwen4_exp.nvidia.mtp import _make_draft_vllm_config
+
+    entries = {
+        "mtp.layers.0.mlp.experts": {"quant_algo": "FP8_PB_WO"},
+        "mtp.layers.1.mlp.experts": {"quant_algo": "FP8_BLOCK_SCALES"},
+        "model.language_model.layers.0.mlp.experts": {"quant_algo": "NVFP4"},
+    }
+    target_quant = _mixed_precision_config(deepcopy(entries))
+    draft_quant = deepcopy(target_quant)
+    draft_model = object()
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=draft_model),
+        quant_config=target_quant,
+    )
+    with (
+        patch(
+            "vllm.models.qwen4_exp.nvidia.mtp.get_draft_quant_config",
+            return_value=draft_quant,
+        ),
+        patch(
+            "vllm.models.qwen4_exp.nvidia.mtp.replace",
+            side_effect=lambda cfg, **kw: SimpleNamespace(**(vars(cfg) | kw)),
+        ),
+    ):
+        draft = _make_draft_vllm_config(config, 48)
+    assert draft.model_config is draft_model
+    assert (
+        draft.quant_config._resolve_quant_algo("mtp.layers.48.mlp.experts")
+        == "FP8_PB_WO"
+    )
+    assert (
+        draft.quant_config._resolve_quant_algo("mtp.layers.49.mlp.experts")
+        == "FP8_BLOCK_SCALES"
+    )
+    assert target_quant.quantized_layers == entries
+
+
 def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
     from vllm.models.qwen4_exp.nvidia.mtp import (
         Qwen4ExpMultiTokenPredictor,

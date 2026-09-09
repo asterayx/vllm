@@ -2438,6 +2438,20 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             return UnquantizedLinearMethod()
 
         if isinstance(layer, RoutedExperts):
+            if quant_algo in ("FP8_PB_WO", "FP8_BLOCK_SCALES"):
+                from vllm.model_executor.layers.quantization.fp8 import (
+                    Fp8Config,
+                    Fp8MoEMethod,
+                )
+
+                return Fp8MoEMethod(
+                    Fp8Config(
+                        is_checkpoint_fp8_serialized=True,
+                        activation_scheme="dynamic",
+                        weight_block_size=[128, 128],
+                    ),
+                    layer,
+                )
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(
                     quant_config=self.fp8_config,

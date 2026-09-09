@@ -208,6 +208,101 @@ def test_modelopt_nvfp4_leaves_excluded_parallel_lm_head_unquantized():
     assert isinstance(method, UnquantizedLinearMethod)
 
 
+@pytest.mark.parametrize("algo", ["FP8_PB_WO", "FP8_BLOCK_SCALES"])
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_modelopt_block_fp8_expert_loads_tp_boundary_scales(algo, tp_rank):
+    """TP=2 splits a 640-wide expert inside a 128-wide checkpoint block."""
+    from dataclasses import replace
+
+    from vllm.model_executor.layers.fused_moe import FusedMoEConfig, RoutedExperts
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEParallelConfig,
+        RoutingMethodType,
+    )
+    from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+
+    parallel = replace(
+        FusedMoEParallelConfig.make_no_parallel(), tp_size=2, tp_rank=tp_rank
+    )
+    moe = FusedMoEConfig(
+        num_experts=1,
+        num_local_experts=1,
+        num_logical_experts=1,
+        experts_per_token=1,
+        hidden_dim=256,
+        intermediate_size=640,
+        activation=MoEActivation.SILU,
+        device="cpu",
+        in_dtype=torch.bfloat16,
+        routing_method=RoutingMethodType.TopK,
+        moe_parallel_config=parallel,
+    )
+    manager = ExpertMapManager(16, 1, 1, 0, None, parallel, "linear", False)
+    config = _mixed_precision_config(
+        {"mtp.layers.48.mlp.experts": {"quant_algo": algo}}
+    )
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.fp8.select_fp8_moe_backend",
+            return_value=(Fp8MoeBackend.TRITON, None),
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.fp8.get_tensor_model_parallel_world_size",
+            return_value=2,
+        ),
+    ):
+        layer = RoutedExperts(
+            "mtp.layers.48.mlp.experts", torch.bfloat16, moe, config, manager
+        )
+    for projection, shape, dim, parameter, weight in [
+        (
+            "gate_proj",
+            (640, 256),
+            0,
+            layer.w13_weight_scale_inv[:, :5],
+            layer.w13_weight[:, :320],
+        ),
+        (
+            "up_proj",
+            (640, 256),
+            0,
+            layer.w13_weight_scale_inv[:, 5:],
+            layer.w13_weight[:, 320:],
+        ),
+        ("down_proj", (256, 640), 1, layer.w2_weight_scale_inv, layer.w2_weight),
+    ]:
+        scales = (
+            torch.arange(10, dtype=torch.float32)
+            .reshape(shape[0] // 128, shape[1] // 128)
+            .add(1)
+            .to(torch.bfloat16)
+        )
+        original = (torch.arange(shape[0] * shape[1]).reshape(shape) % 31).to(
+            torch.float8_e4m3fn
+        )
+        loaded = list(
+            layer.load_weights(
+                [
+                    (f"0.{projection}.weight", original),
+                    (f"0.{projection}.weight_scale_inv", scales),
+                ]
+            )
+        )
+        assert len(loaded) == 2
+        torch.testing.assert_close(
+            weight[0].float(),
+            original.float().chunk(2, dim)[tp_rank],
+            rtol=0,
+            atol=0,
+        )
+        expanded = scales.repeat_interleave(128, 0).repeat_interleave(128, 1)
+        expected = expanded.chunk(2, dim)[tp_rank].float()
+        actual = parameter[0].repeat_interleave(64, 0).repeat_interleave(64, 1)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_modelopt_mixed_precision_quantizes_parallel_lm_head():
     config = _mixed_precision_config(
         {"lm_head": {"quant_algo": "NVFP4", "group_size": 16}}

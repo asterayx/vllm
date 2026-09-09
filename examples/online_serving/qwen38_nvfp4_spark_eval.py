@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Small GSM8K chat evaluation for the Spark TP2 launch example."""
 
+import argparse
 import asyncio
 import importlib.util
 import json
@@ -12,7 +13,7 @@ from pathlib import Path
 import aiohttp
 
 
-async def main():
+async def main(base_url: str, output: Path):
     root = Path(__file__).resolve().parents[2]
     cache = root / ".run/gsm8k-data"
     cache.mkdir(parents=True, exist_ok=True)
@@ -42,7 +43,7 @@ async def main():
                     "stop": ["Question", "Assistant:", "<|separator|>"],
                 }
                 async with session.post(
-                    "http://127.0.0.1:18029/v1/chat/completions", json=payload
+                    f"{base_url.rstrip('/')}/chat/completions", json=payload
                 ) as response:
                     response.raise_for_status()
                     result = await response.json()
@@ -65,9 +66,18 @@ async def main():
             for i in range(len(prompts))
         ],
     }
-    (root / ".run/gsm8k-16.json").write_text(json.dumps(report, indent=2))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2))
     print(json.dumps(metrics, indent=2), flush=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", default="http://127.0.0.1:18029/v1")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path(__file__).resolve().parents[2] / ".run/gsm8k-16.json",
+    )
+    args = parser.parse_args()
+    asyncio.run(main(args.base_url, args.output))

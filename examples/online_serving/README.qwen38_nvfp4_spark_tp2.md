@@ -25,6 +25,44 @@ An additional regression test exercises actual PLE construction and loading on
 both TP ranks, including checkpoint shards crossing a TP boundary. With the
 original rc4 implementation, both ranks reproduce the missing-scale exception.
 
+### NVIDIA mixed-precision MTP checkpoint
+
+`nvidia/Qwen3.8-Flash-Next-NVFP4` also quantizes the MTP routed experts,
+using blockwise FP8 (`FP8_PB_WO`, also named `FP8_BLOCK_SCALES`). Its
+`weight_scale_inv` tensors use 128-by-128 blocks. The draft quantization map
+must follow the runtime layer offset from `mtp.layers.0` to `mtp.layers.48`;
+otherwise those experts are constructed without their scale parameters.
+
+The loader selects the existing blockwise FP8 MoE implementation for these
+experts. TP2 splits the 640-wide intermediate dimension at 320, inside a
+checkpoint block. Lossless scale refinement to 64-by-64 blocks preserves the
+original weights and dequantization values across that boundary.
+
+The launcher selects the draft MoE backend independently, defaulting to
+`MTP_MOE_BACKEND=auto`, while the NVFP4 target retains FlashInfer CUTLASS.
+The V2 runner now honors this existing speculative configuration option.
+Use `MODEL_PATH="$HOME/models/nvidia/Qwen3.8-Flash-Next-NVFP4"` on both
+nodes; MTP remains enabled with two draft tokens. These changes require a
+restart on both nodes, with no rebuild of vLLM's compiled extensions.
+
+Validation on two GB10s on 2026-09-09 passed 18 configuration/loading
+regressions and six TP2/TP4 Triton numerical cases. Full NVIDIA checkpoint
+startup completed with TP2, MTP2, 512K context and decode CUDA Graphs.
+Programming output, image recognition, automatic tool selection and tool-result
+follow-up passed;
+both draft positions recorded accepted tokens. The fixed GSM8K first-16,
+5-shot chat evaluation scored 15/16 with zero invalid responses. This small
+sample is a serving regression check, not a broad accuracy or speed claim.
+
+Reproduce the quality check against an isolated API port without overwriting
+the default evaluation report:
+
+```bash
+.venv/bin/python examples/online_serving/qwen38_nvfp4_spark_eval.py \
+  --base-url http://127.0.0.1:18039/v1 \
+  --output .run/nvidia-mtp-fix-gsm8k-16.json
+```
+
 ## Isolated installation
 
 Use a separate worktree and environment on each Spark. The existing checkout,
