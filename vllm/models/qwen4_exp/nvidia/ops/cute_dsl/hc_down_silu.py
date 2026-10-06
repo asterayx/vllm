@@ -167,6 +167,14 @@ class HcDownSiluGemm:
 
 
 @lru_cache
+def is_hc_down_silu_supported() -> bool:
+    """The split-K configs rely on SM90/SM100 cluster and smem budgets."""
+    return current_platform.has_device_capability(
+        90
+    ) and not current_platform.is_device_capability_family(120)
+
+
+@lru_cache
 def _get_kernel(
     rank: int, hc: int, k: int, prefetch_pdl_weights: bool = False
 ) -> HcDownSiluGemm:
@@ -209,7 +217,7 @@ def request_hc_down_silu_warmup(
         k: Input feature size.
 
     """
-    if not current_platform.has_device_capability(90) or k % 8 != 0:
+    if not is_hc_down_silu_supported() or k % 8 != 0:
         return
     m_set = {int(m) for m in m_values if 1 <= m <= MAX_FUSED_M}
     # M=1 dispatches to the weight-prefetching PDL variant.
@@ -220,5 +228,6 @@ def request_hc_down_silu_warmup(
 __all__ = [
     "MAX_FUSED_M",
     "hc_down_silu",
+    "is_hc_down_silu_supported",
     "request_hc_down_silu_warmup",
 ]

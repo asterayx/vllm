@@ -401,8 +401,11 @@ def _prefill_logits(
         num_queries, logits_width
     )
 
-    # tuned on GB300
-    if k_cache.dtype == torch.float8_e4m3fn:
+    # tuned on GB300; sm_12x has ~99 KB smem/block, too little for TILE_R=64 bf16
+    if (
+        k_cache.dtype == torch.float8_e4m3fn
+        or current_platform.is_device_capability_family(120)
+    ):
         TILE_R, STAGES, num_warps = 32, 2, 8
     else:
         TILE_R, STAGES, num_warps = 64, 2, 4

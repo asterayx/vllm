@@ -18,8 +18,8 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 
 @lru_cache(maxsize=1)
 def _is_sm120() -> bool:
-    """True on sm_120 (RTX PRO 6000 Blackwell): selects the sm_120 tuning table."""
-    return current_platform.get_device_capability() == (12, 0)
+    """True on sm_12x (RTX PRO Blackwell, GB10): selects the sm_120 tuning table."""
+    return current_platform.is_device_capability_family(120)
 
 
 @lru_cache(maxsize=1)
