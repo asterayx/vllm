@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Serve Qwen3.8-Flash-Next on RTX PRO 5000 Blackwell (sm_120, 48 GB) GPUs.
+# Serve Qwen3.8-Flash-Next on RTX PRO 5000 Blackwell (sm_120, 48/72 GB) GPUs.
 #
 # NVFP4 checkpoint footprint (512 experts x 48 layers):
 #   GPU:  ~68 GB NVFP4 routed experts + ~10 GB bf16 dense/embeddings
 #         + ~2.5 GB FP8 MTP experts + ~1 GB vision  => ~80 GB total
 #   Host: ~51 GB FP8 n-gram (PLE) table in pinned memory, sharded across TP
-# TP=2 leaves only a few GB per card for KV cache and CUDA graphs; TP=4 is
-# comfortable.
+# 48 GB cards: TP=2 is tight, prefer TP=4. 72 GB cards: TP=2 fits easily;
+# TP=4 leaves the most KV cache.
 #
 # Usage:
 #   MODEL=~/models/nvidia/Qwen3.8-Flash-Next-NVFP4 TP=2 ./qwen3_8_flash_next_rtx_pro_5000.sh
