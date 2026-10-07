@@ -1211,7 +1211,7 @@ def test_b12x_moe_matches_torch(
 
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
 @pytest.mark.parametrize("intermediate_size", [128, 160, 192, 256])
-@pytest.mark.parametrize("tokens", [1, 2, 3, 4, 8, 16])
+@pytest.mark.parametrize("tokens", [1, 2, 3, 4, 8, 16, 24, 32, 48, 64, 96, 128])
 @torch.inference_mode()
 def test_b12x_nvfp4_moe_small_batch_unaligned_intermediate(
     intermediate_size: int, tokens: int, workspace_init
