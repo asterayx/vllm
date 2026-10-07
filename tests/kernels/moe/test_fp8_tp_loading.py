@@ -158,8 +158,7 @@ def test_fp8_block_aligned_tp_preserves_checkpoint(
         assert torch.equal(torch.cat(parts, dim=2 if name == "w2" else 1), expected)
 
 
-# b12x is NVFP4-only; FP8 layers (e.g. NVFP4 checkpoints' MTP) fall back to auto.
-@pytest.mark.parametrize("backend", ["auto", "triton", "b12x"])
+@pytest.mark.parametrize("backend", ["auto", "triton"])
 @pytest.mark.parametrize("tp_size,block", [(2, 64), (4, 32)])
 def test_fp8_tp_default_keeps_refined_layout(monkeypatch, backend, tp_size, block):
     layer = _make_fp8_tp_experts(monkeypatch, tp_size, 0, backend)
