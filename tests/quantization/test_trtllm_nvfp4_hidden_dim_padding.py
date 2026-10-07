@@ -158,3 +158,54 @@ def test_align_trtllm_fp4_moe_intermediate_pads_gate_and_up_separately():
     torch.testing.assert_close(out_w2_scale[:, :, : intermediate // 16], w2_scale)
     assert torch.count_nonzero(out_w2[:, :, intermediate // 2 :]) == 0
     assert torch.count_nonzero(out_w2_scale[:, :, intermediate // 16 :]) == 0
+
+
+def test_cutlass_fp4_moe_pads_gate_and_up_separately(monkeypatch):
+    # Qwen3.8-Flash-Next at TP4: intermediate 160 is not 64-aligned, so the
+    # 128-row scale swizzle used to reject the fused [gate, up] weights.
+    monkeypatch.setattr(flashinfer_fp4_moe, "swizzle_blockscale", lambda x: x)
+
+    num_experts, intermediate, padded_intermediate, hidden_dim = 2, 160, 192, 32
+    layer = SimpleNamespace(
+        activation=SimpleNamespace(is_gated=True),
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(enable_eplb=False),
+            intermediate_size_per_partition=intermediate,
+        ),
+    )
+    gate = torch.ones((num_experts, intermediate, hidden_dim // 2), dtype=torch.uint8)
+    w13 = torch.cat((gate, torch.full_like(gate, 2)), dim=1)
+    w13_scale = torch.ones(
+        (num_experts, 2 * intermediate, hidden_dim // 16), dtype=torch.float8_e4m3fn
+    )
+    w2 = torch.full((num_experts, hidden_dim, intermediate // 2), 5, dtype=torch.uint8)
+    w2_scale = torch.ones(
+        (num_experts, hidden_dim, intermediate // 16), dtype=torch.float8_e4m3fn
+    )
+    weight_scale = torch.ones(num_experts)
+
+    out_w13, _, _, _, out_w2, out_w2_scale, _, _ = (
+        prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+            backend=NvFp4MoeBackend.VLLM_CUTLASS,
+            layer=layer,
+            w13=w13,
+            w13_scale=w13_scale,
+            w13_scale_2=weight_scale,
+            a13_scale=torch.ones((num_experts, 2)),
+            w2=w2,
+            w2_scale=w2_scale,
+            w2_scale_2=weight_scale,
+            a2_scale=torch.ones(num_experts),
+            is_act_and_mul=True,
+        )
+    )
+
+    assert out_w13.shape == (num_experts, 2 * padded_intermediate, hidden_dim // 2)
+    assert torch.all(out_w13[:, :intermediate] == 1)
+    assert torch.all(out_w13[:, intermediate:padded_intermediate] == 0)
+    up_end = padded_intermediate + intermediate
+    assert torch.all(out_w13[:, padded_intermediate:up_end] == 2)
+    assert torch.all(out_w13[:, up_end:] == 0)
+    assert out_w2.shape == (num_experts, hidden_dim, padded_intermediate // 2)
+    assert out_w2_scale.shape == (num_experts, hidden_dim, padded_intermediate // 16)
+    assert layer.moe_config.intermediate_size_per_partition == padded_intermediate

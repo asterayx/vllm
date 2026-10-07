@@ -404,6 +404,17 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
             is_gated_activation=is_gated,
         )
     else:
+        # swizzle_blockscale pads w13 rows to 128, which would split a fused
+        # [gate, up] whose halves are not 64-aligned (e.g. 640 at TP4 = 160).
+        # Pad each half separately instead; zero rows leave outputs unchanged.
+        if is_act_and_mul:
+            w13, w13_scale, w2, w2_scale, padded_intermediate = (
+                align_fp4_moe_weights_for_fi(
+                    w13, w13_scale, w2, w2_scale, is_act_and_mul, min_alignment=64
+                )
+            )
+            layer.moe_config.intermediate_size_per_partition = padded_intermediate
+
         # Swizzle the block scales for other FI NVFP4 MoE kernels.
         w13_scale = swizzle_blockscale(w13_scale)
 

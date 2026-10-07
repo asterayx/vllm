@@ -6,8 +6,7 @@
 #         + ~2.5 GB FP8 MTP experts + ~1 GB vision  => ~80 GB total
 #   Host: ~51 GB FP8 n-gram (PLE) table in pinned memory, sharded across TP
 # 48 GB cards: TP=2 is tight, prefer TP=4. 72 GB cards: TP=2 fits easily;
-# TP=4 leaves the most KV cache, but needs EP=1: at TP=4 the per-rank NVFP4
-# MoE intermediate (160) needs w1/w3 padding the CUTLASS backend lacks.
+# TP=4 leaves the most KV cache.
 #
 # Usage:
 #   MODEL=~/models/nvidia/Qwen3.8-Flash-Next-NVFP4 TP=2 ./qwen3_8_flash_next_rtx_pro_5000.sh
