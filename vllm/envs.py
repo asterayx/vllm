@@ -272,6 +272,7 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC: bool = False
+    VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS: int = 0
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1920,6 +1921,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # integration is being qualified.
     "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", "0"))
+    ),
+    # Largest token count routed to the FlashInfer PCIe IPC all-reduce; larger
+    # all-reduces fall through to the next backend. 0 covers every CUDA graph
+    # capture size.
+    "VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS", "0")
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(

@@ -21,6 +21,8 @@
 #   NCCL_LL=1     # PCIe-only, multi-socket hosts: P2P across sockets plus the LL
 #                 # protocol for decode-sized TP all-reduce (nccl_ll_tuner.c,
 #                 # built with gcc on first use; LL_TUNER_MAX_BYTES sets the cutoff)
+#   PCIE_IPC=1    # FlashInfer PCIe IPC all-reduce for small decode batches;
+#                 # VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS caps the tokens
 set -euo pipefail
 
 MODEL=${MODEL:-nvidia/Qwen3.8-Flash-Next-NVFP4}
@@ -58,6 +60,9 @@ if [[ "${NCCL_LL:-0}" == "1" ]]; then
     fi
     export NCCL_P2P_LEVEL=${NCCL_P2P_LEVEL:-SYS}
     export NCCL_TUNER_PLUGIN=$tuner
+fi
+if [[ "${PCIE_IPC:-0}" == "1" ]]; then
+    export VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1
 fi
 if [[ "${SPEC:-0}" != "0" ]]; then
     extra+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $SPEC, \"moe_backend\": \"${SPEC_MOE:-auto}\"}")

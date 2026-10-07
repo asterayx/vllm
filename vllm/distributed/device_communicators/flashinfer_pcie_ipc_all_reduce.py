@@ -17,6 +17,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+import vllm.envs as envs
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -56,6 +57,7 @@ class FlashInferPcieIpcAllReduce:
         self.workspace: Any | None = None
         self.hidden_dim = 0
         self.dtype: torch.dtype | None = None
+        self.max_tokens = 0
 
         if not _pcie_ipc_available:
             logger.warning_once(
@@ -112,7 +114,16 @@ class FlashInferPcieIpcAllReduce:
             self.disabled = True
             return
 
-        batches = tuple(sorted({int(size) for size in capture_sizes if size > 0}))
+        token_limit = envs.VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS
+        batches = tuple(
+            sorted(
+                {
+                    int(size)
+                    for size in capture_sizes
+                    if size > 0 and (token_limit <= 0 or size <= token_limit)
+                }
+            )
+        )
         if not batches:
             logger.warning_once(
                 "FlashInfer PCIe IPC all-reduce has no CUDA Graph capture sizes "
@@ -123,6 +134,7 @@ class FlashInferPcieIpcAllReduce:
 
         self.hidden_dim = int(hidden_dim)
         self.dtype = dtype
+        self.max_tokens = batches[-1]
         max_numel = batches[-1] * self.hidden_dim
         workspace = flashinfer_comm.PcieIpcAllReduceWorkspace(
             group=self.group,
@@ -163,6 +175,7 @@ class FlashInferPcieIpcAllReduce:
             and inp.is_cuda
             and inp.is_contiguous()
             and inp.dim() == 2
+            and inp.shape[0] <= self.max_tokens
             and inp.shape[1] == self.hidden_dim
             and inp.dtype == self.dtype
             and workspace.supports(inp)

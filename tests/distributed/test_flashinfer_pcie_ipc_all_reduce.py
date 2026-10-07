@@ -27,6 +27,7 @@ def _uninitialized_comm() -> pcie_ipc.FlashInferPcieIpcAllReduce:
     comm.workspace = None
     comm.hidden_dim = 0
     comm.dtype = None
+    comm.max_tokens = 0
     return comm
 
 
@@ -65,6 +66,39 @@ def test_setup_uses_exact_graph_capacity(monkeypatch, tmp_path):
     assert workspace.rebind_stream.call_count == 2
 
 
+def test_setup_skips_capture_sizes_above_token_limit(monkeypatch, tmp_path):
+    """Batches above the limit stay on the next all-reduce backend."""
+    workspace = Mock()
+    monkeypatch.setattr(
+        pcie_ipc,
+        "flashinfer_comm",
+        SimpleNamespace(PcieIpcAllReduceWorkspace=Mock(return_value=workspace)),
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", Mock())
+    monkeypatch.setenv("VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS", "16")
+
+    comm = _uninitialized_comm()
+    comm.setup(
+        hidden_dim=4096,
+        dtype=torch.bfloat16,
+        capture_sizes=[8, 16, 24, 32],
+        tune_cache=tmp_path / "tp4.json",
+    )
+
+    workspace.prepare.assert_called_once_with(
+        [(8, 4096), (16, 4096)], dtype=torch.bfloat16
+    )
+    workspace.supports.return_value = True
+    inp = SimpleNamespace(
+        is_cuda=True,
+        is_contiguous=lambda: True,
+        dim=lambda: 2,
+        dtype=torch.bfloat16,
+    )
+    assert comm.should_use(SimpleNamespace(**vars(inp), shape=(16, 4096)))
+    assert not comm.should_use(SimpleNamespace(**vars(inp), shape=(24, 4096)))
+
+
 @pytest.mark.parametrize(
     ("shape", "dtype", "contiguous", "expected"),
     [
@@ -78,6 +112,7 @@ def test_should_use_only_prepared_hidden_shape(shape, dtype, contiguous, expecte
     comm = _uninitialized_comm()
     comm.hidden_dim = 4096
     comm.dtype = torch.bfloat16
+    comm.max_tokens = 16
     comm.workspace = Mock()
     comm.workspace.supports.return_value = True
     inp = SimpleNamespace(
