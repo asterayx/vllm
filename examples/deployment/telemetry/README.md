@@ -40,7 +40,7 @@ then the second factor, not the only one.
 
 Variables:
 
-- `DCGM_EXPORTER_IMAGE`: dcgm-exporter image; pick a current tag from NGC if
+- `DCGM_EXPORTER_IMAGE`: dcgm-exporter image; pick a current tag from Docker Hub `nvidia/dcgm-exporter` (or NGC) if
   the default does not support your driver.
 - `ROCE_NETDEV_REGEX`: netdevs for the ethtool collector (default
   `^(ens2f|ens16f).*`). The dashboard's `netdev` variable lists the same names.

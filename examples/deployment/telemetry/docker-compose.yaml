@@ -69,10 +69,10 @@ services:
     restart: unless-stopped
 
   dcgm-exporter:
-    image: ${DCGM_EXPORTER_IMAGE:-nvcr.io/nvidia/k8s/dcgm-exporter:4.6.0-4.8.3-ubuntu22.04}
+    image: ${DCGM_EXPORTER_IMAGE:-nvidia/dcgm-exporter:4.6.1-4.8.4-distroless}
     network_mode: host
     cap_add: [SYS_ADMIN]
-    command: ["dcgm-exporter", "-a", "127.0.0.1:9400", "-f", "/etc/dcgm-exporter/counters.csv"]
+    command: ["-a", "127.0.0.1:9400", "-f", "/etc/dcgm-exporter/counters.csv"]
     volumes:
       - ./dcgm-counters.csv:/etc/dcgm-exporter/counters.csv:ro
     deploy:
