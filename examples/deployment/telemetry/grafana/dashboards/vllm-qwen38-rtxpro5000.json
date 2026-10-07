@@ -539,13 +539,13 @@
     },
     {
       "type": "timeseries",
-      "title": "Finished requests by reason",
+      "title": "Average time per request",
       "id": 12,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "",
+      "description": "Mean seconds per finished request over a 5-minute window.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -558,15 +558,45 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (finished_reason) (rate(vllm:request_success_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "{{finished_reason}}",
+          "expr": "sum(rate(vllm:e2e_request_latency_seconds_sum{model_name=~\"$model\"}[5m])) / sum(rate(vllm:e2e_request_latency_seconds_count{model_name=~\"$model\"}[5m]))",
+          "legendFormat": "end-to-end",
           "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(vllm:request_queue_time_seconds_sum{model_name=~\"$model\"}[5m])) / sum(rate(vllm:request_queue_time_seconds_count{model_name=~\"$model\"}[5m]))",
+          "legendFormat": "queue",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(vllm:request_prefill_time_seconds_sum{model_name=~\"$model\"}[5m])) / sum(rate(vllm:request_prefill_time_seconds_count{model_name=~\"$model\"}[5m]))",
+          "legendFormat": "prefill",
+          "refId": "C",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(vllm:request_decode_time_seconds_sum{model_name=~\"$model\"}[5m])) / sum(rate(vllm:request_decode_time_seconds_count{model_name=~\"$model\"}[5m]))",
+          "legendFormat": "decode",
+          "refId": "D",
           "range": true
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps",
+          "unit": "s",
           "custom": {
             "lineWidth": 1,
             "fillOpacity": 10,
@@ -602,7 +632,7 @@
       "description": "Decode speed a single user sees.",
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 14
       },
@@ -656,9 +686,68 @@
       }
     },
     {
+      "type": "timeseries",
+      "title": "Finished requests per 5 min by reason",
+      "id": 14,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "stop = normal end, length = hit max_tokens, abort = client disconnected.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 14
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (finished_reason) (increase(vllm:request_success_total{model_name=~\"$model\"}[5m]))",
+          "legendFormat": "{{finished_reason}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "showPoints": "never",
+            "drawStyle": "bars",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "interval": "5m"
+    },
+    {
       "type": "heatmap",
       "title": "Tokens per engine step",
-      "id": 14,
+      "id": 15,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -666,8 +755,8 @@
       "description": "Batch size distribution per step: small = decode (3 tokens/request with MTP 2), large = prefill chunks.",
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
+        "w": 8,
+        "x": 16,
         "y": 14
       },
       "targets": [
@@ -693,7 +782,7 @@
     {
       "type": "row",
       "title": "Latency",
-      "id": 15,
+      "id": 16,
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -706,7 +795,7 @@
     {
       "type": "timeseries",
       "title": "Time to first token",
-      "id": 16,
+      "id": 17,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -780,7 +869,7 @@
     {
       "type": "timeseries",
       "title": "Time per output token (TPOT)",
-      "id": 17,
+      "id": 18,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -854,7 +943,7 @@
     {
       "type": "timeseries",
       "title": "Inter-token latency (per step)",
-      "id": 18,
+      "id": 19,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -928,7 +1017,7 @@
     {
       "type": "timeseries",
       "title": "End-to-end request latency",
-      "id": 19,
+      "id": 20,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1002,7 +1091,7 @@
     {
       "type": "timeseries",
       "title": "Queue time",
-      "id": 20,
+      "id": 21,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1076,7 +1165,7 @@
     {
       "type": "timeseries",
       "title": "Prefill vs decode time (p50 / p99)",
-      "id": 21,
+      "id": 22,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1160,7 +1249,7 @@
     {
       "type": "row",
       "title": "Scheduler & KV cache",
-      "id": 22,
+      "id": 23,
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -1173,7 +1262,7 @@
     {
       "type": "timeseries",
       "title": "Requests",
-      "id": 23,
+      "id": 24,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1237,7 +1326,7 @@
     {
       "type": "timeseries",
       "title": "KV cache usage",
-      "id": 24,
+      "id": 25,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1291,7 +1380,7 @@
     {
       "type": "timeseries",
       "title": "Prefix cache hit rate & preemptions",
-      "id": 25,
+      "id": 26,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1355,7 +1444,7 @@
     {
       "type": "row",
       "title": "Speculative decoding (MTP)",
-      "id": 26,
+      "id": 27,
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -1368,7 +1457,7 @@
     {
       "type": "timeseries",
       "title": "Acceptance rate & length",
-      "id": 27,
+      "id": 28,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1432,7 +1521,7 @@
     {
       "type": "timeseries",
       "title": "Per-position acceptance",
-      "id": 28,
+      "id": 29,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1486,7 +1575,7 @@
     {
       "type": "row",
       "title": "Request shape",
-      "id": 29,
+      "id": 30,
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -1499,7 +1588,7 @@
     {
       "type": "timeseries",
       "title": "Prompt length",
-      "id": 30,
+      "id": 31,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1573,7 +1662,7 @@
     {
       "type": "timeseries",
       "title": "Generation length",
-      "id": 31,
+      "id": 32,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1647,7 +1736,7 @@
     {
       "type": "row",
       "title": "GPU (DCGM)",
-      "id": 32,
+      "id": 33,
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -1660,7 +1749,7 @@
     {
       "type": "timeseries",
       "title": "GPU utilization",
-      "id": 33,
+      "id": 34,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1714,7 +1803,7 @@
     {
       "type": "timeseries",
       "title": "Tensor pipe active",
-      "id": 34,
+      "id": 35,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1768,7 +1857,7 @@
     {
       "type": "timeseries",
       "title": "DRAM active",
-      "id": 35,
+      "id": 36,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1822,7 +1911,7 @@
     {
       "type": "timeseries",
       "title": "Memory used",
-      "id": 36,
+      "id": 37,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1876,7 +1965,7 @@
     {
       "type": "timeseries",
       "title": "Power",
-      "id": 37,
+      "id": 38,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1930,7 +2019,7 @@
     {
       "type": "timeseries",
       "title": "SM clock",
-      "id": 38,
+      "id": 39,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1984,7 +2073,7 @@
     {
       "type": "timeseries",
       "title": "Temperature",
-      "id": 39,
+      "id": 40,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2038,7 +2127,7 @@
     {
       "type": "timeseries",
       "title": "PCIe throughput",
-      "id": 40,
+      "id": 41,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2102,7 +2191,7 @@
     {
       "type": "row",
       "title": "Host",
-      "id": 41,
+      "id": 42,
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -2115,7 +2204,7 @@
     {
       "type": "timeseries",
       "title": "CPU busy",
-      "id": 42,
+      "id": 43,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2169,7 +2258,7 @@
     {
       "type": "timeseries",
       "title": "Memory",
-      "id": 43,
+      "id": 44,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2233,7 +2322,7 @@
     {
       "type": "timeseries",
       "title": "NUMA node memory used",
-      "id": 44,
+      "id": 45,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2287,7 +2376,7 @@
     {
       "type": "row",
       "title": "RoCE (CX7)",
-      "id": 45,
+      "id": 46,
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -2300,7 +2389,7 @@
     {
       "type": "timeseries",
       "title": "RDMA throughput",
-      "id": 46,
+      "id": 47,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2364,7 +2453,7 @@
     {
       "type": "timeseries",
       "title": "RDMA packets",
-      "id": 47,
+      "id": 48,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2428,7 +2517,7 @@
     {
       "type": "timeseries",
       "title": "Port errors & discards",
-      "id": 48,
+      "id": 49,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2482,7 +2571,7 @@
     {
       "type": "timeseries",
       "title": "Congestion (CNP / ECN)",
-      "id": 49,
+      "id": 50,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2536,7 +2625,7 @@
     {
       "type": "timeseries",
       "title": "Retransmits & sequence errors",
-      "id": 50,
+      "id": 51,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2590,7 +2679,7 @@
     {
       "type": "timeseries",
       "title": "PFC pause frames",
-      "id": 51,
+      "id": 52,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2644,7 +2733,7 @@
     {
       "type": "timeseries",
       "title": "Physical port bytes (incl. RDMA)",
-      "id": 52,
+      "id": 53,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2708,7 +2797,7 @@
     {
       "type": "stat",
       "title": "Port state",
-      "id": 53,
+      "id": 54,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -2753,7 +2842,7 @@
     {
       "type": "stat",
       "title": "Link rate",
-      "id": 54,
+      "id": 55,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
