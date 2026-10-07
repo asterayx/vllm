@@ -1210,13 +1210,13 @@ def test_b12x_moe_matches_torch(
 
 
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
-@pytest.mark.parametrize("intermediate_size", [128, 160, 192, 256])
+@pytest.mark.parametrize("intermediate_size", [128, 160, 192, 256, 320])
 @pytest.mark.parametrize("tokens", [1, 2, 3, 4, 8, 16, 24, 32, 48, 64, 96, 128])
 @torch.inference_mode()
 def test_b12x_nvfp4_moe_small_batch_unaligned_intermediate(
     intermediate_size: int, tokens: int, workspace_init
 ) -> None:
-    # Qwen3.8-Flash-Next at TP4: 640 / 4 = 160 per rank; 192 gave NaNs here.
+    # Qwen3.8-Flash-Next at TP4: 640 / 4 = 160 per rank, padded to 192 for b12x.
     # Small token counts take the micro-kernel path used by decode CUDA graphs.
     with set_current_vllm_config(
         VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))

@@ -30,9 +30,7 @@ def _pad_gated_weights(
     if w2_scale.size(2) * 16 != half_size:
         raise ValueError("w2 scale shape does not match gated w13")
 
-    # The b12x micro kernel (small token counts) returns NaNs for halves that
-    # are 64- but not 128-aligned, e.g. 192 from Qwen3.8-Flash-Next at TP4.
-    half_pad_size = round_up(half_size, 128) - half_size
+    half_pad_size = round_up(half_size, 64) - half_size
     if half_pad_size == 0:
         return w13, w13_scale, w2, w2_scale
 

@@ -14,6 +14,7 @@
 #   TEXT_ONLY=1   # skip the vision tower (--language-model-only)
 #   EP=1          # shard experts instead of their intermediate dim
 #   SPEC=2        # MTP speculative decoding with 2 draft tokens
+#   --moe-backend b12x  # needs b12x>=1.5.0 at TP4 (160 per rank, padded to 192)
 #   SPEC_MOE=auto # MoE backend for the FP8 MTP layer (not inherited from
 #                 # --moe-backend, which may be NVFP4-only, e.g. b12x)
 set -euo pipefail
