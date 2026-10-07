@@ -17,8 +17,26 @@ Requires Docker with the NVIDIA Container Toolkit.
 cd examples/deployment/telemetry
 GRAFANA_ADMIN_PASSWORD=<password> docker compose up -d
 # Grafana listens on 127.0.0.1 by default; GRAFANA_ADDR=0.0.0.0 exposes it on the LAN.
-ssh -L 3000:127.0.0.1:3000 <server>   # then open http://localhost:3000
+ssh -L 3000:127.0.0.1:3000 <server>   # then open http://localhost:3000/telemetry/
 ```
+
+Grafana is served under `/telemetry/`. To publish it through the same
+Cloudflare tunnel as the API, start it with the public URL and add an ingress
+rule before the catch-all:
+
+```bash
+GRAFANA_ROOT_URL=https://t.example.com/telemetry/ GRAFANA_COOKIE_SECURE=true \
+GRAFANA_ADMIN_PASSWORD=<password> docker compose up -d
+```
+
+```yaml
+  - hostname: t.example.com
+    path: ^/telemetry(/|$)
+    service: http://127.0.0.1:3000
+```
+
+Put a Cloudflare Access application on that path as well; Grafana's login is
+then the second factor, not the only one.
 
 Variables:
 
