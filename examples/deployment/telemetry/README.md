@@ -8,7 +8,7 @@ Prometheus + Grafana stack for `../qwen3_8_flash_next_rtx_pro_5000.sh`:
 | dcgm-exporter | 9400 | GPU util, tensor/DRAM activity, memory, power, clocks, PCIe |
 | node-exporter | 9100 | CPU, memory per NUMA node, RDMA port counters, mlx5 ethtool (PFC pause, `*_bytes_phy`) |
 | roce-hw-counters | (textfile) | RoCE `hw_counters`: CNP/ECN, retransmits, sequence errors |
-| Prometheus | 9090 | 30-day retention (`PROM_RETENTION`) |
+| Prometheus | 19090 (`PROM_PORT`) | 30-day retention (`PROM_RETENTION`) |
 | Grafana | 3000 | dashboard "vLLM · Qwen3.8-Flash-Next · RTX PRO 5000" |
 
 Requires Docker with the NVIDIA Container Toolkit.
