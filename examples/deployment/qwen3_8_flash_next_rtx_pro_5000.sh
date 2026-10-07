@@ -14,6 +14,8 @@
 #   TEXT_ONLY=1   # skip the vision tower (--language-model-only)
 #   EP=1          # shard experts instead of their intermediate dim
 #   SPEC=2        # MTP speculative decoding with 2 draft tokens
+#   SPEC_MOE=auto # MoE backend for the FP8 MTP layer (not inherited from
+#                 # --moe-backend, which may be NVFP4-only, e.g. b12x)
 set -euo pipefail
 
 MODEL=${MODEL:-nvidia/Qwen3.8-Flash-Next-NVFP4}
@@ -40,7 +42,7 @@ if [[ "${EP:-0}" == "1" ]]; then
     extra+=(--enable-expert-parallel)
 fi
 if [[ "${SPEC:-0}" != "0" ]]; then
-    extra+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $SPEC}")
+    extra+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $SPEC, \"moe_backend\": \"${SPEC_MOE:-auto}\"}")
 fi
 
 # Without NVLink, P2P over PCIe can hang on some boards; set NCCL_P2P_DISABLE=1
