@@ -17,6 +17,10 @@
 #   --moe-backend b12x  # needs b12x>=1.5.0 at TP4 (160 per rank, padded to 192)
 #   SPEC_MOE=auto # MoE backend for the FP8 MTP layer (not inherited from
 #                 # --moe-backend, which may be NVFP4-only, e.g. b12x)
+#   NUMA=1        # bind each GPU worker (and its PLE table shard) to its NUMA node
+#   NCCL_LL=1     # PCIe-only, multi-socket hosts: P2P across sockets plus the LL
+#                 # protocol for decode-sized TP all-reduce (nccl_ll_tuner.c,
+#                 # built with gcc on first use; LL_TUNER_MAX_BYTES sets the cutoff)
 set -euo pipefail
 
 MODEL=${MODEL:-nvidia/Qwen3.8-Flash-Next-NVFP4}
@@ -41,6 +45,19 @@ if [[ "${TEXT_ONLY:-0}" == "1" ]]; then
 fi
 if [[ "${EP:-0}" == "1" ]]; then
     extra+=(--enable-expert-parallel)
+fi
+if [[ "${NUMA:-0}" == "1" ]]; then
+    extra+=(--numa-bind)
+fi
+if [[ "${NCCL_LL:-0}" == "1" ]]; then
+    src="$(dirname "$0")/nccl_ll_tuner.c"
+    tuner="${XDG_CACHE_HOME:-$HOME/.cache}/vllm/libnccl_ll_tuner.so"
+    if [[ ! -f "$tuner" || "$src" -nt "$tuner" ]]; then
+        mkdir -p "$(dirname "$tuner")"
+        gcc -fPIC -shared -O2 -o "$tuner" "$src"
+    fi
+    export NCCL_P2P_LEVEL=${NCCL_P2P_LEVEL:-SYS}
+    export NCCL_TUNER_PLUGIN=$tuner
 fi
 if [[ "${SPEC:-0}" != "0" ]]; then
     extra+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $SPEC, \"moe_backend\": \"${SPEC_MOE:-auto}\"}")
