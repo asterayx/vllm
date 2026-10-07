@@ -1003,9 +1003,12 @@ def _make_b12x_moe_case(
     activation: MoEActivation = MoEActivation.SILU,
     tokens: int = 16,
     seed: int = 19,
+    num_experts: int = 4,
+    hidden_size: int = 512,
+    intermediate_size: int = 128,
+    topk: int = 2,
 ) -> _B12xMoeCase:
     set_random_seed(seed)
-    num_experts, hidden_size, intermediate_size = 4, 512, 128
     dtype = torch.bfloat16
     hidden_states = torch.randn((tokens, hidden_size), device="cuda", dtype=dtype) / 10
     w1_rows = 2 * intermediate_size if activation.is_gated else intermediate_size
@@ -1117,6 +1120,7 @@ def _make_b12x_moe_case(
         quant_config=quant_config,
         activation=activation,
         activation_dtype=activation_dtype,
+        topk=topk,
     )
 
 
@@ -1201,6 +1205,56 @@ def test_b12x_moe_matches_torch(
         output.flatten().float(),
         reference.flatten().float(),
         dim=0,
+    )
+    assert cosine > 0.99
+
+
+@pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
+@pytest.mark.parametrize("intermediate_size", [128, 160, 256])
+@pytest.mark.parametrize("tokens", [1, 2, 3, 4, 8, 16])
+@torch.inference_mode()
+def test_b12x_nvfp4_moe_small_batch_unaligned_intermediate(
+    intermediate_size: int, tokens: int, workspace_init
+) -> None:
+    # Qwen3.8-Flash-Next at TP4: 640 / 4 = 160 per rank, padded to 192 for b12x.
+    # Small token counts take the micro-kernel path used by decode CUDA graphs.
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        case = _make_b12x_moe_case(
+            "nvfp4",
+            "nvfp4",
+            tokens=tokens,
+            num_experts=64,
+            hidden_size=2560,
+            intermediate_size=intermediate_size,
+            topk=10,
+        )
+        topk_weights, topk_ids, _ = fused_topk(
+            case.hidden_states, case.score, case.topk, renormalize=False
+        )
+        reference = _nvfp4_activation_reference(
+            case.hidden_states,
+            case.w1_ref,
+            case.w2_ref,
+            topk_weights,
+            topk_ids,
+            case.quant_config.a1_gscale,
+            case.quant_config.a2_gscale,
+        )
+        output = _run_b12x_moe(
+            case.hidden_states,
+            case.w1,
+            case.w2,
+            case.score,
+            case.topk,
+            case.activation,
+            case.quant_config,
+        )
+        torch.accelerator.synchronize()
+
+    cosine = torch.nn.functional.cosine_similarity(
+        output.flatten().float(), reference.flatten().float(), dim=0
     )
     assert cosine > 0.99
 
