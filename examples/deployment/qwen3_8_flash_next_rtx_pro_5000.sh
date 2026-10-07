@@ -13,6 +13,7 @@
 #   CHECK=1 ...   # run the sm_120-relevant kernel tests first
 #   TEXT_ONLY=1   # skip the vision tower (--language-model-only)
 #   EP=1          # shard experts instead of their intermediate dim
+#   SPEC=2        # MTP speculative decoding with 2 draft tokens
 set -euo pipefail
 
 MODEL=${MODEL:-nvidia/Qwen3.8-Flash-Next-NVFP4}
@@ -37,6 +38,9 @@ if [[ "${TEXT_ONLY:-0}" == "1" ]]; then
 fi
 if [[ "${EP:-0}" == "1" ]]; then
     extra+=(--enable-expert-parallel)
+fi
+if [[ "${SPEC:-0}" != "0" ]]; then
+    extra+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $SPEC}")
 fi
 
 # Without NVLink, P2P over PCIe can hang on some boards; set NCCL_P2P_DISABLE=1
