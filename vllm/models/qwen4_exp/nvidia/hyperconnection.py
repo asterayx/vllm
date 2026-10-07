@@ -31,16 +31,13 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.platforms import current_platform
 
 from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
-from .ops.cute_dsl.hc_down_silu import (
-    MAX_FUSED_M,
-    hc_down_silu,
-    is_hc_down_silu_supported,
-)
+from .ops.cute_dsl.hc_down_silu import MAX_FUSED_M, hc_down_silu
 from .ops.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,
@@ -115,7 +112,7 @@ class GatedResidual(nn.Module):
             self._use_hc_down_silu = (
                 weight.shape[1] % 8 == 0
                 and weight.dtype == torch.bfloat16
-                and is_hc_down_silu_supported()
+                and current_platform.has_device_capability(90)
             )
         else:
             self.input_mix_weight_down = ReplicatedLinear(
