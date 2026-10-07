@@ -261,25 +261,43 @@ def backend_to_kernel_cls(
         raise ValueError(f"Unknown FP8 MoE backend: {backend.value}")
 
 
+_FP8_BACKEND_MAP: dict[str, Fp8MoeBackend] = {
+    "triton": Fp8MoeBackend.TRITON,
+    "deep_gemm": Fp8MoeBackend.DEEPGEMM,
+    "cutlass": Fp8MoeBackend.VLLM_CUTLASS,
+    "flashinfer_trtllm": Fp8MoeBackend.FLASHINFER_TRTLLM,
+    "flashinfer_cutlass": Fp8MoeBackend.FLASHINFER_CUTLASS,
+    "marlin": Fp8MoeBackend.MARLIN,
+    "humming": Fp8MoeBackend.HUMMING,
+    "aiter": Fp8MoeBackend.AITER,
+    "hpc": Fp8MoeBackend.HPC,
+}
+
+# moe_backend values that name kernels for other quant schemes only. In a
+# mixed-precision checkpoint (e.g. NVFP4 routed experts + FP8 MTP experts)
+# they target the other layers, so FP8 layers fall back to auto-selection.
+_NON_FP8_MOE_BACKENDS = {"b12x", "flashinfer_b12x", "flashinfer_cutedsl"}
+
+
 def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
     """Map user's MoEBackend to Fp8MoeBackend."""
-    mapping = {
-        "triton": Fp8MoeBackend.TRITON,
-        "deep_gemm": Fp8MoeBackend.DEEPGEMM,
-        "cutlass": Fp8MoeBackend.VLLM_CUTLASS,
-        "flashinfer_trtllm": Fp8MoeBackend.FLASHINFER_TRTLLM,
-        "flashinfer_cutlass": Fp8MoeBackend.FLASHINFER_CUTLASS,
-        "marlin": Fp8MoeBackend.MARLIN,
-        "humming": Fp8MoeBackend.HUMMING,
-        "aiter": Fp8MoeBackend.AITER,
-        "hpc": Fp8MoeBackend.HPC,
-    }
-    if backend := mapping.get(runner_backend):
+    if backend := _FP8_BACKEND_MAP.get(runner_backend):
         return backend
     raise ValueError(
         f"moe_backend='{runner_backend}' is not supported for FP8 MoE. "
-        f"Expected one of {list(mapping.keys())}."
+        f"Expected one of {list(_FP8_BACKEND_MAP.keys())}."
     )
+
+
+def _fp8_runner_backend(config: FusedMoEConfig) -> MoEBackend:
+    if config.moe_backend in _NON_FP8_MOE_BACKENDS:
+        logger.warning_once(
+            "moe_backend='%s' does not apply to FP8 MoE layers; "
+            "auto-selecting their backend instead.",
+            config.moe_backend,
+        )
+        return "auto"
+    return config.moe_backend
 
 
 def refine_fp8_moe_block_shape(
@@ -354,8 +372,9 @@ def resolve_fp8_moe_weight_block_shape(
     """Return the TP-adapted block shape and refine factor:
     refine if kernels allow, else pad to the TP shard."""
     refined_shape = refine_fp8_moe_block_shape(config, weight_block_size)
-    if is_checkpoint_fp8_serialized and config.moe_backend != "auto":
-        kernel_classes = backend_to_kernel_cls(map_fp8_backend(config.moe_backend))
+    runner_backend = _fp8_runner_backend(config)
+    if is_checkpoint_fp8_serialized and runner_backend != "auto":
+        kernel_classes = backend_to_kernel_cls(map_fp8_backend(runner_backend))
         can_refine = refined_shape is not None and any(
             k_cls._supports_quant_scheme(
                 create_fp8_quant_key(
@@ -369,7 +388,7 @@ def resolve_fp8_moe_weight_block_shape(
             logger.info_once(
                 "FP8 %s TP loading uses complete checkpoint blocks: "
                 "local allocation %d, without weight requantization.",
-                config.moe_backend,
+                runner_backend,
                 config.intermediate_size_per_partition,
             )
             return weight_block_size, None
@@ -445,7 +464,7 @@ def select_fp8_moe_backend(
         raise ValueError(_make_log_unsupported(backend, reason))
 
     # Handle explicit moe_backend from user.
-    runner_backend = config.moe_backend
+    runner_backend = _fp8_runner_backend(config)
     if runner_backend != "auto":
         requested_backend = map_fp8_backend(runner_backend)
         # For batched activation format, use batched variants if available.
