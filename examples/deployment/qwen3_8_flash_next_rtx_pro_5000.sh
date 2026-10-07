@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 # Serve Qwen3.8-Flash-Next on RTX PRO 5000 Blackwell (sm_120, 48 GB) GPUs.
 #
-# The FP8 checkpoint does not fit on a single 48 GB card, so TP defaults to 2;
-# raise it if `nvidia-smi` shows more cards and you need longer contexts.
+# NVFP4 checkpoint footprint (512 experts x 48 layers):
+#   GPU:  ~68 GB NVFP4 routed experts + ~10 GB bf16 dense/embeddings
+#         + ~2.5 GB FP8 MTP experts + ~1 GB vision  => ~80 GB total
+#   Host: ~51 GB FP8 n-gram (PLE) table in pinned memory, sharded across TP
+# TP=2 leaves only a few GB per card for KV cache and CUDA graphs; TP=4 is
+# comfortable.
 #
 # Usage:
-#   CHECK=1 ./qwen3_8_flash_next_rtx_pro_5000.sh   # run sm_120 kernel tests first
-#   TP=4 MAX_LEN=65536 ./qwen3_8_flash_next_rtx_pro_5000.sh
+#   MODEL=~/models/nvidia/Qwen3.8-Flash-Next-NVFP4 TP=2 ./qwen3_8_flash_next_rtx_pro_5000.sh
+#   CHECK=1 ...   # run the sm_120-relevant kernel tests first
+#   TEXT_ONLY=1   # skip the vision tower (--language-model-only)
 set -euo pipefail
 
-MODEL=${MODEL:-Qwen/Qwen3.8-Flash-Next-FP8}
+MODEL=${MODEL:-nvidia/Qwen3.8-Flash-Next-NVFP4}
 TP=${TP:-2}
 MAX_LEN=${MAX_LEN:-32768}
-GPU_UTIL=${GPU_UTIL:-0.92}
+MAX_SEQS=${MAX_SEQS:-16}
+GPU_UTIL=${GPU_UTIL:-0.95}
 PORT=${PORT:-8000}
 PYTHON=${PYTHON:-.venv/bin/python}
 
@@ -24,12 +30,19 @@ if [[ "${CHECK:-0}" == "1" ]]; then
         tests/models/qwen4_exp/test_qsa_reference.py
 fi
 
+extra=()
+if [[ "${TEXT_ONLY:-0}" == "1" ]]; then
+    extra+=(--language-model-only)
+fi
+
 # Without NVLink, P2P over PCIe can hang on some boards; set NCCL_P2P_DISABLE=1
 # if the first all-reduce never completes.
 exec "$PYTHON" -m vllm.entrypoints.cli.main serve "$MODEL" \
     --tensor-parallel-size "$TP" \
     --max-model-len "$MAX_LEN" \
+    --max-num-seqs "$MAX_SEQS" \
     --gpu-memory-utilization "$GPU_UTIL" \
     --reasoning-parser qwen3 \
     --port "$PORT" \
+    "${extra[@]}" \
     "$@"
