@@ -72,9 +72,9 @@ services:
     image: ${DCGM_EXPORTER_IMAGE:-nvidia/dcgm-exporter:4.6.1-4.8.4-distroless}
     network_mode: host
     cap_add: [SYS_ADMIN]
-    command: ["-a", "127.0.0.1:9400", "-f", "/etc/dcgm-exporter/counters.csv"]
+    command: ["-a", "127.0.0.1:9400", "-f", "/etc/dcgm-exporter/custom/counters.csv"]
     volumes:
-      - ./dcgm-counters.csv:/etc/dcgm-exporter/counters.csv:ro
+      - ./dcgm:/etc/dcgm-exporter/custom:ro
     deploy:
       resources:
         reservations:
