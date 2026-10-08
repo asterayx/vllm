@@ -20,6 +20,8 @@ MAX_SEQS=${MAX_SEQS:-16}
 GPU_UTIL=${GPU_UTIL:-0.93}
 PORT=${PORT:-8000}
 PYTHON=${PYTHON:-.venv/bin/python}
+# Keep colored logs when piped through tee; view saved logs with `less -R`.
+export VLLM_LOGGING_COLOR=${VLLM_LOGGING_COLOR:-1}
 
 nvidia-smi --query-gpu=index,name,compute_cap,memory.total --format=csv
 
