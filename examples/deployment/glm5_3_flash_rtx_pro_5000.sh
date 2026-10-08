@@ -7,6 +7,7 @@
 #
 # Usage:
 #   MODEL=~/models/zai-org/GLM-5.3-Flash TP=4 ./glm5_3_flash_rtx_pro_5000.sh
+# Full runbook: glm5_3_flash_rtx_pro_5000.md
 #   NUMA=1        # bind each GPU worker to its NUMA node
 #   NCCL_LL=1     # P2P across sockets + LL for decode-sized TP all-reduce
 #   SPEC=N        # MTP speculative decoding with N draft tokens
