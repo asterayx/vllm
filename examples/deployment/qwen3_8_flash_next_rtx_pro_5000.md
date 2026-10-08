@@ -28,6 +28,11 @@ VLLM_USE_PRECOMPILED=1 uv pip install -e . \
   "b12x==1.5.0" "nvidia-cutlass-dsl[cu13]==4.7.1" "quack-kernels==0.6.5" \
   --torch-backend=auto
 
+# flashinfer-cubin is only on the FlashInfer index, so `-e .` skips it. Without
+# it (or nvcc on PATH) vLLM disables FlashInfer backends.
+uv pip install "flashinfer-cubin==0.7.0.post1" --extra-index-url https://flashinfer.ai/whl/
+.venv/bin/python -c "from vllm.utils.flashinfer import has_flashinfer; print(has_flashinfer())"  # True
+
 uv pip show torch torchvision b12x nvidia-cutlass-dsl | grep -E "^(Name|Version)"
 # 期望: torch 2.13.0, torchvision 0.28.0, b12x 1.5.0, nvidia-cutlass-dsl 4.7.1
 ```
@@ -281,6 +286,7 @@ All-reduce 微基准（`~/ar.py`，TP4，µs）：
 
 | 现象 | 原因 / 处理 |
 |---|---|
+| `FLASHINFER_* requires FlashInfer's ... API` 但 FlashInfer 可以 import | 未装 `flashinfer-cubin` 且 `nvcc` 不在 PATH；按第 1 节安装 cubin |
 | `torchvision::nms does not exist` | `uv pip install -U` 升级了 torch；按第 1 节重新安装 |
 | b12x 在 TP4 下 NaN / illegal memory access | b12x < 1.5.0 不支持 intermediate 192；升级到 1.5.0 |
 | Grok Build 只显示 "Waiting for response" | 需要 `VLLM_EMIT_REASONING_CONTENT=1` |

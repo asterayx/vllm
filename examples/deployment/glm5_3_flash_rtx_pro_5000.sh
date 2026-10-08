@@ -22,6 +22,11 @@ PORT=${PORT:-8000}
 PYTHON=${PYTHON:-.venv/bin/python}
 # Keep colored logs when piped through tee; view saved logs with `less -R`.
 export VLLM_LOGGING_COLOR=${VLLM_LOGGING_COLOR:-1}
+# vLLM treats FlashInfer as unavailable without flashinfer-cubin or nvcc on
+# PATH, silently dropping FlashInfer backends (e.g. SM120 sparse MLA).
+if ! command -v nvcc >/dev/null && [[ -x "${CUDA_HOME:-/usr/local/cuda}/bin/nvcc" ]]; then
+    export PATH="${CUDA_HOME:-/usr/local/cuda}/bin:$PATH"
+fi
 
 nvidia-smi --query-gpu=index,name,compute_cap,memory.total --format=csv
 
