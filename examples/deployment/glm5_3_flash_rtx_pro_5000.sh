@@ -11,6 +11,13 @@
 #   NCCL_LL=1     # P2P across sockets + LL for decode-sized TP all-reduce
 #   SPEC=N        # MTP speculative decoding with N draft tokens
 #   TOOLS=1       # enable tool calling (glm47 parser)
+#
+# Recommended on 4x RTX PRO 5000 72GB (NVFP4 checkpoint):
+#   NUMA=1 NCCL_LL=1 SPEC=3 ./glm5_3_flash_rtx_pro_5000.sh --moe-backend b12x
+# mt-bench output tok/s at concurrency 1/8/16 (default sampling):
+#   SPEC=2: 152/567/755 (acceptance length 2.41)
+#   SPEC=3: 165/562/808 (acceptance length 2.85)
+# The MTP layer is BF16 and costs ~3.7 GiB/GPU of KV cache.
 set -euo pipefail
 
 MODEL=${MODEL:-zai-org/GLM-5.3-Flash}
