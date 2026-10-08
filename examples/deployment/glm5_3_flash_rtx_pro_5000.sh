@@ -22,6 +22,11 @@ PORT=${PORT:-8000}
 PYTHON=${PYTHON:-.venv/bin/python}
 # Keep colored logs when piped through tee; view saved logs with `less -R`.
 export VLLM_LOGGING_COLOR=${VLLM_LOGGING_COLOR:-1}
+# FlashInfer JIT needs ninja (installed into the venv) on PATH.
+PY_BIN_DIR=$(dirname "$PYTHON")
+if [[ -x "$PY_BIN_DIR/ninja" ]]; then
+    export PATH="$(cd "$PY_BIN_DIR" && pwd):$PATH"
+fi
 # vLLM treats FlashInfer as unavailable without flashinfer-cubin or nvcc on
 # PATH, silently dropping FlashInfer backends (e.g. SM120 sparse MLA).
 if ! command -v nvcc >/dev/null && [[ -x "${CUDA_HOME:-/usr/local/cuda}/bin/nvcc" ]]; then
