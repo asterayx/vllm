@@ -166,3 +166,20 @@ def test_flashinfer_autotune_clears_rank_local_cache_before_sync(tmp_path):
 
     tuned = [c[0] for c in tuner.mock_calls if c[0] != "save_configs"]
     assert tuned == ["clear_cache", "load_configs"]
+
+
+def test_flashinfer_autotune_cache_saved_by_every_rank(tmp_path):
+    """Rank-keyed entries (e.g. CUTLASS fused MoE) must reach the shared
+    cache from every rank, or the next synchronized pass desyncs."""
+    from vllm.model_executor.warmup.flashinfer_autotune_cache import (
+        save_flashinfer_autotune_cache_all_ranks,
+    )
+
+    cache_path = tmp_path / "autotune_configs.json"
+    for rank in range(4):
+        tuner = Mock()
+        group = SimpleNamespace(rank_in_group=rank, world_size=4, barrier=Mock())
+        with patch("flashinfer.autotuner.AutoTuner.get", return_value=tuner):
+            save_flashinfer_autotune_cache_all_ranks(cache_path, group)
+        tuner.save_configs.assert_called_once_with(str(cache_path))
+        assert group.barrier.call_count == 4

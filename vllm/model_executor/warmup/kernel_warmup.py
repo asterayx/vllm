@@ -18,6 +18,7 @@ from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
+    save_flashinfer_autotune_cache_all_ranks,
     write_flashinfer_autotune_cache,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
@@ -448,10 +449,9 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             cached_results = f.read()
     cached_results = world.broadcast_object(cached_results, src=0)
     if world.world_size > 1:
-        # Synchronized tuning needs identical caches on every rank: a
-        # cache hit skips that profile's all-reduce. Earlier leader-only
-        # tuning (e.g. SM120 sparse MLA warmup) leaves extra in-memory
-        # entries on rank 0 only; they were already saved to cache_path.
+        # Synchronized tuning needs equivalent caches on every rank: a
+        # cache hit skips that profile's all-reduce. Drop rank-local
+        # in-memory entries; earlier passes already saved them to cache_path.
         tuner.clear_cache()
     if cached_results is not None:
         write_flashinfer_autotune_cache(cache_path, cached_results)
@@ -482,7 +482,4 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     finally:
         set_autotune_process_group(None)
 
-    if world.world_size > 1:
-        world.barrier()
-    if is_leader:
-        tuner.save_configs(str(cache_path))
+    save_flashinfer_autotune_cache_all_ranks(cache_path, world)

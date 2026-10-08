@@ -92,3 +92,22 @@ def write_flashinfer_autotune_cache(cache_path: Path, contents: bytes) -> None:
         with suppress(OSError):
             os.unlink(tmp_path)
         raise
+
+
+def save_flashinfer_autotune_cache_all_ranks(
+    cache_path: Path, group: "GroupCoordinator"
+) -> None:
+    """Merge every rank's tuning results into ``cache_path``.
+
+    Some ops (e.g. CUTLASS fused MoE) key entries by TP/EP rank, so a
+    leader-only save leaves other ranks without cache hits and desyncs the
+    next synchronized tuning pass. Ranks save in turn; ``save_configs``
+    merges with the entries already on disk.
+    """
+    from flashinfer.autotuner import AutoTuner
+
+    tuner = AutoTuner.get()
+    for rank in range(group.world_size):
+        if group.rank_in_group == rank:
+            tuner.save_configs(str(cache_path))
+        group.barrier()

@@ -9,7 +9,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
-    write_flashinfer_autotune_cache,
+    save_flashinfer_autotune_cache_all_ranks,
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import autotune as flashinfer_autotune
@@ -132,7 +132,7 @@ def _run_flashinfer_sparse_mla_decode_autotune(
         return False
 
     try:
-        from flashinfer.autotuner import AutoTuner
+        from flashinfer.autotuner import AutoTuner, set_autotune_process_group
     except ImportError:
         logger.warning(
             "Skipping FlashInfer SM120 sparse MLA decode autotune because "
@@ -161,9 +161,14 @@ def _run_flashinfer_sparse_mla_decode_autotune(
             cache_path,
         )
 
-    with torch.inference_mode():
-        warmup_executed = True
-        if is_leader:
+    # Every rank tunes with per-tactic timings averaged over the CPU group,
+    # starting from an empty cache: a rank-local cache hit (some ops key
+    # entries by TP rank) would skip that profile's all-reduce and deadlock.
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    set_autotune_process_group(world.cpu_group if world.world_size > 1 else None)
+    try:
+        with torch.inference_mode():
             if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:
                 v2_runner = cast("V2GPUModelRunner", runner)
                 warmup_executed = run_mixed_prefill_decode_warmup(
@@ -171,47 +176,21 @@ def _run_flashinfer_sparse_mla_decode_autotune(
                     worker.execute_model,
                     worker.sample_tokens,
                     num_tokens,
-                    mixed_step_context=flashinfer_autotune(True, cache=str(cache_path)),
+                    mixed_step_context=flashinfer_autotune(True),
                     req_id_prefix="_sparse_mla_v2_warmup",
                 )
             else:
-                with flashinfer_autotune(True, cache=str(cache_path)):
+                with flashinfer_autotune(True):
                     runner._dummy_run(**dummy_run_kwargs)
-        else:
-            if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:
-                v2_runner = cast("V2GPUModelRunner", runner)
-                warmup_executed = run_mixed_prefill_decode_warmup(
-                    v2_runner,
-                    worker.execute_model,
-                    worker.sample_tokens,
-                    num_tokens,
-                    req_id_prefix="_sparse_mla_v2_warmup",
-                )
-            else:
-                runner._dummy_run(**dummy_run_kwargs)
+                warmup_executed = True
+    finally:
+        set_autotune_process_group(None)
 
     if not warmup_executed:
         return False
 
-    tune_results: bytes | None = None
-    if is_leader and cache_path.exists():
-        with open(cache_path, "rb") as f:
-            tune_results = f.read()
-
-    tune_results = world.broadcast_object(tune_results, src=0)
-    if tune_results is None:
-        logger.warning(
-            "No FlashInfer SM120 sparse MLA %s decode autotune cache entries found. "
-            "Falling back to FlashInfer's default tactic heuristic.",
-            log_label,
-        )
-        world.barrier()
-        return True
-
-    write_flashinfer_autotune_cache(cache_path, tune_results)
-    world.barrier()
-
-    AutoTuner.get().load_configs(str(cache_path))
+    save_flashinfer_autotune_cache_all_ranks(cache_path, world)
+    tuner.load_configs(str(cache_path))
     logger.info(
         "FlashInfer SM120 sparse MLA %s decode autotune cache loaded on rank %d "
         "from %s.",
