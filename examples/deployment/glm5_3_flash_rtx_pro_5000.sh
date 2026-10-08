@@ -7,7 +7,6 @@
 #
 # Usage:
 #   MODEL=~/models/zai-org/GLM-5.3-Flash TP=4 ./glm5_3_flash_rtx_pro_5000.sh
-# Full runbook: glm5_3_flash_rtx_pro_5000.md
 #   NUMA=1        # bind each GPU worker to its NUMA node
 #   NCCL_LL=1     # P2P across sockets + LL for decode-sized TP all-reduce
 #   SPEC=N        # MTP speculative decoding with N draft tokens
@@ -19,6 +18,7 @@
 #   SPEC=2: 152/567/755 (acceptance length 2.41)
 #   SPEC=3: 165/562/808 (acceptance length 2.85)
 # The MTP layer is BF16 and costs ~3.7 GiB/GPU of KV cache.
+# Full runbook: glm5_3_flash_rtx_pro_5000.md
 set -euo pipefail
 
 MODEL=${MODEL:-zai-org/GLM-5.3-Flash}
