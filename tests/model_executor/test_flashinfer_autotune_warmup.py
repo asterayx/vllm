@@ -125,3 +125,44 @@ def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn):
             **({"skip_attn": True} if skip_attn else {}),
         ),
     ]
+
+
+def test_flashinfer_autotune_clears_rank_local_cache_before_sync(tmp_path):
+    """Leader-only warmup tuning must not leave rank 0 with extra cache hits:
+    a hit skips that profile's all-reduce and deadlocks synchronized tuning."""
+    from vllm.model_executor.warmup import kernel_warmup
+
+    cache_path = tmp_path / "autotune_configs.json"
+    tuner = Mock()
+    world = SimpleNamespace(
+        rank_in_group=0,
+        world_size=4,
+        cpu_group=object(),
+        broadcast_object=Mock(return_value=b"{}"),
+        barrier=Mock(),
+    )
+    runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            attention_config=SimpleNamespace(hisparse_config=None)
+        ),
+        get_model=Mock(),
+    )
+    with (
+        patch("flashinfer.autotuner.AutoTuner.get", return_value=tuner),
+        patch("flashinfer.autotuner.set_autotune_process_group"),
+        patch("vllm.distributed.parallel_state.get_world_group", return_value=world),
+        patch("vllm.utils.flashinfer.autotune"),
+        patch.object(kernel_warmup, "_flashinfer_autotune_skip_ops"),
+        patch.object(
+            kernel_warmup, "resolve_flashinfer_autotune_file", return_value=cache_path
+        ),
+        patch.object(kernel_warmup, "write_flashinfer_autotune_cache"),
+        patch.object(kernel_warmup, "_run_flashinfer_autotune_dummy_runs"),
+        patch.object(kernel_warmup, "replayssm_autotune_warmup"),
+        patch.object(kernel_warmup, "_autotune_kimi_k3_kda_qkvg"),
+        patch.object(kernel_warmup, "_run_flashinfer_bf16_autotune_dummy_run"),
+    ):
+        kernel_warmup.flashinfer_autotune(runner)
+
+    tuned = [c[0] for c in tuner.mock_calls if c[0] != "save_configs"]
+    assert tuned == ["clear_cache", "load_configs"]

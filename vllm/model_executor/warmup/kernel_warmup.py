@@ -447,6 +447,12 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         with open(cache_path, "rb") as f:
             cached_results = f.read()
     cached_results = world.broadcast_object(cached_results, src=0)
+    if world.world_size > 1:
+        # Synchronized tuning needs identical caches on every rank: a
+        # cache hit skips that profile's all-reduce. Earlier leader-only
+        # tuning (e.g. SM120 sparse MLA warmup) leaves extra in-memory
+        # entries on rank 0 only; they were already saved to cache_path.
+        tuner.clear_cache()
     if cached_results is not None:
         write_flashinfer_autotune_cache(cache_path, cached_results)
         world.barrier()
