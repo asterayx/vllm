@@ -8,6 +8,8 @@
 # 48 GB cards: TP=2 is tight, prefer TP=4. 72 GB cards: TP=2 fits easily;
 # TP=4 leaves the most KV cache.
 #
+# Full runbook (install, tunnel, clients, telemetry): qwen3_8_flash_next_rtx_pro_5000.md
+#
 # Recommended on 4x RTX PRO 5000 72GB, dual-socket, PCIe only (b12x>=1.5.0);
 # random 1024/512 at concurrency 1/8/16: ~193/770/1110 output tok/s:
 #   NUMA=1 NCCL_LL=1 TP=4 SPEC=2 ./qwen3_8_flash_next_rtx_pro_5000.sh \
