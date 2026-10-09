@@ -83,6 +83,7 @@ MAX_LEN=262144 MAX_SEQS=32 NUMA=1 NCCL_LL=1 SPEC=3 TOOLS=1 MODEL=$G \
 ```toml
 # ~/.codex/config.toml
 model = "glm-5.3-flash"
+model_reasoning_effort = "low"
 ```
 
 ```toml
@@ -94,9 +95,22 @@ name = "GLM-5.3 Flash (asteraix)"
 env_key = "ASTERAIX_API_KEY"
 api_backend = "chat_completions"
 context_window = 262144
-max_completion_tokens = 32768
-reasoning_effort = "medium"
+supports_reasoning_effort = true
+reasoning_effort = "low"
 ```
+
+不要设置 `max_completion_tokens`：GLM 思考很长，32K 上限会截断回复。
+
+思考强度：GLM-5.3 的对话模板只认 `low` / `high`，其他值（包括客户端默认的
+`medium` 和 `none`）都按 `max` 处理，且没有关闭思考的开关。
+
+| `reasoning_effort` | 实际档位 | 示例（写 300 行贪吃蛇） |
+|---|---|---|
+| `low` | Low | 15 s，几乎不思考 |
+| `high` | High | — |
+| `medium` / 不设 / `none` | Max | 126 s，其中思考约 114 s |
+
+日常编码用 `low`，难题切 `high`。
 
 pi：在 `~/.pi/agent/models.json` 的 `models` 中加一项，`"id": "glm-5.3-flash"`，
 其余字段与 Qwen 相同。

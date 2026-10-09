@@ -48,6 +48,17 @@ def no_thinking_parser():
     )
 
 
+@pytest.fixture
+def effort_template_parser():
+    """GLM-5.3 templates read only ``reasoning_effort`` and always think."""
+    tokenizer = make_mock_tokenizer(VOCAB)
+    tokenizer.chat_template = (
+        "{%- set effective_reasoning_effort = reasoning_effort "
+        "if reasoning_effort in ['low', 'high'] else 'max' -%}"
+    )
+    return Glm47MoeParser(tokenizer, chat_template_kwargs={"enable_thinking": False})
+
+
 class TestIsReasoningEnd:
     def test_open_reasoning(self, parser):
         assert not parser.is_reasoning_end([THINK_S, TEXT])
@@ -74,6 +85,11 @@ class TestIsReasoningEnd:
 
     def test_thinking_disabled(self, no_thinking_parser):
         assert no_thinking_parser.is_reasoning_end([THINK_S, TEXT])
+
+    def test_enable_thinking_ignored_by_template(self, effort_template_parser):
+        """``reasoning_effort: none`` maps to enable_thinking=False, which this
+        template ignores; reasoning must still be split from content."""
+        assert not effort_template_parser.is_reasoning_end([THINK_S, TEXT])
 
 
 class TestExtractContentIds:

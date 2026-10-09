@@ -190,8 +190,14 @@ class Glm47MoeParser(ParserEngine):
         **kwargs,
     ) -> None:
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
-        thinking = chat_kwargs.get("thinking", None)
-        enable_thinking = chat_kwargs.get("enable_thinking", None)
+        thinking = enable_thinking = None
+        # Templates that ignore these switches (e.g. GLM-5.3 only reads
+        # reasoning_effort) always think, so the flags must not hide it.
+        template = getattr(tokenizer, "chat_template", None)
+        if not isinstance(template, str) or re.search(r"\bthinking\b", template):
+            thinking = chat_kwargs.get("thinking", None)
+        if not isinstance(template, str) or "enable_thinking" in template:
+            enable_thinking = chat_kwargs.get("enable_thinking", None)
         self.thinking_enabled = (
             True
             if thinking is None and enable_thinking is None
