@@ -106,6 +106,8 @@ cloudflared tunnel route dns asteraix-llm t.asteraix.com
 ```yaml
 tunnel: asteraix-llm
 credentials-file: /home/<user>/.cloudflared/<UUID>.json
+# QUIC uploads large agent requests (~0.5 MB per turn) at ~11 KB/s here.
+protocol: http2
 
 ingress:
   - hostname: t.asteraix.com
@@ -292,6 +294,7 @@ All-reduce 微基准（`~/ar.py`，TP4，µs）：
 | Grok Build 只显示 "Waiting for response" | 需要 `VLLM_EMIT_REASONING_CONTENT=1` |
 | Codex 不显示思考 | `show_raw_agent_reasoning = true` |
 | Codex 提示 `Missing environment variable` | 启动 Codex 的 shell 中未 `export ASTERAIX_API_KEY` |
+| 客户端长时间 "Waiting for response"，服务端 `Running: 0` | cloudflared 默认 QUIC 上传大请求极慢（176 KB 需 16.6 s，边缘节点直传 1 s）；日志有 `Body length 0` / `context canceled`。配置 `protocol: http2` 后重启 cloudflared |
 | `https://t.asteraix.com/telemetry` 404 | 规则写在了 `~/.cloudflared/config.yml`；服务读 `/etc/cloudflared/config.yml` |
 | 容器挂载文件变成 root 拥有的空目录 | 挂载源不存在时 Docker 会自建目录；删除后 `git pull`（仓库 `.gitignore` 忽略 `*.csv`，counters 文件需 `git add -f`） |
 | Prometheus `bind: address already in use` | 9090 被占用；已改为 19090（`PROM_PORT`） |
