@@ -112,6 +112,13 @@ reasoning_effort = "low"
 
 日常编码用 `low`，难题切 `high`。
 
+启动脚本默认 `STRICT_EFFORT=1`：在模型模板前加一段检查（生成到
+`~/.cache/vllm/glm5_strict_effort.jinja` 并以 `--chat-template` 传入），`reasoning_effort`
+不是 `low` / `high` / `max` 时返回 HTTP 400：
+`reasoning_effort=medium is not supported by GLM-5.3; use low, high or max`。
+不传 `reasoning_effort` 仍按 `max`。Codex 默认发送 `medium`，必须显式配置
+`model_reasoning_effort`。设 `STRICT_EFFORT=0` 可恢复原行为。
+
 pi：在 `~/.pi/agent/models.json` 的 `models` 中加一项，`"id": "glm-5.3-flash"`，
 其余字段与 Qwen 相同。
 

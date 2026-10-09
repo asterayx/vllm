@@ -11,6 +11,8 @@
 #   NCCL_LL=1     # P2P across sockets + LL for decode-sized TP all-reduce
 #   SPEC=N        # MTP speculative decoding with N draft tokens
 #   TOOLS=1       # enable tool calling (glm47 parser)
+#   STRICT_EFFORT=0  # accept any reasoning_effort (GLM maps all but
+#                    # low/high to max); default rejects them with HTTP 400
 #
 # Recommended on 4x RTX PRO 5000 72GB (NVFP4 checkpoint):
 #   NUMA=1 NCCL_LL=1 SPEC=3 ./glm5_3_flash_rtx_pro_5000.sh --moe-backend b12x
@@ -62,6 +64,12 @@ if [[ "${SPEC:-0}" != "0" ]]; then
 fi
 if [[ "${TOOLS:-0}" == "1" ]]; then
     extra+=(--enable-auto-tool-choice --tool-call-parser glm47)
+fi
+if [[ "${STRICT_EFFORT:-1}" == "1" ]]; then
+    template="${XDG_CACHE_HOME:-$HOME/.cache}/vllm/glm5_strict_effort.jinja"
+    mkdir -p "$(dirname "$template")"
+    "$PYTHON" "$(dirname "$0")/glm5_strict_effort_template.py" "$MODEL" "$template"
+    extra+=(--chat-template "$template")
 fi
 
 exec "$PYTHON" -m vllm.entrypoints.cli.main serve "$MODEL" \
