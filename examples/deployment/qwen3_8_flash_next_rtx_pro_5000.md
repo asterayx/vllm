@@ -130,6 +130,17 @@ sudo cloudflared tunnel --config /etc/cloudflared/config.yml ingress rule https:
 sudo systemctl restart cloudflared
 ```
 
+- 本机的透明代理（sing-box / Clash TUN）会接管 cloudflared 的出站连接，导致隧道频繁断线
+  （`connection with edge closed`，客户端 502）与上传缓慢。让 cloudflared 直连，在 sing-box
+  `route.rules` 最前面加：
+
+  ```json
+  { "process_name": ["cloudflared"], "outbound": "direct" },
+  { "ip_cidr": ["198.41.192.0/24", "198.41.200.0/24"], "outbound": "direct" },
+  { "domain_suffix": ["argotunnel.com"], "outbound": "direct" },
+  ```
+
+  验证：`sudo mtr -rwc 20 -i 0.2 -T -P 7844 198.41.192.47` 延迟应为真实网络延迟（而非 0.1 ms）。
 - 只放行 `/v1/` 与 `/telemetry`，其余（`/metrics`、`/scale_elastic_ep` 等）返回 404。
 - Cloudflare 后台：WAF / Bot Fight Mode 对 `t.asteraix.com` 加 Skip 规则，避免拦截 API 客户端。
 - 建议在 Zero Trust 中仅为 `t.asteraix.com/telemetry` 建 Access 应用；不要给整个域名加，否则 `/v1` 会被拦。
@@ -294,6 +305,7 @@ All-reduce 微基准（`~/ar.py`，TP4，µs）：
 | Grok Build 只显示 "Waiting for response" | 需要 `VLLM_EMIT_REASONING_CONTENT=1` |
 | Codex 不显示思考 | `show_raw_agent_reasoning = true` |
 | Codex 提示 `Missing environment variable` | 启动 Codex 的 shell 中未 `export ASTERAIX_API_KEY` |
+| Grok 间歇性 502；cloudflared 日志 `connection with edge closed` 与 8000 端口 `context canceled` 同时出现 | cloudflared 经本机 sing-box TUN 出站，代理链路断开会中断其上全部请求。按第 3 节让 cloudflared 直连（176 KB 上传 16.6 s → 2.0 s） |
 | 客户端长时间 "Waiting for response"，服务端 `Running: 0` | cloudflared 默认 QUIC 上传大请求极慢（176 KB 需 16.6 s，边缘节点直传 1 s）；日志有 `Body length 0` / `context canceled`。配置 `protocol: http2` 后重启 cloudflared |
 | `https://t.asteraix.com/telemetry` 404 | 规则写在了 `~/.cloudflared/config.yml`；服务读 `/etc/cloudflared/config.yml` |
 | 容器挂载文件变成 root 拥有的空目录 | 挂载源不存在时 Docker 会自建目录；删除后 `git pull`（仓库 `.gitignore` 忽略 `*.csv`，counters 文件需 `git add -f`） |
