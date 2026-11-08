@@ -322,6 +322,28 @@ def kv_cache_as_quant_view(
 _DPSK_INDEXER_SM120_FIX = os.environ.get("DPSK_INDEXER_SM120_FIX", "0") == "1"
 
 
+def _indexer_logits_shrink_breaks_full_graph() -> bool:
+    """Re-run the indexer outside FULL CUDA graphs when shrink is requested.
+
+    A captured launch freezes the logits width. Breaking the op out lets
+    each replay allocate the live context length. Unset leaves FULL graphs
+    captured, matching the previous behavior.
+    """
+    return os.environ.get("DSV41_EXP_INDEXER_LOGITS_SHRINK", "0") == "1"
+
+
+def _log_indexer_logits_shrink_unused(backend: str) -> None:
+    """One-time fallback when the shrink flag is set but this backend is not
+    the SM120 Triton paged logits path."""
+    if os.environ.get("DSV41_EXP_INDEXER_LOGITS_SHRINK", "0") != "1":
+        return
+    from vllm.model_executor.layers.sm120_paged_mqa_logits import (
+        log_sm120_logits_shrink_unused,
+    )
+
+    log_sm120_logits_shrink_unused(backend)
+
+
 def _sm120_needs_ref_paged_logits(kv_cache: torch.Tensor, use_fp4_cache: bool) -> bool:
     """SM120 DeepGEMM fp8 paged MQA logits only supports 64-row pages; the
     DeepSeek-V4.1 ratio-1 indexer uses 128-row pages there."""
@@ -348,7 +370,9 @@ def _paged_mqa_logits_ref_fp8(
     page = int(kv_cache.stride(0))
     nb_total = kv_cache.shape[0]
     out = torch.full(
-        (B * N, max_model_len), float("-inf"), dtype=torch.float32,
+        (B * N, max_model_len),
+        float("-inf"),
+        dtype=torch.float32,
         device=q_fp8.device,
     )
     if B == 0:
@@ -369,8 +393,11 @@ def _paged_mqa_logits_ref_fp8(
         b1 = min(B, b0 + chunk)
         pages = flat[bt[b0:b1]]  # [b, nblk, bs*(D+4)]
         k = (
-            pages[..., : bs * D].contiguous().view(torch.float8_e4m3fn)
-            .view(b1 - b0, nblk, bs, D).float()
+            pages[..., : bs * D]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+            .view(b1 - b0, nblk, bs, D)
+            .float()
         )
         sc = pages[..., bs * D : bs * (D + 4)].contiguous().view(torch.float32)
         sc = sc.view(b1 - b0, nblk, bs)
@@ -385,7 +412,7 @@ def _paged_mqa_logits_ref_fp8(
     return out
 
 
-@eager_break_during_capture
+@eager_break_during_capture(break_on_full=_indexer_logits_shrink_breaks_full_graph)
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -781,6 +808,7 @@ def sparse_attn_indexer(
             seq_lens_xpu = (
                 seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
             )
+            _log_indexer_logits_shrink_unused("XPU paged MQA logits")
             logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
                 padded_q_quant_cast,
                 kv_cache,
@@ -795,6 +823,9 @@ def sparse_attn_indexer(
         ):
             # DPSK_INDEXER_SM120_FIX=1: fused Triton fp8 paged logits for
             # 128-row pages (replaces fp32 dequant + einsum simt sgemm).
+            # max_seq_len is the host upper bound on this step's context
+            # (uncompressed; compressed indexer rows are shorter). Shrink
+            # keeps column t == position t for every t < that bound.
             from vllm.model_executor.layers.sm120_paged_mqa_logits import (
                 sm120_paged_mqa_logits_fp8,
             )
@@ -806,8 +837,13 @@ def sparse_attn_indexer(
                 seq_lens,
                 decode_metadata.block_table,
                 max_model_len,
+                used_len=int(attn_metadata_narrowed.max_seq_len),
             )
         elif _sm120_needs_ref_paged_logits(kv_cache, use_fp4_cache):
+            _log_indexer_logits_shrink_unused(
+                "DPSK_INDEXER_SM120_FIX is unset; the fp32 reference keeps "
+                "the full max_model_len width"
+            )
             logits = _paged_mqa_logits_ref_fp8(
                 padded_q_quant_decode_tokens,
                 kv_cache,
@@ -817,6 +853,7 @@ def sparse_attn_indexer(
                 max_model_len,
             )
         else:
+            _log_indexer_logits_shrink_unused("DeepGEMM fp8_fp4_paged_mqa_logits")
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,

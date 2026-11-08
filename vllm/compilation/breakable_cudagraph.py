@@ -64,7 +64,11 @@ def _weak_ref_capture_arg(arg: Any) -> Any:
     return weak_ref_tensor(arg)
 
 
-def eager_break_during_capture(fn: F) -> F:
+def eager_break_during_capture(
+    fn: F | None = None,
+    *,
+    break_on_full: Callable[[], bool] | None = None,
+) -> F:
     """Decorator that turns a custom-op Python kernel into a "break point"
     for the breakable cudagraph capture.
 
@@ -74,6 +78,10 @@ def eager_break_during_capture(fn: F) -> F:
     When invoked inside a capture context, it ends the current cudagraph
     segment, runs the function eagerly on the capture stream, records the
     callable for replay, and starts a fresh segment.
+
+    FULL graphs keep the op inside the capture unless ``break_on_full``
+    returns true. That opt-in re-runs the op on every replay so its launch
+    shape can follow the live batch. The default stays captured.
 
     **In-place output buffer required.** Decorated ops must write into a
     caller-provided output tensor; a fresh tensor returned by ``fn`` would
@@ -95,29 +103,39 @@ def eager_break_during_capture(fn: F) -> F:
         def unified_attention_with_output(...):
             ...
     """
-    if not is_breakable_cudagraph_enabled():
-        return fn
 
-    @functools.wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        capture = BreakableCUDAGraphCapture.current()
-        if capture is None:
-            return fn(*args, **kwargs)
-        if not capture._capturing:
-            return fn(*args, **kwargs)
-        if is_forward_context_available():
-            mode = get_forward_context().cudagraph_runtime_mode
-            if mode == CUDAGraphMode.FULL:
-                return fn(*args, **kwargs)
+    def decorate(func: F) -> F:
+        if not is_breakable_cudagraph_enabled():
+            return func
 
-        # Weak-ref args: strong refs in the replay lambda pin cudagraph-pool
-        # slots across batch descriptors. cudagraph owns the slot, so the
-        # weak_ref is safe to deref on replay.
-        weak_args = tuple(_weak_ref_capture_arg(a) for a in args)
-        weak_kwargs = {k: _weak_ref_capture_arg(v) for k, v in kwargs.items()}
-        return capture.add_eager(lambda: fn(*weak_args, **weak_kwargs))
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            capture = BreakableCUDAGraphCapture.current()
+            if capture is None:
+                return func(*args, **kwargs)
+            if not capture._capturing:
+                return func(*args, **kwargs)
+            if is_forward_context_available():
+                mode = get_forward_context().cudagraph_runtime_mode
+                # FULL stays in the graph unless this op opts into a replay
+                # that must see the live batch (indexer logits shrink).
+                if mode == CUDAGraphMode.FULL and not (
+                    break_on_full is not None and break_on_full()
+                ):
+                    return func(*args, **kwargs)
 
-    return wrapper  # type: ignore[return-value]
+            # Weak-ref args: strong refs in the replay lambda pin cudagraph-pool
+            # slots across batch descriptors. cudagraph owns the slot, so the
+            # weak_ref is safe to deref on replay.
+            weak_args = tuple(_weak_ref_capture_arg(a) for a in args)
+            weak_kwargs = {k: _weak_ref_capture_arg(v) for k, v in kwargs.items()}
+            return capture.add_eager(lambda: func(*weak_args, **weak_kwargs))
+
+        return wrapper  # type: ignore[return-value]
+
+    if fn is not None:
+        return decorate(fn)
+    return decorate  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
