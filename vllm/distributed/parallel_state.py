@@ -1141,7 +1141,8 @@ class GroupCoordinator:
                 # The oldest send is still in flight; FIFO ordering means the
                 # rest are no further along, so stop here.
                 break
-            handles[0].wait()
+            if handles[0] is not None:
+                handles[0].wait()
             pending.popleft()
 
     def isend_tensor_dict(
@@ -1150,6 +1151,7 @@ class GroupCoordinator:
         dst: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        meta_key: Any = None,
     ) -> list[Handle]:
         """Send the input tensor dictionary asynchronously.
 
@@ -1193,7 +1195,16 @@ class GroupCoordinator:
         # Reap completed sends before posting new ones, bounding the
         # self-retention FIFO.
         self._reap_completed_isends()
-        handles: list[Handle] = [self.isend_object(metadata_list, dst=dst)]
+        # try63: metadata cache (both stages key on scheduler-derived meta_key)
+        _mc = self.__dict__.setdefault("_dpsk_send_meta", {})
+        if meta_key is not None and meta_key in _mc:
+            if _mc[meta_key] != metadata_list:
+                raise RuntimeError(f"DPSK_PP_META_CACHE mismatch key={meta_key}")
+            handles: list[Handle] = [None]  # type: ignore[list-item]
+        else:
+            if meta_key is not None:
+                _mc[meta_key] = metadata_list
+            handles = [self.isend_object(metadata_list, dst=dst)]
 
         sent_tensors: list[torch.Tensor] = []
         for key, tensor in zip(tensor_keys, tensor_list):
@@ -1271,6 +1282,7 @@ class GroupCoordinator:
         src: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        meta_key: Any = None,
     ) -> tuple[
         dict[str, torch.Tensor | Any] | None,
         list[Handle],
@@ -1300,7 +1312,13 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
 
-        recv_metadata_list = self.recv_object(src=src)
+        _mc = self.__dict__.setdefault("_dpsk_recv_meta", {})
+        if meta_key is not None and meta_key in _mc:
+            recv_metadata_list = _mc[meta_key]
+        else:
+            recv_metadata_list = self.recv_object(src=src)
+            if meta_key is not None:
+                _mc[meta_key] = recv_metadata_list
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
         postprocess: list[Callable[[], None]] = []

@@ -13,8 +13,13 @@ from vllm.model_executor.layers.fusion.quant_activation import (
     get_input_quant_key,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+    fused_inv_rope_fp8_quant,
+)
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import deep_gemm_fp8_o_proj
 from vllm.platforms import current_platform
+
+from . import wo_a_fp8_skinny as _wo_a_fp8_skinny  # noqa: F401  (registers op)
 
 
 def _fused_wo_a_max_tokens(layer: nn.Module) -> int:
@@ -79,6 +84,26 @@ def dsv41_o_proj(
         return layer._wo_b_proj(
             QuantizedActivation(q, scales, o.dtype, q.shape, kMxfp8Dynamic)
         )
+    wo_a_fp8 = getattr(layer, "_wo_a_fp8", None)
+    if wo_a_fp8 is not None:
+        # DPSK_WO_A_FP8_SKINNY (SM120): bf16 inverse rope, then the e4m3 skinny
+        # grouped bmm for small M (bf16 torch.bmm fallback inside the op).
+        o_in, _ = fused_inv_rope_fp8_quant(
+            o,
+            positions,
+            cos_sin_cache,
+            n_groups=layer.n_local_groups,
+            heads_per_group=layer.n_local_heads // layer.n_local_groups,
+            nope_dim=layer.nope_head_dim,
+            rope_dim=layer.rope_head_dim,
+            quant_group_size=layer._einsum_recipe[2],
+            tma_aligned_scales=layer._tma_aligned_scales,
+            quantize=False,
+        )
+        z = torch.ops.vllm.dpsk_wo_a_fp8_bmm(
+            o_in, layer.wo_a.weight, wo_a_fp8[0], wo_a_fp8[1], layer.n_local_groups
+        )
+        return layer._wo_b_proj(z.flatten(1))
     return deep_gemm_fp8_o_proj(
         o,
         positions,

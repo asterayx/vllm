@@ -429,11 +429,22 @@ def allocate_kv_cache(
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
         layer_name = tensor.layers[0]
-        group_id, group = next(
+        group_id, group = next((
             (group_id, group)
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
             if layer_name in group.layer_names
-        )
+        ), (None, None))
+        if group is None:
+            raise RuntimeError(
+                f"[dbg] kv tensor layer {layer_name!r} (layers={tensor.layers[:4]}"
+                f"...{len(tensor.layers)}) not in any group; groups="
+                + "; ".join(
+                    f"{i}:{type(g.kv_cache_spec).__name__}:{len(g.layer_names)}:"
+                    f"{g.layer_names[:3]}"
+                    for i, g in enumerate(kv_cache_config.kv_cache_groups)
+                )
+                + f"; all tensor first layers={[t.layers[0] for t in kv_cache_config.kv_cache_tensors][:40]}"
+            )
         spec = group.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
             spec = spec.kv_cache_specs[layer_name]

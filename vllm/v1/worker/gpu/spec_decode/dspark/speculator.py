@@ -23,6 +23,7 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
+import os
 from typing import Any
 
 import torch
@@ -35,6 +36,10 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
 logger = init_logger(__name__)
+
+# try45: vocab-shard-local greedy drafting (no full-vocab all-gather of draft
+# logits, Markov bias computed only on this rank's vocab shard).
+_DPSK_VOCAB_LOCAL_ARGMAX = os.environ.get("DPSK_VOCAB_LOCAL_ARGMAX", "0") == "1"
 
 
 class DSparkSpeculator(DFlashSpeculator):
@@ -153,9 +158,69 @@ class DSparkSpeculator(DFlashSpeculator):
             )
         return sampled
 
+    def _use_vocab_local_argmax(self) -> bool:
+        cached = getattr(self, "_vocab_local_argmax_ok", None)
+        if cached is not None:
+            return cached
+        ok = (
+            _DPSK_VOCAB_LOCAL_ARGMAX
+            and self.draft_logits is None
+            and not self.use_confidence_head
+            and getattr(self, "acceptance_estimator", None) is None
+            and self.draft_watermarker is None
+            and hasattr(self.model, "vocab_local_argmax_supported")
+            and self.model.vocab_local_argmax_supported()
+        )
+        self._vocab_local_argmax_ok = bool(ok)
+        logger.info("DSpark vocab-local greedy argmax drafting: %s", ok)
+        return self._vocab_local_argmax_ok
+
+    def _sample_sequential_local_argmax(
+        self, num_reqs: int, head_hidden: torch.Tensor
+    ) -> None:
+        from vllm.distributed import (
+            get_tensor_model_parallel_world_size,
+            tensor_model_parallel_all_gather,
+        )
+
+        n_spec = self.num_speculative_steps
+        num_sample = num_reqs * n_spec
+        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        # [num_sample, shard] local logits; no all-gather.
+        base_local = self.model.compute_draft_logits_local(sample_hidden)
+        lm_head = self.model.lm_head
+        si = lm_head.shard_indices
+        num_pad = si.num_org_vocab_padding
+        n_org = si.org_vocab_end_index - si.org_vocab_start_index
+        vocab_start = si.org_vocab_start_index
+        base_local = base_local[:, :n_org].reshape(num_reqs, n_spec, n_org)
+        tp = get_tensor_model_parallel_world_size()
+        del num_pad
+
+        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        for i in range(n_spec):
+            markov_embed = self.model.markov_embed(prev)
+            bias = self.model.markov_bias_local(markov_embed)
+            logits_i = base_local[:, i] + bias
+            vals, idx = logits_i.max(dim=-1)
+            gidx = idx + vocab_start
+            if tp > 1:
+                pair = torch.stack([vals.float(), gidx.float()], dim=-1)
+                gathered = tensor_model_parallel_all_gather(pair, dim=-1)
+                gathered = gathered.view(num_reqs, tp, 2)
+                best = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+                tok = gathered[:, :, 1].gather(-1, best).squeeze(-1).to(torch.int64)
+            else:
+                tok = gidx.to(torch.int64)
+            self.draft_tokens[:num_reqs, i] = tok
+            prev = tok
+
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)
+            return
+        if self._use_vocab_local_argmax():
+            self._sample_sequential_local_argmax(num_reqs, head_hidden)
             return
 
         # Sequential Markov sampling over the backbone's output hidden states.

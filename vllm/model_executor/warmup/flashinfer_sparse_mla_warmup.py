@@ -166,7 +166,7 @@ def _run_flashinfer_sparse_mla_decode_autotune(
     # entries by TP rank) would skip that profile's all-reduce and deadlock.
     tuner = AutoTuner.get()
     tuner.clear_cache()
-    set_autotune_process_group(world.cpu_group if world.world_size > 1 else None)
+    set_autotune_process_group(_pp_safe_autotune_group(world))
     try:
         with torch.inference_mode():
             if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:
@@ -266,3 +266,18 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
                 force_attention=True,
                 create_mixed_batch=True,
             )
+
+
+def _pp_safe_autotune_group(world):
+    """Autotune all-reduce group that does not deadlock under PP.
+
+    With pipeline parallelism, stages run different layers (and PP1 blocks
+    on recv from PP0), so a world-group all-reduce deadlocks. Sync only
+    within the ranks of the same PP stage (TP group).
+    """
+    from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+
+    if get_pp_group().world_size > 1:
+        tp = get_tp_group()
+        return tp.cpu_group if tp.world_size > 1 else None
+    return world.cpu_group if world.world_size > 1 else None

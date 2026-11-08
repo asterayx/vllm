@@ -667,7 +667,14 @@ class ModelCudaGraphManager(CudaGraphManager):
             }
             if not self.is_first_pp_rank:
                 # Update for non-first PP ranks.
-                model_inputs["input_ids"] = None
+                # DeepSeek V4/V4.1 hash/vision MoE routing needs raw token ids
+                # on every PP stage (requires_raw_input_tokens).
+                from vllm.model_executor.models.interfaces import (
+                    requires_raw_input_tokens,
+                )
+
+                if not requires_raw_input_tokens(model):
+                    model_inputs["input_ids"] = None
                 model_inputs["inputs_embeds"] = None
                 assert intermediate_tensors is not None
                 model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]

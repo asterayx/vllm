@@ -32,15 +32,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v41.common.engram import (
     DEAD_ID,
-    EngramLayout,
-    _engram_head_shard_weight_loader,
-    _engram_select_rows,
-)
-from vllm.models.deepseek_v41.common.engram import (
     Engram as BaseEngram,
-)
-from vllm.models.deepseek_v41.common.engram import (
+    EngramLayout,
     ParallelEngramEmbedding as BaseParallelEngramEmbedding,
+    _engram_embed_quant_is_mxfp4,
+    _engram_head_shard_weight_loader,
+    _engram_lookup_kernel,
+    _engram_select_rows,
 )
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
@@ -164,12 +162,24 @@ class DPSharedEngramStorage:
     """Registered host weights shared by a node-local DP group with one writer."""
 
     def __init__(
-        self, num_rows: int, dim: int, block_size: int, group: GroupCoordinator
+        self,
+        num_rows: int,
+        dim: int,
+        block_size: int,
+        group: GroupCoordinator,
+        packed_fp4: bool = False,
     ) -> None:
         self.group = group
-        weight_bytes = num_rows * dim
-        storage = self._allocate(weight_bytes + weight_bytes // block_size)
-        self.weight = storage[:weight_bytes].view(torch.float8_e4m3fn).view(-1, dim)
+        row_bytes = dim // 2 if packed_fp4 else dim
+        weight_bytes = num_rows * row_bytes
+        scale_bytes = num_rows * dim // block_size
+        storage = self._allocate(weight_bytes + scale_bytes)
+        weight = storage[:weight_bytes]
+        self.weight = (
+            weight.view(-1, row_bytes)
+            if packed_fp4
+            else weight.view(torch.float8_e4m3fn).view(-1, dim)
+        )
         self.weight_scale_inv = storage[weight_bytes:].view(-1, dim // block_size)
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
 
@@ -278,8 +288,12 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         cpu_offload: bool = False,
         dp_shared_memory: bool = False,
         use_thp: bool = False,
+        storage_path: str | None = None,
+        packed_fp4: bool = False,
     ) -> None:
         self.cpu_offload = cpu_offload
+        self.storage_path = storage_path if cpu_offload else None
+        self._file_mapping: mmap.mmap | None = None
         self.dp_shared_memory = dp_shared_memory
         self.use_thp = use_thp
         self._packed: torch.Tensor | None = None
@@ -299,18 +313,37 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             raise RuntimeError("Engram CPU offload requires UVA support")
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
         self._view_src: tuple[int, int] | None = None
-        super().__init__(num_embeddings, dim, head_sizes, block_size)
+        super().__init__(
+            num_embeddings, dim, head_sizes, block_size, packed_fp4=packed_fp4
+        )
         if cpu_offload:
             # Constant dummy values avoid randomizing huge CPU lookup tables.
             set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
             # The ue8m0 encoding of scale 1.0 is exponent byte 127.
             set_weight_attrs(self.weight_scale_inv, {"dummy_weight_value": 127})
+            if self._file_mapping is not None:
+                logger.info(
+                    "Engram table file-backed (no pin) at %s: %d rows x %d%s, "
+                    "%.2f GiB, tp_rank=%d",
+                    self._file_path,
+                    self.part_num_embeddings,
+                    self.row_bytes,
+                    " (mxfp4 packed)" if self.packed_fp4 else "",
+                    self.part_num_embeddings
+                    * (self.row_bytes + dim // block_size)
+                    / 1024**3,
+                    get_tensor_model_parallel_rank(),
+                )
+        if cpu_offload and self._file_mapping is None:
             logger.info(
-                "Engram table offloaded to pinned host memory: %d rows x %d, "
+                "Engram table offloaded to pinned host memory: %d rows x %d%s, "
                 "%.2f GiB %s",
                 self.part_num_embeddings,
-                dim,
-                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+                self.row_bytes,
+                " (mxfp4 packed)" if self.packed_fp4 else "",
+                self.part_num_embeddings
+                * (self.row_bytes + dim // block_size)
+                / 1024**3,
                 "shared across DP replicas" if dp_shared_memory else "per rank",
             )
 
@@ -324,40 +357,127 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             group = get_engram_dp_group()
             assert group is not None
             storage = DPSharedEngramStorage(
-                self.part_num_embeddings, self.dim, self.block_size, group
+                self.part_num_embeddings,
+                self.dim,
+                self.block_size,
+                group,
+                packed_fp4=self.packed_fp4,
             )
             self._shared_memory = storage
             self._weight_loader = storage.load_weight
             return storage.weight, storage.weight_scale_inv
         if not self.cpu_offload:
             return super()._allocate_weights()
+        if self.storage_path:
+            return self._allocate_file_backed(self.storage_path)
+        scale_dim = self.dim // self.block_size
+        weight_dtype = torch.uint8 if self.packed_fp4 else torch.float8_e4m3fn
         if self.use_thp:
-            weight_bytes = self.part_num_embeddings * self.dim
-            packed = _allocate_huge_page_storage(
-                weight_bytes + weight_bytes // self.block_size
-            )
+            weight_bytes = self.part_num_embeddings * self.row_bytes
+            scale_bytes = self.part_num_embeddings * scale_dim
+            packed = _allocate_huge_page_storage(weight_bytes + scale_bytes)
             if packed is not None:
                 self._packed = packed
                 return (
-                    packed[:weight_bytes].view(torch.float8_e4m3fn).view(-1, self.dim),
-                    packed[weight_bytes:].view(-1, self.dim // self.block_size),
+                    packed[:weight_bytes].view(weight_dtype).view(-1, self.row_bytes),
+                    packed[weight_bytes:].view(-1, scale_dim),
                 )
         # Model initialization may be inside a CUDA device context.
         return (
             torch.empty(
                 self.part_num_embeddings,
-                self.dim,
-                dtype=torch.float8_e4m3fn,
+                self.row_bytes,
+                dtype=weight_dtype,
                 device="cpu",
                 pin_memory=True,
             ),
             torch.empty(
                 self.part_num_embeddings,
-                self.dim // self.block_size,
+                scale_dim,
                 dtype=torch.uint8,
                 device="cpu",
                 pin_memory=True,
             ),
+        )
+
+    def _allocate_file_backed(self, path: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """MAP_SHARED file under `path`; pages are reclaimable page cache."""
+        os.makedirs(path, exist_ok=True)
+        scale_dim = self.dim // self.block_size
+        weight_bytes = self.part_num_embeddings * self.row_bytes
+        total = weight_bytes + self.part_num_embeddings * scale_dim
+        fmt = "mxfp4" if self.packed_fp4 else "fp8"
+        name = (
+            f"engram_n{self.num_embeddings}_v{self.vocab_start_idx}-"
+            f"{self.vocab_end_idx}_d{self.dim}_r{self.row_bytes}_{fmt}"
+            f"_b{self.block_size}_tp{get_tensor_model_parallel_rank()}.bin"
+        )
+        self._file_path = os.path.join(path, name)
+        fd = os.open(self._file_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            os.ftruncate(fd, total)
+            mapping = mmap.mmap(fd, total, flags=mmap.MAP_SHARED)
+        finally:
+            os.close(fd)
+        self._file_mapping = mapping
+        packed = torch.from_numpy(np.frombuffer(mapping, dtype=np.uint8))
+        weight_dtype = torch.uint8 if self.packed_fp4 else torch.float8_e4m3fn
+        return (
+            packed[:weight_bytes].view(weight_dtype).view(-1, self.row_bytes),
+            packed[weight_bytes:].view(-1, scale_dim),
+        )
+
+    def lookup(
+        self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
+    ) -> None:
+        if self._file_mapping is None:
+            return super().lookup(indices, out, background)
+        num_tokens = indices.shape[0]
+        local_heads = self.part_n_hash_cols
+        if not num_tokens * local_heads:
+            return
+        head_end = min(self.head_start + local_heads, self.n_hash_cols)
+        nh = head_end - self.head_start
+        device = out.device
+        ids = indices[:, self.head_start : head_end].to("cpu", torch.int64)
+        owned = (ids >= self.vocab_start_idx) & (ids < self.vocab_end_idx)
+        local = torch.where(owned, ids - self.vocab_start_idx, 0).reshape(-1)
+        if self.packed_fp4:
+            weight = self.weight.data.index_select(0, local)
+        else:
+            weight = self.weight.data.view(torch.uint8).index_select(0, local)
+        scales = self.weight_scale_inv.data.index_select(0, local)
+        remap = torch.arange(num_tokens * nh, dtype=torch.int64).view(num_tokens, nh)
+        remap = torch.where(owned, remap, -1)
+        new_ids = torch.full((num_tokens, self.n_hash_cols), -1, dtype=torch.int64)
+        new_ids[:, self.head_start : head_end] = remap
+        if self.packed_fp4:
+            weight = weight.to(device, non_blocking=True)
+        else:
+            weight = weight.to(device).view(torch.float8_e4m3fn)
+        scales = scales.to(device)
+        new_ids = new_ids.to(device)
+        rows = num_tokens * local_heads
+        tiles = (rows + 15) // 16
+        grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
+        _engram_lookup_kernel[(grid,)](
+            weight,
+            scales,
+            new_ids,
+            out,
+            0,
+            num_tokens * nh,
+            rows,
+            new_ids.stride(0),
+            new_ids.stride(1),
+            HEAD_START=self.head_start,
+            LOCAL_HEADS=local_heads,
+            TOTAL_HEADS=self.n_hash_cols,
+            DIM=self.dim,
+            QUANT_BLOCK=self.block_size,
+            BLOCK_R=16,
+            GRID=grid,
+            PACKED_FP4=self.packed_fp4,
         )
 
     def collapse_huge_pages(self) -> None:
@@ -450,6 +570,8 @@ class Engram(BaseEngram):
             cpu_offload=engram_config.cpu_offload,
             dp_shared_memory=bool(engram_config.dp_shared_memory),
             use_thp=engram_config.use_thp,
+            storage_path=engram_config.storage_path,
+            packed_fp4=_engram_embed_quant_is_mxfp4(),
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:

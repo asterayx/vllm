@@ -808,6 +808,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         q = self._prepare_query(q, output)
         swa_cache = self._as_sparse_cache(self.swa_cache_layer.kv_cache)
         extra_cache = self._as_sparse_cache(kv_cache) if kv_cache is not None else None
+        _scrub_null_row(swa_cache)
+        _scrub_null_row(extra_cache)
         if extra_cache is not None and extra_sparse_indices is None:
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
@@ -826,6 +828,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             extra_sparse_indices=extra_sparse_indices,
             extra_sparse_topk_lens=extra_sparse_lengths,
         )
+        _dsv4_dbg_dump(self, "decode", q, swa_cache, swa_indices, swa_lens, output, swa_metadata)
 
     def _forward_prefill(
         self,
@@ -895,6 +898,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     "Compressed sparse MLA layers require their compressed KV cache."
                 )
             extra_kv_paged = self._as_sparse_cache(compressed_k_cache)
+        _scrub_null_row(swa_kv_paged)
+        _scrub_null_row(extra_kv_paged)
 
         num_chunks = (
             num_prefills + self.PREFILL_CHUNK_SIZE - 1
@@ -941,3 +946,58 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 extra_sparse_indices=extra_sparse_indices_chunk,
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
             )
+            _dsv4_dbg_dump(self, "prefill", q_chunk, swa_kv_paged, swa_indices_chunk, swa_lens_chunk, output[query_start:query_end], swa_metadata)
+
+
+import os as _dbg_os
+_DSV4_DUMP = _dbg_os.environ.get("DPSK_DUMP_DIR")
+_dsv4_dump_n = {}
+
+
+def _dsv4_dbg_dump(layer, tag, q, cache, idx, lens, out, md):
+    if not _DSV4_DUMP or ".layers.0." not in (layer.prefix + "."):
+        return
+    import torch.distributed as _d
+    r = _d.get_rank() if _d.is_initialized() else 0
+    if r != 0:
+        return
+    n = _dsv4_dump_n.get(tag, 0)
+    if n >= 3:
+        return
+    _dsv4_dump_n[tag] = n + 1
+    torch.cuda.synchronize()
+    bt = md.block_table
+    nreq = md.num_prefills + md.num_decodes
+    used = torch.unique(bt[:max(nreq, 1)].flatten()).long()
+    d = dict(q=q.cpu(), idx=idx.cpu(), lens=lens.cpu(), out=out.cpu(),
+             cache_shape=tuple(cache.shape), cache_stride=tuple(cache.stride()),
+             used_blocks=used.cpu(), blocks=cache[used.clamp(min=0)].cpu(),
+             block_table=bt[:max(nreq, 1)].cpu(), slot_mapping=md.slot_mapping.cpu(),
+             block_size=md.block_size,
+             seq_lens=None if md.seq_lens is None else md.seq_lens.cpu(),
+             qsl=None if md.query_start_loc_cpu is None else md.query_start_loc_cpu.clone(),
+             sink=layer.attn_sink.float().cpu() if isinstance(layer.attn_sink, torch.Tensor) else None,
+             scale=layer.scale, prefix=layer.prefix)
+    f = _dbg_os.path.join(_DSV4_DUMP, f"{tag}{n}.pt")
+    torch.save(d, f)
+    print(f"[DSV4DUMP] {f} cache={tuple(cache.shape)} stride={tuple(cache.stride())} "
+          f"bs={md.block_size} idx={tuple(idx.shape)} out_nan={int(out.float().isnan().sum())}",
+          flush=True)
+
+
+def _scrub_null_row(cache: torch.Tensor | None) -> None:
+    """Zero row 0 of the null block (block 0) of a packed fp8_ds_mla pool.
+
+    The SM120 sparse-MLA kernels clamp padding indices (-1) to slot 0 and
+    still bulk-load that row into the P.V tile; only the softmax weight is
+    masked to 0. Cache groups overlay one backing buffer, so the null block
+    holds bytes written by other groups' trash writes (e.g. NaN fp8 / 0xFF
+    scales), and 0 * NaN poisons the output columns (layer-0 NaN on yzss,
+    2026-11-04). Keep that one 584 B record finite.
+    """
+    if cache is None or cache.dtype != torch.uint8 or cache.shape[-1] != 584:
+        return
+    pbs = cache.shape[1]
+    blk0 = cache[0].reshape(-1)
+    blk0[:576].zero_()
+    blk0[pbs * 576 : pbs * 576 + 8].zero_()

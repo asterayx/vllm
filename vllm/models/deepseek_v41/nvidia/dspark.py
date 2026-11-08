@@ -355,6 +355,35 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
+    # --- DPSK_VOCAB_LOCAL_ARGMAX: vocab-shard-local greedy drafting ----------
+    def vocab_local_argmax_supported(self) -> bool:
+        lp = self.logits_processor
+        w2 = self.model.markov_head.markov_w2
+        return (
+            lp.soft_cap is None
+            and lp.scale == 1.0
+            and not lp.logits_as_input
+            and getattr(w2, "tp_size", 1) == 1
+            and hasattr(w2, "weight")
+            and w2.weight.dim() == 2
+            and type(w2.quant_method).__name__
+            in ("UnquantizedEmbeddingMethod", "UnquantizedLinearMethod")
+        )
+
+    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Local vocab-shard base logits [N, shard] (no all-gather)."""
+        return self.logits_processor(
+            self.lm_head, self.model.norm(hidden_states), skip_gather=True
+        )
+
+    def markov_bias_local(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        """Markov bias restricted to this rank's lm_head vocab shard rows."""
+        si = self.lm_head.shard_indices
+        start = si.org_vocab_start_index
+        end = si.org_vocab_end_index
+        w2 = self.model.markov_head.markov_w2.weight[start:end]
+        return torch.nn.functional.linear(markov_embed.to(w2.dtype), w2)
+
     def compute_confidence(
         self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
     ) -> torch.Tensor:

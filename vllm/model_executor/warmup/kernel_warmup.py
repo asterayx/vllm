@@ -458,7 +458,11 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         world.barrier()
         tuner.load_configs(str(cache_path))
 
-    group = world.cpu_group if world.world_size > 1 else None
+    from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
+        _pp_safe_autotune_group,
+    )
+
+    group = _pp_safe_autotune_group(world)
     set_autotune_process_group(group)
     try:
         with (

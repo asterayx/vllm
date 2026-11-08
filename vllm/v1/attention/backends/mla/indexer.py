@@ -1591,7 +1591,15 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if (
+                current_platform.is_cuda()
+                and has_deep_gemm()
+                and not (
+                    current_platform.is_device_capability_family(120)
+                    and self.kv_cache_spec.num_states not in (32, 64)
+                )
+            ):
+                # SM120: non-32/64 pages use the torch ref logits fallback.
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,

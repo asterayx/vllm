@@ -50,6 +50,12 @@ class EngramConfig:
     the other settings allow it, falling back to per-replica tables when DP
     replicas are not co-located on one node or /dev/shm cannot hold them."""
 
+    storage_path: str | None = None
+    """Directory for file-backed (NVMe) CPU-offloaded tables. When set, tables
+    live in MAP_SHARED files under this path (reclaimable page cache, no
+    pinned host RAM) and lookups gather rows on the CPU before upload.
+    Requires cpu_offload=True, dp_shared_memory off and use_thp off."""
+
     use_thp: bool = False
     """Back private CPU-offloaded tables with transparent huge pages (best
     effort, falls back to ordinary pinned pages). Prefaulting the tables at
@@ -59,6 +65,13 @@ class EngramConfig:
     def _validate_shared_memory(self) -> Self:
         if self.dp_shared_memory and not self.cpu_offload:
             raise ValueError("dp_shared_memory requires cpu_offload=True")
+        if self.storage_path and (
+            not self.cpu_offload or self.dp_shared_memory or self.use_thp
+        ):
+            raise ValueError(
+                "storage_path requires cpu_offload=True, dp_shared_memory off "
+                "and use_thp off"
+            )
         if self.use_thp and (not self.cpu_offload or self.dp_shared_memory):
             raise ValueError(
                 "use_thp requires cpu_offload=True and dp_shared_memory=False"

@@ -602,11 +602,13 @@ def _engram_lookup_kernel(
     QUANT_BLOCK: tl.constexpr,
     BLOCK_R: tl.constexpr,
     GRID,
+    PACKED_FP4: tl.constexpr = False,
 ):
-    """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
+    """Gather FP8 or packed MXFP4 rows, apply ue8m0 block scales, write bf16.
 
     Only this rank's heads are read; padded heads write zeros for all-gather.
     `weight`/`scales` may address pinned host memory through UVA.
+    MXFP4 rows are E2M1 nibbles, two per byte (even column in the low nibble).
     """
     cols = tl.arange(0, DIM)
     scale_cols = cols // QUANT_BLOCK
@@ -623,11 +625,26 @@ def _engram_lookup_kernel(
         owned = valid & (head < TOTAL_HEADS)
         owned &= (index >= vocab_start) & (index < vocab_end)
         local = tl.where(owned, index - vocab_start, 0)
-        values = tl.load(
-            weight + local[:, None] * DIM + cols[None, :],
-            mask=owned[:, None],
-            other=0.0,
-        )
+        if PACKED_FP4:
+            # Even column in the low nibble. E2M1 magnitude with e = bits 2:1,
+            # m = bit 0: m * 0.5 if e == 0, else (2 + m) * 2**(e - 2).
+            byte = tl.load(
+                weight + local[:, None] * (DIM // 2) + (cols // 2)[None, :],
+                mask=owned[:, None],
+                other=0,
+            ).to(tl.int32)
+            nib = tl.where(cols[None, :] % 2 == 0, byte & 0xF, (byte >> 4) & 0xF)
+            e = (nib & 0x7) >> 1
+            m = (nib & 0x1).to(tl.float32)
+            pow2 = ((e - 2 + 127) << 23).to(tl.float32, bitcast=True)
+            mag = tl.where(e == 0, m * 0.5, (2.0 + m) * pow2)
+            values = tl.where((nib & 0x8) != 0, -mag, mag)
+        else:
+            values = tl.load(
+                weight + local[:, None] * DIM + cols[None, :],
+                mask=owned[:, None],
+                other=0.0,
+            )
         scale = tl.load(
             scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
             mask=owned[:, None],
@@ -642,10 +659,42 @@ def _engram_lookup_kernel(
         )
 
 
+
+def _engram_embed_quant_is_mxfp4() -> bool:
+    """Read checkpoint opt-in `quantization_config.engram_embed_quant=mxfp4`."""
+    vllm_config = get_current_vllm_config()
+    model_config = vllm_config.model_config
+    configs = [
+        getattr(model_config, "hf_config", None),
+        getattr(model_config, "hf_text_config", None),
+    ]
+    embed_quant = "fp8"
+    for cfg in configs:
+        if cfg is None:
+            continue
+        hf_quant = getattr(cfg, "quantization_config", None)
+        if hf_quant is None:
+            continue
+        if isinstance(hf_quant, dict):
+            embed_quant = hf_quant.get("engram_embed_quant", "fp8")
+        elif hasattr(hf_quant, "get"):
+            embed_quant = hf_quant.get("engram_embed_quant", "fp8")
+        else:
+            embed_quant = getattr(hf_quant, "engram_embed_quant", None) or "fp8"
+        break
+    if embed_quant not in ("fp8", "mxfp4"):
+        raise ValueError(
+            f"Unsupported engram_embed_quant {embed_quant!r}; "
+            "expected 'fp8' or 'mxfp4'"
+        )
+    return embed_quant == "mxfp4"
+
+
 class ParallelEngramEmbedding(nn.Module):
-    """TP-sharded hash heads with FP8 rows and per-block E8M0 scales."""
+    """TP-sharded hash heads with FP8 or packed MXFP4 rows and E8M0 scales."""
 
     _weight_loader = staticmethod(_engram_head_shard_weight_loader)
+    packed_fp4: bool = False
 
     def __init__(
         self,
@@ -653,13 +702,17 @@ class ParallelEngramEmbedding(nn.Module):
         dim: int,
         head_sizes: tuple[int, ...],
         block_size: int = 32,
+        packed_fp4: bool = False,
     ) -> None:
         super().__init__()
         assert head_sizes and all(size > 0 for size in head_sizes)
         assert sum(head_sizes) <= num_embeddings
+        assert not packed_fp4 or dim % 2 == 0
         self.num_embeddings = num_embeddings
         self.dim = dim
         self.block_size = block_size
+        self.packed_fp4 = packed_fp4
+        self.row_bytes = dim // 2 if packed_fp4 else dim
         self.n_hash_cols = len(head_sizes)
         self.tp_size = get_tensor_model_parallel_world_size()
         num_shards, head_rank = self._get_shard_info()
@@ -693,8 +746,11 @@ class ParallelEngramEmbedding(nn.Module):
         return self.tp_size, get_tensor_model_parallel_rank()
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        weight_dtype = torch.uint8 if self.packed_fp4 else torch.float8_e4m3fn
         return (
-            torch.empty(self.part_num_embeddings, self.dim, dtype=torch.float8_e4m3fn),
+            torch.empty(
+                self.part_num_embeddings, self.row_bytes, dtype=weight_dtype
+            ),
             torch.empty(
                 self.part_num_embeddings, self.dim // self.block_size, dtype=torch.uint8
             ),
@@ -735,6 +791,7 @@ class ParallelEngramEmbedding(nn.Module):
             QUANT_BLOCK=self.block_size,
             BLOCK_R=16,
             GRID=grid,
+            PACKED_FP4=self.packed_fp4,
         )
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
@@ -954,6 +1011,7 @@ class Engram(nn.Module):
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
+            packed_fp4=_engram_embed_quant_is_mxfp4(),
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:

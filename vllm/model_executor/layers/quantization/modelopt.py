@@ -1778,6 +1778,17 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             return build_linear_method(getattr(self, subcfg_attr), quant_algo, prefix)
 
         if isinstance(layer, RoutedExperts):
+            # DSpark drafter on NVFP4 checkpoints: mtp.* routed experts ship as
+            # native MXFP4 (int8 packed + e8m0 group-32 scales) and are listed
+            # in the ignore set, not as NVFP4. Allocating them as NVFP4 leaves
+            # weight_scale_2/input_scale uninitialized -> NaN draft (yzss
+            # 2026-11-04, 0% MTP acceptance).
+            if getattr(self, "dspark_draft_moe_mxfp4", False):
+                from vllm.model_executor.layers.quantization.mxfp4 import (
+                    Mxfp4MoEMethod,
+                )
+
+                return Mxfp4MoEMethod(layer.moe_config)
             if quant_algo in _BLOCK_FP8_MOE_ALGOS:
                 return Fp8MoEMethod(self.fp8_block_config, layer)
             if quant_algo == "FP8":

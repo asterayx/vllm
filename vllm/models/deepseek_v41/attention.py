@@ -551,7 +551,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
             backend_cls=self.swa_backend_cls,
-            block_size=32,
+            # SM120 FlashInfer sparse-MLA (flashinfer 0.7.0.post1) only has
+            # dsv4 kernels for page_block_size=64; 32 fails at profile time.
+            block_size=64 if current_platform.is_device_capability_family(120) else 32,
             packed_bytes_per_token=self.swa_bytes_per_token,
             packed_page_alignment=self.kv_page_alignment,
             bounded_replay=swa_bounded_replay,
@@ -663,6 +665,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             hidden_states
         )
         qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
+        _dbg = getattr(self, "_dbg", False)
+        if _dbg:
+            from vllm.models.deepseek_v41.nvidia.model import _nan_probe
+            _nan_probe("A0.proj", hs=hidden_states, qr_kv=qr_kv, kv=kv,
+                       **({"qr": qr} if isinstance(qr, torch.Tensor) else {}))
 
         self._prepare_and_attn_fn(
             hidden_states,
@@ -674,6 +681,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             positions,
             attn_out,
         )
+        if _dbg:
+            _nan_probe("A0.attn_out", attn_out=attn_out)
+            _o = self._o_proj(attn_out, positions)
+            _nan_probe("A0.o_proj", o=_o)
+            return _o
         return self._o_proj(attn_out, positions)
 
     def bind_gemm_rs(self) -> None:
@@ -730,6 +742,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         linears = [self.wq_b]
         if self.indexer is not None:
             linears.append(self.indexer.wq_b)
+        # try51: let wq_b / indexer.wq_b take bf16 so the fp8 skinny path runs
+        import os as _os
+        if (_os.environ.get("DPSK_FP8_SKINNY_LINEAR", "0") == "1"
+                and _os.environ.get("DPSK_FP8_SKINNY_QQ_UNFUSE", "1") == "1"
+                and any(getattr(m, "_fp8_skinny", None) is not None for m in linears)):
+            return False
         return can_fuse_query_quant(linears)
 
     def _split_qkv_and_norm(
@@ -864,6 +882,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             indexer_result = prepare_indexer()
         index_q, index_q_scale, index_weights_out = indexer_result
 
+        if getattr(self, "_dbg", False):
+            from vllm.models.deepseek_v41.nvidia.model import _nan_probe
+            _nan_probe("A0.q", q=q)
         self._sparse_indexer_and_attn(
             hidden_states,
             index_q,

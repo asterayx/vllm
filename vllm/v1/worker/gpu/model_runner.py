@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -179,6 +180,14 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
+
+import os as _os
+
+# try45: vocab-shard-local greedy target argmax (see sample()).
+_DPSK_VOCAB_LOCAL_ARGMAX = _os.environ.get("DPSK_VOCAB_LOCAL_ARGMAX", "0") == "1"
+_DPSK_VOCAB_LOCAL_ARGMAX_CHECK = int(
+    _os.environ.get("DPSK_VOCAB_LOCAL_ARGMAX_CHECK", "0")
+)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -401,6 +410,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     eplb_models_added = self.eplb.maybe_register_speculator(
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
+        if os.environ.get("DPSK_LMHEAD_SKINNY", "0") == "1":
+            from vllm.models.deepseek_v41.nvidia.lmhead_gemm import (
+                enable_dpsk_lmhead_skinny,
+            )
+
+            enable_dpsk_lmhead_skinny(
+                self.model, getattr(self.speculator, "model", None)
+            )
+        if os.environ.get("DPSK_WO_A_FP8_SKINNY", "0") == "1":
+            from vllm.models.deepseek_v41.nvidia.ops.wo_a_fp8_skinny import (
+                enable_dpsk_wo_a_fp8,
+            )
+
+            enable_dpsk_wo_a_fp8(self.model, getattr(self.speculator, "model", None))
+        if os.environ.get("DPSK_FP8_SKINNY_LINEAR", "0") == "1":
+            from vllm.models.deepseek_v41.nvidia.ops.fp8_skinny_linear import (
+                enable_dpsk_fp8_skinny_linear,
+            )
+
+            enable_dpsk_fp8_skinny_linear(
+                self.model, getattr(self.speculator, "model", None)
+            )
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -717,6 +748,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_profiling=is_profiling,
             piecewise_capture_available=piecewise_capture_available,
         )
+        # try62: DPSK_PP1_FULL_CG=1 -> last PP rank (no engram layers) uses FULL
+        # graphs for uniform decode, so per-layer eager breaks (indexer topk,
+        # sparse MLA decode) are captured inline; prefill/mixed stay PIECEWISE.
+        import os as _o
+        from vllm.distributed import get_pp_group as _gpp
+        if (
+            _o.environ.get("DPSK_PP1_FULL_CG", "0") == "1"
+            and _gpp().world_size > 1
+            and _gpp().is_last_rank
+            and cudagraph_mode == CUDAGraphMode.PIECEWISE
+        ):
+            logger.warning("DPSK_PP1_FULL_CG=1: last PP rank PIECEWISE -> FULL_AND_PIECEWISE")
+            cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
             self.device,
@@ -1559,6 +1603,42 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        if (
+            _DPSK_VOCAB_LOCAL_ARGMAX
+            and self.batch_sharder is None
+            and grammar_output is None
+            and input_batch.num_reqs > 0
+            and input_batch.num_draft_tokens > 0
+            and self.rejection_sampler is not None
+            and self.speculator is not None
+            and self.rejection_sampler.can_greedy_from_top_tokens(
+                input_batch, self.speculator.draft_logits
+            )
+        ):
+            # try45: greedy verification from vocab-shard-local argmax; only
+            # (max, idx) pairs are all-gathered instead of full-vocab logits.
+            m = getattr(self.model, "language_model", self.model)
+            sample_hidden_states = hidden_states[input_batch.logits_indices]
+            top_tokens = m.logits_processor.get_top_tokens(
+                m.lm_head, sample_hidden_states
+            )
+            if _DPSK_VOCAB_LOCAL_ARGMAX_CHECK > 0:
+                globals()["_DPSK_VOCAB_LOCAL_ARGMAX_CHECK"] -= 1
+                ref = self.model.compute_logits(sample_hidden_states).argmax(-1)
+                nbad = int((ref != top_tokens).sum())
+                logger.warning(
+                    "DPSK_VOCAB_LOCAL_ARGMAX check: rows=%d mismatches=%d",
+                    ref.numel(), nbad,
+                )
+            sampler_output = self.rejection_sampler.greedy_from_top_tokens(
+                top_tokens, input_batch
+            )
+            return (
+                sampler_output,
+                sampler_output.num_sampled,
+                sampler_output.num_rejected,
+            )
+
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
@@ -1922,7 +2002,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
-            model_inputs["input_ids"] = None
+            # DeepSeek V4/V4.1 hash/vision MoE routing needs raw token ids
+            # on every PP stage, so keep them for requires_raw_input_tokens.
+            if not requires_raw_input_tokens(self.model):
+                model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
 
             # Prepare the intermediate tensors.

@@ -100,6 +100,17 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     # VllmConfig post-init restores the target's quant config because the target
     # config is retained for DSpark's target-layer metadata, so we must override it.
     draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
+    _dq = draft_vllm_config.quant_config
+    _dq_name = _dq.get_name() if _dq is not None else None
+    if _dq is not None and _dq_name in ("modelopt_mixed", "deepseek_v4_fp8"):
+        # NVFP4 DeepSeek-V4.x ckpts keep mtp.* routed experts in native MXFP4.
+        _dq.dspark_draft_moe_mxfp4 = True
+    logger.info(
+        "DSpark drafter quant=%s model_type=%s moe_mxfp4=%s",
+        _dq_name,
+        getattr(draft_model_config.hf_config, "model_type", None),
+        getattr(_dq, "dspark_draft_moe_mxfp4", False),
+    )
 
     with set_model_tag("dspark_head"):
         draft_model = get_model(

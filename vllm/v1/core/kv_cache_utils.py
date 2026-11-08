@@ -1788,7 +1788,13 @@ def get_kv_cache_config_from_groups(
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
+            # PP: a projected group can be empty on this worker while still
+            # carrying the global UniformTypeKVCacheSpecs; only allocate the
+            # worker's own layers.
+            group_layer_set = set(group.layer_names)
             for layer_name, spec in group_spec.kv_cache_specs.items():
+                if layer_name not in group_layer_set:
+                    continue
                 layers_by_spec[spec].append(layer_name)
         elif group.layer_names:
             layers_by_spec[group_spec].extend(group.layer_names)

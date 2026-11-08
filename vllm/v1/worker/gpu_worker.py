@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
 
+import os as _dpsk_os
+# try59: DPSK_PP_NO_AG=1 -> PP send full tensor per TP rank (no TP-sliced send + AllGather)
+_DPSK_PP_NO_AG = _dpsk_os.environ.get("DPSK_PP_NO_AG", "0") == "1"
 import gc
 import os
 import time
@@ -177,6 +180,64 @@ class AsyncIntermediateTensors(IntermediateTensors):
         if name == "tensors" and not object.__getattribute__(self, "_comm_waited"):
             object.__getattribute__(self, "wait_for_comm")()
         return object.__getattribute__(self, name)
+
+
+_DPSK_PREP_AHEAD = _dpsk_os.environ.get("DPSK_PREP_AHEAD", "0") == "1"
+_DPSK_PP_META_CACHE = _dpsk_os.environ.get("DPSK_PP_META_CACHE", "0") == "1"
+
+
+def _dpsk_meta_key(so):
+    """try63: identical on all PP stages; only uniform batches are cached."""
+    if not _DPSK_PP_META_CACHE:
+        return None
+    v = list(so.num_scheduled_tokens.values())
+    if not v or min(v) != max(v):
+        return None
+    return (so.total_num_scheduled_tokens, len(v), v[0])
+
+
+class _DpskThreadedRecvTensors(AsyncIntermediateTensors):
+    """try61: irecv_tensor_dict on a helper thread; .tensors joins it."""
+
+    def __init__(self, device, all_gather_tensors) -> None:
+        import threading
+        IntermediateTensors.__init__(self, {})
+        self._comm_handles = None
+        self._comm_postprocess = None
+        self._comm_waited = False
+        self._dpsk_res = None
+        self._dpsk_exc = None
+        stream = torch.cuda.current_stream(device)
+
+        def _run():
+            try:
+                torch.cuda.set_device(device)
+                with torch.cuda.stream(stream):
+                    self._dpsk_res = get_pp_group().irecv_tensor_dict(
+                        all_gather_group=None if _DPSK_PP_NO_AG else get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                    )
+            except BaseException as e:  # noqa: BLE001
+                self._dpsk_exc = e
+
+        self._dpsk_thread = threading.Thread(target=_run, daemon=True)
+        self._dpsk_thread.start()
+
+    def wait_for_comm(self) -> None:
+        if object.__getattribute__(self, "_comm_waited"):
+            return
+        object.__getattribute__(self, "_dpsk_thread").join()
+        exc = object.__getattribute__(self, "_dpsk_exc")
+        if exc is not None:
+            raise exc
+        tensor_dict, handles, post = object.__getattribute__(self, "_dpsk_res")
+        assert tensor_dict is not None
+        object.__setattr__(self, "tensors", tensor_dict)
+        for h in handles or []:
+            h.wait()
+        for fn in post or []:
+            fn()
+        object.__setattr__(self, "_comm_waited", True)
 
 
 class Worker(WorkerBase):
@@ -1264,11 +1325,17 @@ class Worker(WorkerBase):
                 )
             }
 
-        if forward_pass and not get_pp_group().is_first_rank:
+        if forward_pass and not get_pp_group().is_first_rank and _DPSK_PREP_AHEAD:
+            # try61: run the CPU-blocking metadata recv + NCCL irecv in a helper
+            # thread so prepare_inputs/prepare_attn overlap the stage-0 wait.
+            intermediate_tensors = _DpskThreadedRecvTensors(
+                self.device, all_gather_tensors)
+        elif forward_pass and not get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
+                    all_gather_group=None if _DPSK_PP_NO_AG else get_tp_group(),
                     all_gather_tensors=all_gather_tensors,
+                    meta_key=_dpsk_meta_key(scheduler_output),
                 )
             )
             assert tensor_dict is not None
@@ -1305,8 +1372,9 @@ class Worker(WorkerBase):
         # waited at the top of the next step.
         handles = get_pp_group().isend_tensor_dict(
             output.tensors,
-            all_gather_group=get_tp_group(),
+            all_gather_group=None if _DPSK_PP_NO_AG else get_tp_group(),
             all_gather_tensors=all_gather_tensors,
+            meta_key=_dpsk_meta_key(scheduler_output),
         )
         self._pp_send_work = handles[1:]
 

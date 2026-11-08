@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -315,6 +317,72 @@ def kv_cache_as_quant_view(
             stride=(page_bytes, fp4_bytes, fp4_bytes, 1),
         )
     return kv_cache.unsqueeze(-2)
+
+
+_DPSK_INDEXER_SM120_FIX = os.environ.get("DPSK_INDEXER_SM120_FIX", "0") == "1"
+
+
+def _sm120_needs_ref_paged_logits(kv_cache: torch.Tensor, use_fp4_cache: bool) -> bool:
+    """SM120 DeepGEMM fp8 paged MQA logits only supports 64-row pages; the
+    DeepSeek-V4.1 ratio-1 indexer uses 128-row pages there."""
+    return (
+        current_platform.is_cuda()
+        and not use_fp4_cache
+        and current_platform.is_device_capability_family(120)
+        and kv_cache.shape[1] != 64
+    )
+
+
+def _paged_mqa_logits_ref_fp8(
+    q_fp8: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    """Torch fallback for fp8 paged MQA logits (segregated page layout:
+    [block_size * D fp8 values | block_size fp32 scales])."""
+    B, N, H, D = q_fp8.shape
+    bs = kv_cache.shape[1]
+    page = int(kv_cache.stride(0))
+    nb_total = kv_cache.shape[0]
+    out = torch.full(
+        (B * N, max_model_len), float("-inf"), dtype=torch.float32,
+        device=q_fp8.device,
+    )
+    if B == 0:
+        return out
+    cl = context_lens.reshape(B, -1)
+    max_len = int(cl.max().item())
+    max_len = min(max_len, max_model_len)
+    if max_len <= 0:
+        return out
+    nblk = min((max_len + bs - 1) // bs, block_table.shape[1])
+    flat = torch.as_strided(kv_cache, (nb_total, bs * (D + 4)), (page, 1))
+    bt = block_table[:B, :nblk].long().clamp_(0, nb_total - 1)
+    T = nblk * bs
+    wq = weights.reshape(B, N, H).float()
+    qf = q_fp8.float()
+    chunk = 4
+    for b0 in range(0, B, chunk):
+        b1 = min(B, b0 + chunk)
+        pages = flat[bt[b0:b1]]  # [b, nblk, bs*(D+4)]
+        k = (
+            pages[..., : bs * D].contiguous().view(torch.float8_e4m3fn)
+            .view(b1 - b0, nblk, bs, D).float()
+        )
+        sc = pages[..., bs * D : bs * (D + 4)].contiguous().view(torch.float32)
+        sc = sc.view(b1 - b0, nblk, bs)
+        k = (k * sc.unsqueeze(-1)).view(b1 - b0, T, D)
+        score = torch.einsum("bnhd,btd->bnht", qf[b0:b1], k).relu_()
+        lg = (score * wq[b0:b1].unsqueeze(-1)).sum(2)  # [b, N, T]
+        Tc = min(T, max_model_len)
+        lg = lg[..., :Tc]
+        pos = torch.arange(Tc, device=lg.device).view(1, 1, Tc)
+        lg = lg.masked_fill(pos >= cl[b0:b1].unsqueeze(-1), float("-inf"))
+        out.view(B, N, max_model_len)[b0:b1, :, :Tc] = lg
+    return out
 
 
 @eager_break_during_capture
@@ -720,6 +788,32 @@ def sparse_attn_indexer(
                 seq_lens_xpu,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
+                max_model_len,
+            )
+        elif _sm120_needs_ref_paged_logits(kv_cache, use_fp4_cache) and (
+            _DPSK_INDEXER_SM120_FIX
+        ):
+            # DPSK_INDEXER_SM120_FIX=1: fused Triton fp8 paged logits for
+            # 128-row pages (replaces fp32 dequant + einsum simt sgemm).
+            from vllm.model_executor.layers.sm120_paged_mqa_logits import (
+                sm120_paged_mqa_logits_fp8,
+            )
+
+            logits = sm120_paged_mqa_logits_fp8(
+                padded_q_quant_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len,
+            )
+        elif _sm120_needs_ref_paged_logits(kv_cache, use_fp4_cache):
+            logits = _paged_mqa_logits_ref_fp8(
+                padded_q_quant_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
                 max_model_len,
             )
         else:

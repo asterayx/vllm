@@ -73,6 +73,9 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+import os as _dpsk_os
+_DPSK_PP_MICROBATCH = _dpsk_os.environ.get("DPSK_PP_MICROBATCH", "0") == "1"
+
 logger = init_logger(__name__)
 
 
@@ -627,6 +630,15 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        # try55 DPSK_PP_MICROBATCH: cap decodes per step to ceil(n/pp) so PP
+        # stages each get a distinct request group (A/B) in flight.
+        _dpsk_mb_cap = None
+        if _DPSK_PP_MICROBATCH and self.use_pp and len(self.running) >= 2:
+            _pp = self.parallel_config.pipeline_parallel_size
+            _n = sum(1 for r in self.running if not r.is_prefill_chunk)
+            if _n >= 2:
+                _dpsk_mb_cap = -(-_n // _pp)
+        _dpsk_mb_count = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if input_budget <= draft_slots:
@@ -647,6 +659,16 @@ class Scheduler(SchedulerInterface):
                 # partial draft tokens since this prevents uniform decode optimizations.
                 req_index += 1
                 continue
+
+            if (
+                _dpsk_mb_cap is not None
+                and not request.is_prefill_chunk
+                and self.current_step >= request.next_decode_eligible_step
+            ):
+                if _dpsk_mb_count >= _dpsk_mb_cap:
+                    req_index += 1
+                    continue
+                _dpsk_mb_count += 1
 
             if self.current_step < request.next_decode_eligible_step:
                 # V2+PP+async: enforce `pp_size` steps between same-req decodes
