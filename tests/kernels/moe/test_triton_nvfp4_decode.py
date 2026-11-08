@@ -27,11 +27,13 @@ from vllm.model_executor.layers.fused_moe.triton_nvfp4_decode import (
     DSV41_FLASH_TOPK,
     SM120_NUM_SMS,
     TritonNvfp4DecodeMoE,
+    a1_gscale_is_shared,
     cfg_divides_shapes,
     choose_triton_nvfp4_decode_cfg,
     decode_occupancy_rows,
     dsv41_triton_nvfp4_decode_requested,
     normalize_swiglu_clamp_limit,
+    pair_a1_gscales,
     parse_tile_override,
     silu_mul_with_optional_clamp,
     triton_nvfp4_decode_overlay_opt_in,
@@ -231,12 +233,20 @@ def test_dspark_draft_stays_mxfp4_when_triton_opt_in(
     assert isinstance(method, FakeMxfp4)
 
 
-def _fake_prepared(num_experts: int, hidden: int, intermediate: int):
+def _fake_prepared(
+    num_experts: int,
+    hidden: int,
+    intermediate: int,
+    *,
+    a1_gscale: torch.Tensor | None = None,
+):
     e, h, i = num_experts, hidden, intermediate
     c41 = (h // 16 + 3) // 4
     c42 = (i // 16 + 3) // 4
     s1_cols = ((2 * i + 127) // 128 * 128) * c41 * 4
     s2_cols = ((h + 127) // 128 * 128) * c42 * 4
+    if a1_gscale is None:
+        a1_gscale = torch.ones(e, dtype=torch.float32)
     return SimpleNamespace(
         num_experts=e,
         hidden_size=h,
@@ -248,9 +258,14 @@ def _fake_prepared(num_experts: int, hidden: int, intermediate: int):
         w2_blockscale=torch.zeros(e, s2_cols, dtype=torch.float8_e4m3fn),
         w1_alphas=torch.ones(e, dtype=torch.float32),
         w2_alphas=torch.ones(e, dtype=torch.float32),
-        a1_gscale=torch.ones(e, dtype=torch.float32),
+        a1_gscale=a1_gscale,
         a2_gscale=torch.ones(e, dtype=torch.float32),
     )
+
+
+def _unshared_a1_gscale(num_experts: int) -> torch.Tensor:
+    # Distinct per-expert scales, as in DSv4.1 NVFP4 w13_input_scale -> 1/scale.
+    return torch.linspace(0.5, 2.0, num_experts, dtype=torch.float32)
 
 
 def test_runner_accepts_dsv41_tp4_tiles() -> None:
@@ -263,7 +278,35 @@ def test_runner_accepts_dsv41_tp4_tiles() -> None:
     assert runner.I == DSV41_FLASH_INTERMEDIATE_TP4
     assert runner.c["BN1"] == 32
     assert runner.swiglu_limit is None
+    assert runner.a1_gscale_shared is True
     assert cfg_divides_shapes(runner.c, runner.H, runner.I)
+
+
+def test_pair_a1_gscales_selects_per_expert() -> None:
+    g1 = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    ids = torch.tensor([[0, 2], [1, 3]], dtype=torch.int32)
+    got = pair_a1_gscales(g1, ids)
+    assert got.tolist() == [1.0, 3.0, 2.0, 4.0]
+    assert a1_gscale_is_shared(torch.ones(8)) is True
+    assert a1_gscale_is_shared(_unshared_a1_gscale(8)) is False
+
+
+def test_runner_accepts_unshared_a1_gscale() -> None:
+    # Previously raised: "a1_gscale is not shared across experts (xq pre-pass needs it)"
+    g1 = _unshared_a1_gscale(8)
+    prepared = _fake_prepared(
+        8, DSV41_FLASH_HIDDEN, DSV41_FLASH_INTERMEDIATE_TP4, a1_gscale=g1
+    )
+    runner = TritonNvfp4DecodeMoE(
+        prepared,
+        topk=DSV41_FLASH_TOPK,
+        max_m=24,
+        profile="dsv41_sm120",
+        swiglu_limit=10.0,
+    )
+    assert runner.a1_gscale_shared is False
+    assert runner.swiglu_limit == 10.0
+    torch.testing.assert_close(runner.g1, g1)
 
 
 def test_normalize_swiglu_clamp_limit() -> None:
@@ -345,6 +388,46 @@ def test_tri_setup_attaches_with_dsv41_swiglu_limit(
     assert experts._tri is not None
     assert experts._tri.swiglu_limit == 10.0
     assert "Triton NVFP4 decode MoE" in caplog.text
+    assert "swiglu clamp limit set" not in caplog.text
+    assert "a1_gscale is not shared across experts" not in caplog.text
+
+
+def test_tri_setup_attaches_with_unshared_a1_gscale(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("DSV41_EXP_TRITON_MOE", "1")
+    monkeypatch.delenv("QWEN4_EXP_TRITON_MOE", raising=False)
+    monkeypatch.setattr(B12xExperts, "_tri_logged", False)
+    moe = make_dummy_moe_config(
+        num_experts=8,
+        experts_per_token=DSV41_FLASH_TOPK,
+        hidden_dim=DSV41_FLASH_HIDDEN,
+        intermediate_size=DSV41_FLASH_INTERMEDIATE_TP4,
+        in_dtype=torch.bfloat16,
+    )
+    moe.swiglu_limit = 10.0
+    experts = B12xExperts(moe, _nvfp4_quant_config())
+    layer = SimpleNamespace(
+        activation=MoEActivation.SILU,
+        apply_router_weight_on_input=False,
+    )
+    prepared = _fake_prepared(
+        8,
+        DSV41_FLASH_HIDDEN,
+        DSV41_FLASH_INTERMEDIATE_TP4,
+        a1_gscale=_unshared_a1_gscale(8),
+    )
+    with caplog.at_level(
+        logging.INFO, logger="vllm.model_executor.layers.fused_moe.b12x"
+    ):
+        experts._tri_setup(layer, prepared)
+    assert experts._tri is not None
+    assert experts._tri.swiglu_limit == 10.0
+    assert experts._tri.a1_gscale_shared is False
+    assert "Triton NVFP4 decode MoE" in caplog.text
+    assert "swiglu_limit=10.0" in caplog.text
+    assert "a1_gscale=per-expert" in caplog.text
+    assert "a1_gscale is not shared across experts" not in caplog.text
     assert "swiglu clamp limit set" not in caplog.text
 
 

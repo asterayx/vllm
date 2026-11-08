@@ -11,9 +11,12 @@ Hosted by B12xExperts when an opt-in flag is set and M <= MAX_M:
 Reads b12x's *prepared* expert tensors in place (no copies):
   w1_fp4 [E, 2I, H/2] u8 in kernel order [up; gate] (after b12x's one-time w31 flip),
     w2_fp4 [E, H, I/2] u8, 128x4-swizzled e4m3 block scales, per-expert fp32 alphas / a-gscales.
-Pipeline: xq (x -> FP4 + e4m3 sf, shared a1_gscale) -> fc1 (tl.dot_scaled NVFP4 MMA, SiLU*up
-with optional SwiGLU clamp, bf16, re-quant with a2_gscale[e]) -> fc2 (dot_scaled, *alpha2,
-[bf16], *router_w, fp32 atomic scatter) -> fin (fp32 -> bf16, re-zero accumulator).
+Pipeline: xq (x -> FP4 + e4m3 sf per (token, expert) using a1_gscale[e]) -> fc1 (tl.dot_scaled
+NVFP4 MMA, SiLU*up with optional SwiGLU clamp, bf16, re-quant with a2_gscale[e]) ->
+fc2 (dot_scaled, *alpha2, [bf16], *router_w, fp32 atomic scatter) -> fin (fp32 -> bf16,
+re-zero accumulator). DSv4.1 NVFP4 stores per-expert ``w13_input_scale``; a1_gscale is
+``1/w13_input_scale`` with shape [E]. Shared a1_gscale is the special case where every
+expert uses the same scale.
 Quantization numerics mirror b12x: QMODE 1 = micro kernel (M <= 8), QMODE 2 = dynamic
 kernel fast_math (M > 8). SwiGLU clamp matches Marlin/b12x SILU: gate.clamp(max=L),
 up.clamp(-L, L), then silu(gate)*up. DSv4.1 checkpoints set L=10.0.
@@ -132,6 +135,23 @@ def silu_mul_with_optional_clamp(
         g = torch.clamp(g, max=limit_f)
         u = torch.clamp(u, min=-limit_f, max=limit_f)
     return g * torch.sigmoid(g) * u
+
+
+def a1_gscale_is_shared(g1: torch.Tensor) -> bool:
+    """True when every expert uses the same activation global scale."""
+    g = g1.reshape(-1)
+    return bool(g.numel() <= 1 or (g == g[0]).all().item())
+
+
+def pair_a1_gscales(
+    a1_gscale: torch.Tensor, topk_ids: torch.Tensor
+) -> torch.Tensor:
+    """Per (token, expert) a1_gscale in row-major ``[M, topk]`` pair order.
+
+    Matches the xq pre-pass: pair ``p = t * topk + k`` uses ``a1_gscale[ids[t, k]]``.
+    """
+    g = a1_gscale.float().reshape(-1)
+    return g[topk_ids.reshape(-1).long()]
 
 
 def cfg_divides_shapes(
@@ -326,15 +346,20 @@ def _quant_codes(v, gs, R: tl.constexpr, C: tl.constexpr, QMODE: tl.constexpr):
 
 
 @triton.jit
-def _xq_kernel(x_ptr, g1_ptr, xq_ptr, xs_ptr, H: tl.constexpr, BK: tl.constexpr,
+def _xq_kernel(x_ptr, g1_ptr, topk_ids_ptr, xq_ptr, xs_ptr, H: tl.constexpr,
+               BK: tl.constexpr, TOPK: tl.constexpr, E: tl.constexpr,
                QMODE: tl.constexpr):
-    t = tl.program_id(0)
+    # One CTA per (token, expert) pair so a1_gscale[e] can differ across experts.
+    p = tl.program_id(0)
     k0 = tl.program_id(1) * BK
-    gs1 = tl.load(g1_ptr)
+    t = p // TOPK
+    e = tl.load(topk_ids_ptr + p)
+    e = tl.where((e >= 0) & (e < E), e, 0).to(tl.int64)
+    gs1 = tl.load(g1_ptr + e)
     xv = tl.load(x_ptr + t * H + k0 + tl.arange(0, BK)).to(tl.float32)
     q, s = _quant_codes(xv[None, :], gs1, 1, BK, QMODE)
-    tl.store(xq_ptr + t * (H // 2) + k0 // 2 + tl.arange(0, BK // 2), q.reshape(BK // 2))
-    tl.store(xs_ptr + t * (H // 16) + k0 // 16 + tl.arange(0, BK // 16), s.reshape(BK // 16))
+    tl.store(xq_ptr + p * (H // 2) + k0 // 2 + tl.arange(0, BK // 2), q.reshape(BK // 2))
+    tl.store(xs_ptr + p * (H // 16) + k0 // 16 + tl.arange(0, BK // 16), s.reshape(BK // 16))
 
 
 @triton.jit
@@ -350,7 +375,6 @@ def _fc1_kernel(xq_ptr, xs_ptr, w1_ptr, s1_ptr, a1_ptr, g2_ptr, sorted_ptr, eid_
     e = tl.load(eid_ptr + pm).to(tl.int64)
     rows = tl.load(sorted_ptr + pm * BM + tl.arange(0, BM))
     valid = rows < num_pairs
-    tok = tl.where(valid, rows // TOPK, 0)
     al1 = tl.load(a1_ptr + e)
     gs2 = tl.load(g2_ptr + e)
     n = pn * BN + tl.arange(0, BN)
@@ -361,8 +385,8 @@ def _fc1_kernel(xq_ptr, xs_ptr, w1_ptr, s1_ptr, a1_ptr, g2_ptr, sorted_ptr, eid_
     for k0 in range(0, H, BK):
         kp = k0 // 2 + tl.arange(0, BK // 2)
         kb = k0 // 16 + tl.arange(0, BK // 16)
-        xa = tl.load(xq_ptr + tok[:, None] * (H // 2) + kp[None, :], mask=valid[:, None], other=0)
-        xs = tl.load(xs_ptr + tok[:, None] * (H // 16) + kb[None, :], mask=valid[:, None],
+        xa = tl.load(xq_ptr + rows[:, None] * (H // 2) + kp[None, :], mask=valid[:, None], other=0)
+        xs = tl.load(xs_ptr + rows[:, None] * (H // 16) + kb[None, :], mask=valid[:, None],
                      other=0.0)
         wu = tl.load(wbase + n[:, None] * (H // 2) + kp[None, :], cache_modifier=".cg")
         wg = tl.load(wbase + (I + n)[:, None] * (H // 2) + kp[None, :], cache_modifier=".cg")
@@ -437,8 +461,8 @@ class _Scratch:
         self.sorted = torch.empty(self.max_pad, dtype=torch.int32, device=dev)
         self.eids = torch.empty(self.max_blocks, dtype=torch.int32, device=dev)
         self.npost = torch.empty(1, dtype=torch.int32, device=dev)
-        self.xq = torch.empty(M, H // 2, dtype=torch.uint8, device=dev)
-        self.xs = torch.empty(M, H // 16, dtype=torch.float8_e4m3fn, device=dev)
+        self.xq = torch.empty(npairs, H // 2, dtype=torch.uint8, device=dev)
+        self.xs = torch.empty(npairs, H // 16, dtype=torch.float8_e4m3fn, device=dev)
         self.iq = torch.empty(npairs, I // 2, dtype=torch.uint8, device=dev)
         self.isc = torch.empty(npairs, I // 16, dtype=torch.float8_e4m3fn, device=dev)
         self.acc = torch.zeros(M, H, dtype=torch.float32, device=dev)  # fin re-zeroes
@@ -523,10 +547,7 @@ class TritonNvfp4DecodeMoE:
 
         self.a1, self.a2 = f(prepared.w1_alphas), f(prepared.w2_alphas)
         self.g1, self.g2 = f(prepared.a1_gscale), f(prepared.a2_gscale)
-        if not bool((self.g1 == self.g1[0]).all()):
-            raise ValueError(
-                "a1_gscale is not shared across experts (xq pre-pass needs it)"
-            )
+        self.a1_gscale_shared = a1_gscale_is_shared(self.g1)
         self.C41 = (H // 16 + 3) // 4
         self.C42 = (I // 16 + 3) // 4
         if self.s1.shape[1] != ((2 * I + 127) // 128 * 128) * self.C41 * 4 or \
@@ -573,8 +594,10 @@ class TritonNvfp4DecodeMoE:
         npairs = M * self.topk
         ops.moe_align_block_size(topk_ids, self.E, c["BM"], s.sorted, s.eids, s.npost)
         nb = min(s.max_blocks, min(npairs, self.E) + npairs // c["BM"])
-        _xq_kernel[(M, self.H // c["XB"])](x, self.g1, s.xq, s.xs, self.H, BK=c["XB"],
-                                            QMODE=qmode, num_warps=2)
+        ids = topk_ids.reshape(-1)
+        _xq_kernel[(npairs, self.H // c["XB"])](
+            x, self.g1, ids, s.xq, s.xs, self.H, BK=c["XB"], TOPK=self.topk,
+            E=self.E, QMODE=qmode, num_warps=2)
         has_clamp = 1 if self.swiglu_limit is not None else 0
         clamp_limit = 0.0 if self.swiglu_limit is None else float(self.swiglu_limit)
         _fc1_kernel[(nb, self.I // c["BN1"])](

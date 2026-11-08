@@ -459,7 +459,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             B12xExperts._tri_logged = True
             logger.info(
                 "%s=1: Triton NVFP4 decode MoE for M<=%d "
-                "(E=%d H=%d I=%d topk=%d swiglu_limit=%s cfg=%s), b12x above",
+                "(E=%d H=%d I=%d topk=%d swiglu_limit=%s a1_gscale=%s "
+                "cfg=%s), b12x above",
                 flag,
                 self._tri_max_m,
                 self._tri.E,
@@ -467,6 +468,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 self._tri.I,
                 self._tri.topk,
                 self._tri.swiglu_limit,
+                "shared" if self._tri.a1_gscale_shared else "per-expert",
                 self._tri.c,
             )
 
