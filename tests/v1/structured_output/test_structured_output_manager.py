@@ -224,7 +224,7 @@ FLOW_CASES = [
             prefix='{"a"',
             raw_drafts=("z", ":", ' "', "b"),
             expected_validated=(),
-            expected_row_pattern="CCCCC",
+            expected_row_pattern="CUUUU",
             expected_reasoning=True,
             expect_terminated=False,
             reasoning_ended=True,
@@ -426,9 +426,9 @@ def test_initial_constraint_activation(
         # EOS is only valid once the regex has matched; rows after EOS are
         # unconstrained since the request stops there.
         pytest.param(("1", EOS, "2"), ("1", EOS), "CCUU", True, id="terminates"),
-        # All drafts rejected → padded with -1. Keep every row constrained
-        # rather than unconstraining after the first placeholder.
-        pytest.param((EOS, "1"), (), "CCC", False, id="early_eos"),
+        # All drafts rejected → padded with -1. Do not copy row 0 onto later
+        # rows (those are already in different FSM states).
+        pytest.param((EOS, "1"), (), "CUU", False, id="early_eos"),
     ],
 )
 def test_regex_flow(
@@ -483,8 +483,10 @@ def test_rejected_draft_keeps_later_rows_constrained(tokenizer, backend: str):
 
 
 @pytest.mark.parametrize("backend", REGEX_BACKENDS)
-def test_placeholder_drafts_keep_later_rows_constrained(tokenizer, backend: str):
-    """All -1 placeholders must not unconstrain later draft rows or bonus."""
+def test_placeholder_drafts_log_and_do_not_copy_row0(
+    tokenizer, backend: str, caplog_vllm
+):
+    """Missing real drafts must not copy row 0 onto later FSM rows."""
     manager, request = _build_harness(
         tokenizer,
         backend,
@@ -498,10 +500,14 @@ def test_placeholder_drafts_keep_later_rows_constrained(tokenizer, backend: str)
         scheduled_spec_decode_tokens={request.request_id: placeholders},
     )
     assert bitmask is not None
-    assert _row_pattern(bitmask) == "CCCC"
-    assert (bitmask[1] == bitmask[0]).all()
-    assert (bitmask[2] == bitmask[0]).all()
-    assert (bitmask[3] == bitmask[0]).all()
+    assert manager.num_missing_draft_bitmask_fills == 1
+    assert "no real draft token ids" in caplog_vllm.text
+    # Row 0 is constrained; later rows stay unconstrained rather than
+    # replicating the row-0 mask.
+    assert _row_pattern(bitmask) == "CUUU"
+    assert not (bitmask[1] == bitmask[0]).all()
+    assert not (bitmask[2] == bitmask[0]).all()
+    assert not (bitmask[3] == bitmask[0]).all()
 
 
 def test_outlines_termination(tokenizer):

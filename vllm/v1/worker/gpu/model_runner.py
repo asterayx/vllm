@@ -2232,6 +2232,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
+            draft_tokens_handler=(
+                self.draft_tokens_handler if self.num_speculative_steps > 0 else None
+            ),
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None

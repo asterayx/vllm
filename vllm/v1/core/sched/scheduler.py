@@ -232,9 +232,9 @@ class Scheduler(SchedulerInterface):
         self.reset_preempted_req_ids: set[str] = set()
 
         # Real speculative draft token ids keyed by request id. Under PP the
-        # latest take_draft_token_ids() microbatch may omit a request, so
-        # grammar bitmasks look up this store instead of leftover -1
-        # placeholders from AsyncScheduler.
+        # latest ModelRunnerOutput/take_draft_token_ids() microbatch may omit
+        # a request, so grammar bitmasks look up this store instead of leftover
+        # -1 placeholders from AsyncScheduler.
         self._draft_token_ids_by_req: dict[str, list[int]] = {}
 
         # Counter for requests waiting for streaming input. Used to calculate
@@ -1998,6 +1998,9 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        if model_runner_output.draft_token_ids is not None:
+            self.update_draft_token_ids(model_runner_output.draft_token_ids)
+
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -2549,8 +2552,9 @@ class Scheduler(SchedulerInterface):
     ) -> None:
         """Replace placeholder -1 spec tokens with this request's stored drafts.
 
-        If a request has no stored drafts, leave the placeholders in place;
-        grammar_bitmask() must not unconstrain later rows from those -1s.
+        If a request has no stored drafts, leave the placeholders in place.
+        grammar_bitmask() logs an error rather than copying row 0 onto later
+        rows (those rows are already in different FSM states).
         """
         sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         num_invalid_spec_tokens = scheduler_output.num_invalid_spec_tokens

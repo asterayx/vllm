@@ -57,6 +57,9 @@ class StructuredOutputManager:
 
         self._grammar_bitmask: torch.Tensor | None = None
         self._full_mask = torch.tensor(-1, dtype=torch.int32)
+        # Incremented when grammar_bitmask sees all-negative placeholders
+        # instead of persisted real drafts. That path must not copy row 0.
+        self.num_missing_draft_bitmask_fills = 0
 
         max_batch_size = self.vllm_config.scheduler_config.max_num_seqs
         self.fill_bitmask_parallel_threshold = 128
@@ -384,23 +387,18 @@ class StructuredOutputManager:
                     assert isinstance(grammar, StructuredOutputGrammar)
 
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, list())
-                bitmask = self._grammar_bitmask
                 if req_tokens and all(token < 0 for token in req_tokens):
-                    # No real drafts were available (PP take omitted this
-                    # request). Constrain every draft row and the bonus row
-                    # from the current grammar state rather than treating -1
-                    # placeholders as padding that unconstrains later rows.
-                    apply_bitmask = self._get_constraint_start(request, ()) == 0
-                    num_rows = len(req_tokens)
-                    if not (self.vllm_config.model_config.is_diffusion and req_tokens):
-                        num_rows += 1
-                    self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
-                    first_index = cumulative_index
-                    cumulative_index += 1
-                    for _ in range(num_rows - 1):
-                        bitmask[cumulative_index].copy_(bitmask[first_index])
-                        cumulative_index += 1
-                    continue
+                    # Persisted per-request drafts should have replaced these
+                    # placeholders. Copying row 0 onto later rows is unsafe:
+                    # later FSM states can reject a row-0-legal token or
+                    # resample an illegal one.
+                    logger.error(
+                        "Structured-output grammar bitmask has no real draft "
+                        "token ids for request %s; later rows will not be "
+                        "advanced from persisted drafts.",
+                        req_id,
+                    )
+                    self.num_missing_draft_bitmask_fills += 1
 
                 constraint_start = self._get_constraint_start(
                     request, strip_speculative_padding(req_tokens)

@@ -815,8 +815,11 @@ def test_resumable_request_handoff():
     assert len(request.output_token_ids) == 1
 
 
-def test_async_non_deferred_path_takes_drafts_for_structured_spec():
-    """Non-deferred structured+spec steps must still fetch real draft ids."""
+def test_async_non_deferred_path_does_not_take_drafts():
+    """Non-deferred structured+spec steps must not block on take_draft_token_ids.
+
+    Drafts ride back on ModelRunnerOutput and are stored in update_from_output.
+    """
     core = MagicMock()
     core.batch_queue = deque()
     core.batch_queue_size = 2
@@ -837,16 +840,12 @@ def test_async_non_deferred_path_takes_drafts_for_structured_spec():
     sampled.set_result(output)
     core.model_executor.execute_model.return_value = executed
     core.model_executor.sample_tokens.return_value = sampled
-    drafts = MagicMock()
-    core.model_executor.take_draft_token_ids.return_value = drafts
 
     EngineCore.step_with_batch_queue(core)
     if core.batch_queue:
         EngineCore.step_with_batch_queue(core)
 
-    core.model_executor.take_draft_token_ids.assert_called()
-    core.scheduler.update_draft_token_ids_in_output.assert_called_with(
-        drafts, scheduled
-    )
+    core.model_executor.take_draft_token_ids.assert_not_called()
+    core.scheduler.update_draft_token_ids_in_output.assert_not_called()
     core.scheduler.get_grammar_bitmask.assert_called_with(scheduled)
     core.model_executor.sample_tokens.assert_called_once()

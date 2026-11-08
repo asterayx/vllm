@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Sequence
+
 import numpy as np
 import torch
 
@@ -100,6 +102,30 @@ class DraftTokensHandler:
             else:
                 draft_tokens = draft_tokens.tolist()
             draft_token_ids.append(draft_tokens)
+        return DraftTokenIds(out_req_ids, draft_token_ids)
+
+    def get_copied_draft_tokens(self, req_ids: Sequence[str]) -> DraftTokenIds | None:
+        """Return real CPU-copied drafts for ``req_ids``.
+
+        Int-width placeholders (unstructured batches) are omitted so the
+        scheduler does not persist dummy -1 rows. Syncs the async copy if
+        one is still in flight.
+        """
+        if self._copy_pending:
+            assert self.copy_event is not None
+            self.copy_event.synchronize()
+            self._copy_pending = False
+
+        out_req_ids: list[str] = []
+        draft_token_ids: list[list[int]] = []
+        for req_id in req_ids:
+            draft_tokens = self._draft_tokens_by_req.get(req_id)
+            if draft_tokens is None or isinstance(draft_tokens, int):
+                continue
+            out_req_ids.append(req_id)
+            draft_token_ids.append(draft_tokens.tolist())
+        if not out_req_ids:
+            return None
         return DraftTokenIds(out_req_ids, draft_token_ids)
 
 

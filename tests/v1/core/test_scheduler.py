@@ -7090,6 +7090,50 @@ def test_update_draft_token_ids_in_output_strips_padding():
     assert scheduler_output.num_invalid_spec_tokens == {request.request_id: 2}
 
 
+def test_update_from_output_stores_output_carried_drafts():
+    """Drafts attached to ModelRunnerOutput are persisted per request."""
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    request = _decode_ready_request(scheduler)
+    request.structured_output_request = SimpleNamespace(
+        grammar=_RecordingGrammar(), reasoning_ended=True
+    )
+    req_id = request.request_id
+    output = scheduler.schedule()
+    # Isolate persist from sampled-token bookkeeping for this unit test.
+    output.num_scheduled_tokens.clear()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[req_id],
+            req_id_to_index={req_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            draft_token_ids=DraftTokenIds([req_id], [[10, 11, 12]]),
+        ),
+    )
+    assert scheduler._draft_token_ids_by_req[req_id] == [10, 11, 12]
+
+    captured: dict[str, list[int]] = {}
+
+    def fake_bitmask(requests, structured_ids, spec_tokens):
+        captured.update(spec_tokens)
+        return None
+
+    scheduler.structured_output_manager.grammar_bitmask = fake_bitmask
+    grammar_output = scheduler.get_grammar_bitmask(
+        SimpleNamespace(
+            has_structured_output_requests=True,
+            num_scheduled_tokens={req_id: 4},
+            scheduled_spec_decode_tokens={req_id: [-1, -1, -1]},
+            num_invalid_spec_tokens=None,
+        )
+    )
+    assert grammar_output is not None
+    assert captured[req_id] == [10, 11, 12]
+
+
 def test_grammar_bitmask_uses_persisted_drafts_when_take_omits_request():
     """PP microbatches can omit a request from take_draft_token_ids().
 

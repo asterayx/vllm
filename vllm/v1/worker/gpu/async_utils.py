@@ -22,6 +22,7 @@ from vllm.v1.worker.utils import raise_if_nan_logits
 if TYPE_CHECKING:
     from vllm.distributed.aux_output_connector.worker import PendingAuxOutput
     from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool,
         pending_aux_output: "PendingAuxOutput | None",
+        draft_tokens_handler: "DraftTokensHandler | None" = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -130,6 +132,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.pending_aux_output = pending_aux_output
+        self.draft_tokens_handler = draft_tokens_handler
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
@@ -212,6 +215,13 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 "Fault detected in EP all2all communication: "
                 "one or more ranks timed out during dispatch/combine. "
                 f"Mask: {mask.cpu().tolist()}"
+            )
+
+        if self.draft_tokens_handler is not None:
+            self.model_runner_output.draft_token_ids = (
+                self.draft_tokens_handler.get_copied_draft_tokens(
+                    self.model_runner_output.req_ids
+                )
             )
 
         return self.model_runner_output
