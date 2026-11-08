@@ -392,13 +392,13 @@ class StructuredOutputManager:
                     # placeholders. Copying row 0 onto later rows is unsafe:
                     # later FSM states can reject a row-0-legal token or
                     # resample an illegal one.
-                    logger.error(
-                        "Structured-output grammar bitmask has no real draft "
-                        "token ids for request %s; later rows will not be "
-                        "advanced from persisted drafts.",
-                        req_id,
-                    )
                     self.num_missing_draft_bitmask_fills += 1
+                    logger.error_once(
+                        "Structured-output grammar bitmask has no real draft "
+                        "token ids; later rows will not be advanced from "
+                        "persisted drafts. See "
+                        "vllm:num_missing_draft_bitmask_fills."
+                    )
 
                 constraint_start = self._get_constraint_start(
                     request, strip_speculative_padding(req_tokens)

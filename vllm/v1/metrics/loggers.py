@@ -525,6 +525,20 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_scheduler_waiting, per_engine_labelvalues
         )
 
+        gauge_missing_draft_bitmask_fills = self._gauge_cls(
+            name="vllm:num_missing_draft_bitmask_fills",
+            documentation=(
+                "Grammar bitmask fills that had no real persisted draft "
+                "token ids. Should stay 0 when spec+structured-output "
+                "drafts are carried on ModelRunnerOutput."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_missing_draft_bitmask_fills = create_metric_per_engine(
+            gauge_missing_draft_bitmask_fills, per_engine_labelvalues
+        )
+
         gauge_waiting_by_reason = self._gauge_cls(
             name="vllm:num_requests_waiting_by_reason",
             documentation=(
@@ -1041,6 +1055,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 + scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_scheduler_waiting[engine_idx].set(total_waiting)
+            self.gauge_missing_draft_bitmask_fills[engine_idx].set(
+                scheduler_stats.num_missing_draft_bitmask_fills
+            )
             self.gauge_waiting_by_reason[WAITING_REASON_CAPACITY][engine_idx].set(
                 scheduler_stats.num_waiting_reqs
             )

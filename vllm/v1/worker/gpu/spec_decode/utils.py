@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Sequence
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -13,6 +13,14 @@ from vllm.v1.worker.gpu.async_utils import async_copy_to_np
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 logger = init_logger(__name__)
+
+
+class DraftCopySnapshot(NamedTuple):
+    """Per-step CPU draft copy. Owned by that step's AsyncOutput."""
+
+    req_ids: list[str]
+    draft_tokens_np: np.ndarray
+    copy_event: Any | None
 
 
 def get_pp_safe_draft_load_config(load_config: LoadConfig) -> LoadConfig:
@@ -44,12 +52,10 @@ class DraftTokensHandler:
     def _ensure_copy_resources(self) -> None:
         if self.copy_stream is None:
             self.copy_stream = torch.cuda.Stream(self.device)
-            # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-            self.copy_event = torch.cuda.Event(blocking=True)
 
     def set_draft_tokens(
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
-    ) -> None:
+    ) -> DraftCopySnapshot | None:
         if not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by
             # the scheduler for this batch. Record widths only so a later
@@ -57,26 +63,36 @@ class DraftTokensHandler:
             num_draft_tokens = int(draft_tokens.shape[1])
             for req_id in input_batch.req_ids:
                 self._draft_tokens_by_req[req_id] = num_draft_tokens
-            return
+            return None
 
         # For spec decoding + structured outputs, we must transfer the
         # draft tokens back to the scheduler for grammar validation.
-        self._ensure_copy_resources()
-        assert self.copy_stream is not None
-        assert self.copy_event is not None
-        current_stream = torch.cuda.current_stream(self.device)
-        self.copy_stream.wait_stream(current_stream)
-        with torch.cuda.stream(self.copy_stream):
-            draft_tokens_np = async_copy_to_np(draft_tokens)
-            # draft_tokens is a temporary allocation on the main stream and read here on
-            # copy_stream; without record_stream, the caching allocator may reuse its
-            # memory before the async copy executes.
-            draft_tokens.record_stream(self.copy_stream)
-            self.copy_event.record()
+        is_cpu = self.device is None or self.device.type == "cpu"
+        if is_cpu:
+            draft_tokens_np = np.ascontiguousarray(draft_tokens.detach().cpu().numpy())
+            copy_event = None
+        else:
+            self._ensure_copy_resources()
+            assert self.copy_stream is not None
+            current_stream = torch.cuda.current_stream(self.device)
+            self.copy_stream.wait_stream(current_stream)
+            # Per-step event so the output thread never waits on a later
+            # sample_tokens recording of the shared copy_event.
+            copy_event = torch.cuda.Event(blocking=True)
+            with torch.cuda.stream(self.copy_stream):
+                draft_tokens_np = async_copy_to_np(draft_tokens)
+                # draft_tokens is a temporary allocation on the main stream
+                # and read here on copy_stream; without record_stream, the
+                # caching allocator may reuse its memory before the async
+                # copy executes.
+                draft_tokens.record_stream(self.copy_stream)
+                copy_event.record()
+            self.copy_event = copy_event
             self._copy_pending = True
 
         for req_id, row in zip(input_batch.req_ids, draft_tokens_np, strict=True):
             self._draft_tokens_by_req[req_id] = row
+        return DraftCopySnapshot(list(input_batch.req_ids), draft_tokens_np, copy_event)
 
     def discard(self, req_id: str) -> None:
         self._draft_tokens_by_req.pop(req_id, None)
@@ -102,30 +118,6 @@ class DraftTokensHandler:
             else:
                 draft_tokens = draft_tokens.tolist()
             draft_token_ids.append(draft_tokens)
-        return DraftTokenIds(out_req_ids, draft_token_ids)
-
-    def get_copied_draft_tokens(self, req_ids: Sequence[str]) -> DraftTokenIds | None:
-        """Return real CPU-copied drafts for ``req_ids``.
-
-        Int-width placeholders (unstructured batches) are omitted so the
-        scheduler does not persist dummy -1 rows. Syncs the async copy if
-        one is still in flight.
-        """
-        if self._copy_pending:
-            assert self.copy_event is not None
-            self.copy_event.synchronize()
-            self._copy_pending = False
-
-        out_req_ids: list[str] = []
-        draft_token_ids: list[list[int]] = []
-        for req_id in req_ids:
-            draft_tokens = self._draft_tokens_by_req.get(req_id)
-            if draft_tokens is None or isinstance(draft_tokens, int):
-                continue
-            out_req_ids.append(req_id)
-            draft_token_ids.append(draft_tokens.tolist())
-        if not out_req_ids:
-            return None
         return DraftTokenIds(out_req_ids, draft_token_ids)
 
 

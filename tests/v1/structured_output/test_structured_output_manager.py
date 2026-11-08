@@ -493,6 +493,9 @@ def test_placeholder_drafts_log_and_do_not_copy_row0(
         use_reasoner=False,
         structured_outputs=StructuredOutputsParams(regex=DIGITS_REGEX),
     )
+    from vllm.logger import _print_error_once
+
+    _print_error_once.cache_clear()
     placeholders = [-1, -1, -1]
     bitmask = manager.grammar_bitmask(
         requests={request.request_id: request},
