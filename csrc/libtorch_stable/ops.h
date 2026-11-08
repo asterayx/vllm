@@ -543,6 +543,13 @@ std::tuple<int64_t, torch::stable::Tensor> allocate_shared_buffer_and_handle(
     int64_t size);
 int64_t open_mem_handle(torch::stable::Tensor& mem_handle);
 void free_shared_buffer(int64_t buffer);
+void pcie_xor_all_reduce(const std::vector<int64_t>& peer_ptrs,
+                         torch::stable::Tensor& state,
+                         torch::stable::Tensor& partial,
+                         torch::stable::Tensor& inp, torch::stable::Tensor& out,
+                         int64_t rank, int64_t world_size, int64_t flag_base,
+                         int64_t payload_base, int64_t slot_stride);
+void pcie_xor_close_peer(int64_t ptr);
 
 // Activation kernels (shared CUDA/ROCm)
 void silu_and_mul(torch::stable::Tensor& out, torch::stable::Tensor& input);

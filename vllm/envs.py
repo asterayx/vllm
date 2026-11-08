@@ -273,6 +273,9 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_FLASHINFER: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC: bool = False
     VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS: int = 0
+    DSV41_EXP_PCIE_XOR_AR: bool = False
+    DSV41_EXP_PCIE_XOR_AR_MAX_BYTES: int = 1048576
+    DSV41_EXP_PCIE_XOR_AR_TIMEOUT_MS: int = 2000
     VLLM_EMIT_REASONING_CONTENT: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
@@ -609,6 +612,17 @@ def _resolve_rust_cli_path() -> str | None:
             "Build with setuptools-rust or set the path explicitly."
         )
     return raw
+
+
+def _read_optional_int(name: str, default: int) -> int:
+    """Parse a decimal env var. Unset returns ``default``; garbage returns -1."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip(), 10)
+    except ValueError:
+        return -1
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -1928,6 +1942,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # capture size.
     "VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS", "0")
+    ),
+    # Opt-in paired posted-write XOR-butterfly all-reduce for PCIe tensor
+    # parallel. Unset (or 0) keeps NCCL. See pcie_xor_all_reduce.py.
+    # 1 MiB covers DSV4.1-Flash decode (hidden 5120 bf16, 64 tokens).
+    "DSV41_EXP_PCIE_XOR_AR": lambda: os.getenv("DSV41_EXP_PCIE_XOR_AR", "0") == "1",
+    "DSV41_EXP_PCIE_XOR_AR_MAX_BYTES": lambda: _read_optional_int(
+        "DSV41_EXP_PCIE_XOR_AR_MAX_BYTES", 1 << 20
+    ),
+    "DSV41_EXP_PCIE_XOR_AR_TIMEOUT_MS": lambda: _read_optional_int(
+        "DSV41_EXP_PCIE_XOR_AR_TIMEOUT_MS", 2000
     ),
     # Also emit chat completion reasoning as the legacy `reasoning_content`
     # field, for clients that only read that name.

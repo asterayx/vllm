@@ -3213,6 +3213,10 @@ def free_shared_buffer(ptr: int) -> None:
     torch.ops._C_custom_ar.free_shared_buffer(ptr)
 
 
+def pcie_xor_close_peer(ptr: int) -> None:
+    torch.ops._C_custom_ar.pcie_xor_close_peer(ptr)
+
+
 # quick all reduce
 def init_custom_qr(rank: int, world_size: int, qr_max_size: int | None = None) -> int:
     return torch.ops._C_custom_ar.init_custom_qr(rank, world_size, qr_max_size)
