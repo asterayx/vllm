@@ -9,17 +9,29 @@ cache. Later decoder layers then run on a dependency-preserving tail of each
 prefill request. Long-context attention still reads the global cache; only
 the queries shrink.
 
-The tail is wider than the sliding window. Causal SWA of width ``W`` at each
-of the ``D`` compact layers needs ``W - 1`` extra positions of the previous
-layer, and decode reads the last ``W`` keys at the final layer, so the first
-compact layer must see
+Each compact layer drops ``W - 1`` accurate rows on the left, because those
+queries' SWA reaches positions this step did not write. Aux id ``a_max`` is
+the post captured on entry to 0-based layer ``a_max`` (the output of
+0-based layer ``a_max - 1``). Official Flash ``dspark_target_layer_ids`` are
+``[37, 38, 39]``, so ``a_max`` is 39 and the tail is
 
-    W + (D - 1) * (W - 1)
+    W + (W - 1) * (a_max - 21) = 128 + 127 * 18 = 2414
 
-rows ending at the chunk. That is 2414 on Flash (``W=128``, 19 layers after
-layer 20). ``DSV41_EXP_CED_PREFILL_ROWS``, when set, replaces that width.
+That leaves the last 128 rows accurate at aux 39, and only the last row
+accurate at 0-based layer 39. It does not make the final layer's last
+window complete. Aux id 40 (``final_aux``) is not in this checkpoint;
+including it would be 2541. ``DSV41_EXP_CED_PREFILL_ROWS``, when set,
+replaces that width.
 
 Unset ``DSV41_EXP_CED_PREFILL`` leaves the full-chunk prefill untouched.
+Eager steps that compact log once per chunk. Piecewise and full CUDA-graph
+steps that would have compacted log a refusal and stay on full prefill;
+production graph mode is unchanged.
+
+PP2's even split keeps layers 0–19 at full width on rank 0, so TTFT stays
+gated by stage 0. A compute-balanced partition depends on the chunk size
+(about 13/27 for an 8k chunk and a 2414 tail) and would move Engram layer
+14. It is not applied automatically.
 
 The hierarchical indexer pool is a separate, already-wired mechanism:
 ``candidate_source_layer_id`` publishes ``candidate_topk_blocks`` blocks of
@@ -101,23 +113,43 @@ def compact_layer_count(num_hidden_layers: int, boundary: int) -> int:
     return max(0, num_hidden_layers - boundary - 1)
 
 
-def dependency_halo_rows(window: int, compact_layers: int) -> int:
-    """Trailing rows whose final-layer states match a full prefill.
+def dspark_target_layer_ids(hf_config: Any) -> tuple[int, ...]:
+    raw = getattr(hf_config, "dspark_target_layer_ids", None) or ()
+    return tuple(int(layer_id) for layer_id in raw)
 
-    Args:
-        window: Causal SWA width (``sliding_window``).
-        compact_layers: How many decoder layers consume the tail.
 
-    Returns:
-        ``window + (compact_layers - 1) * (window - 1)`` when both are
-        positive, else 0. The last ``window`` outputs of the final compact
-        layer then have a complete local cone, which is what the sampled
-        token and the next decode step's SWA read.
+def draft_aux_halo_rows(window: int, a_max: int, first_compact_layer: int) -> int:
+    """Tail width so aux id ``a_max`` keeps its last ``window`` rows in-cone.
 
+    This is ``window + (window - 1) * (a_max - first_compact_layer)``.
+    Flash's deepest target is 39 and the first compact layer is 21, so the
+    width is 2414. That is not a full window at the final layer's output:
+    0-based layer 39 then has a single in-cone row (the sampled token).
+    Aux id 40 would be 2541.
     """
-    if window <= 0 or compact_layers <= 0:
+    if window <= 0 or a_max < first_compact_layer:
         return 0
-    return window + (compact_layers - 1) * (window - 1)
+    return window + (window - 1) * (a_max - first_compact_layer)
+
+
+def accurate_output_rows(width: int, shrink_steps: int, window: int) -> int:
+    """In-cone rows after ``shrink_steps`` compact layers.
+
+    The first compact layer is step 1. 0-based layer 39 on Flash is step 19.
+    """
+    if window <= 1:
+        return width
+    return width - (window - 1) * shrink_steps
+
+
+def dependency_halo_rows(window: int, a_max_offset: int) -> int:
+    """``draft_aux_halo_rows`` with the first compact layer fixed at 21.
+
+    ``a_max_offset`` is ``a_max - 21`` (18 for Flash aux 39).
+    """
+    if window <= 0 or a_max_offset < 0:
+        return 0
+    return window + (window - 1) * a_max_offset
 
 
 def full_resolution_boundary(hf_config: Any) -> int | None:
@@ -160,6 +192,8 @@ class CedPrefillConfig:
     compact_layers: int = 0
     formula_rows: int = 0
     rows_overridden: bool = False
+    aux_a_max: int = 0
+    target_layer_ids: tuple[int, ...] = ()
 
 
 def ced_attach_message(config: CedPrefillConfig) -> str:
@@ -174,15 +208,22 @@ def ced_attach_message(config: CedPrefillConfig) -> str:
             f"{config.formula_rows}). Unset {CED_PREFILL_ENV} keeps full "
             "prefill."
         )
-    lookback_layers = max(0, config.compact_layers - 1)
+    lookbacks = max(0, config.aux_a_max - (config.boundary_layer + 1))
+    final_shrink = max(0, config.compact_layers)
+    final_accurate = accurate_output_rows(config.tail_rows, final_shrink, config.window)
     return (
         "DSV41 CED prefill attached: after layer "
         f"{config.boundary_layer} writes full-resolution global KV and index "
         "keys, later decoder layers compute a dependency-preserving tail of "
-        f"{config.tail_rows} rows per prefill chunk (sliding window "
-        f"{config.window} plus {lookback_layers} layers of "
-        f"{config.window - 1}-token left context). Unset {CED_PREFILL_ENV} "
-        "keeps full prefill."
+        f"{config.tail_rows} rows per prefill chunk (draft targets "
+        f"{list(config.target_layer_ids) or 'none'}, deepest aux "
+        f"{config.aux_a_max}, {lookbacks} lookbacks of "
+        f"{config.window - 1}). The final layer output has {final_accurate} "
+        "in-cone row(s), not a full window. Unset "
+        f"{CED_PREFILL_ENV} keeps full prefill. Count lines containing "
+        "'compacted to a dependency-preserving tail' for eager compactions; "
+        "piecewise and full CUDA-graph steps log 'refused: cudagraph' and "
+        "stay on full prefill."
     )
 
 
@@ -205,8 +246,8 @@ def ced_compact_message(
     return (
         "DSV41 CED prefill compacted to a dependency-preserving tail of "
         f"{config.tail_rows} rows after layer {config.boundary_layer} "
-        f"(sliding window {config.window}, {config.compact_layers} decoder "
-        f"layers after the boundary; {wrote})."
+        f"(deepest draft aux {config.aux_a_max}, not a full final-layer "
+        f"window; {wrote})."
     )
 
 
@@ -272,6 +313,39 @@ def decide_ced_rank(
     return "attach", None
 
 
+def _effective_swa_bounded_replay(vllm_config: Any) -> bool:
+    """Match the attention layer: the config bit is not enough."""
+    cache = getattr(vllm_config, "cache_config", None)
+    if cache is None or not bool(getattr(cache, "swa_bounded_replay", False)):
+        return False
+    if not bool(getattr(vllm_config, "use_v2_model_runner", False)):
+        return False
+    parallel = getattr(vllm_config, "parallel_config", None)
+    pcp = int(getattr(parallel, "prefill_context_parallel_size", 1) or 1)
+    if pcp > 1:
+        return False
+    from vllm.platforms import current_platform
+
+    return not current_platform.is_rocm()
+
+
+def ced_prefix_cache_refusal(vllm_config: Any) -> str | None:
+    """Refuse when discarded SWA rows could be served from a prefix hit.
+
+    Prefix caching stores SWA blocks unless bounded replay is actually on.
+    A later hit would then read rows CED never wrote.
+    """
+    cache = getattr(vllm_config, "cache_config", None)
+    if cache is None or not bool(getattr(cache, "enable_prefix_caching", False)):
+        return None
+    if _effective_swa_bounded_replay(vllm_config):
+        return None
+    return (
+        "prefix caching is on and SWA bounded replay is not effective, so "
+        "discarded SWA blocks could be reused by a later prefix hit"
+    )
+
+
 def build_ced_prefill(
     vllm_config: Any,
     *,
@@ -296,7 +370,25 @@ def build_ced_prefill(
         if boundary is not None
         else 0
     )
-    formula_rows = dependency_halo_rows(window, compact_layers)
+    targets = dspark_target_layer_ids(hf_config)
+    first_compact = (boundary + 1) if boundary is not None else 0
+    if targets:
+        aux_a_max = max(targets)
+    elif boundary is not None:
+        # No draft targets: the sampled row is the final compact output,
+        # whose aux id is one past that 0-based layer.
+        aux_a_max = boundary + compact_layers
+    else:
+        aux_a_max = 0
+    formula_rows = (
+        draft_aux_halo_rows(window, aux_a_max, first_compact)
+        if boundary is not None
+        else 0
+    )
+    prefix_block = ced_prefix_cache_refusal(vllm_config)
+    if prefix_block is not None:
+        _log_once("warning", f"DSV41 CED prefill refused: {prefix_block}")
+        return None
     if override is None:
         # A zero formula means there is no compact stack. Pass a positive
         # placeholder so decide_ced_rank can report the real reason.
@@ -343,6 +435,8 @@ def build_ced_prefill(
         compact_layers=compact_layers,
         formula_rows=formula_rows,
         rows_overridden=rows_overridden,
+        aux_a_max=aux_a_max,
+        target_layer_ids=targets,
     )
     logger.info("%s", ced_attach_message(config))
     return config
@@ -461,6 +555,89 @@ def _cpu_index(
     return torch.tensor(indices, dtype=dtype)
 
 
+def _tail_replay_starts(
+    plan: PrefillKeepPlan,
+    prefill_seq_lens: torch.Tensor,
+    metadata: Any,
+) -> torch.Tensor | str:
+    """Raise prefill ``replay_start`` to the first kept position.
+
+    Bounded replay already hides context below ``replay_start``. The tail's
+    left edge must do the same: those slots were not written at compact
+    layers on this step. Decode requests keep the replay start they had.
+    """
+    nreq = plan.num_decodes + plan.num_prefills
+    old = getattr(metadata, "replay_start", None)
+    if old is None:
+        replay = torch.zeros(nreq, dtype=torch.int64)
+    else:
+        replay = old.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+        if replay.shape[0] < nreq:
+            return "replay_start is shorter than the batch"
+        replay = replay[:nreq].clone()
+    if prefill_seq_lens.shape[0] != plan.num_prefills:
+        return "SWA prefill seq lens do not match the prefill requests"
+    for i, qlen in enumerate(plan.prefill_query_lens):
+        tail_start = int(prefill_seq_lens[i]) - int(qlen)
+        req = plan.num_decodes + i
+        if tail_start > int(replay[req]):
+            replay[req] = tail_start
+    return replay
+
+
+def _mask_prefill_swa(
+    plan: PrefillKeepPlan,
+    prefill_seq_lens: torch.Tensor,
+    replay: torch.Tensor,
+    metadata: Any,
+) -> tuple[torch.Tensor, torch.Tensor] | None | str:
+    """Rebuild prefill SWA indices so they do not read below ``replay``."""
+    like = getattr(metadata, "prefill_swa_indices", None)
+    if like is None or plan.num_prefill_tokens == 0:
+        return None
+    block_table = getattr(metadata, "block_table", None)
+    block_size = int(getattr(metadata, "block_size", 0) or 0)
+    window = int(getattr(metadata, "prefill_window_size", 0) or 0)
+    if block_table is None or block_size <= 0:
+        return "SWA block table is missing; cannot mask the tail's left edge"
+    if window <= 0:
+        return "SWA window is missing; cannot mask the tail's left edge"
+    index_width = int(like.shape[-1])
+    table = block_table.detach().to(device="cpu", dtype=torch.int64)
+    rows: list[torch.Tensor] = []
+    lengths: list[int] = []
+    offsets = torch.arange(index_width)
+    for i, qlen in enumerate(plan.prefill_query_lens):
+        qlen = int(qlen)
+        if qlen == 0:
+            continue
+        req = plan.num_decodes + i
+        first = int(prefill_seq_lens[i]) - qlen
+        replay_i = int(replay[req])
+        positions = first + torch.arange(qlen)
+        start = torch.clamp(positions - (window - 1), min=max(replay_i, 0))
+        end = positions + 1
+        pos = start[:, None] + offsets[None, :]
+        valid = pos < end[:, None]
+        if int(pos.max()) // block_size >= table.shape[1]:
+            return "SWA block table is shorter than the tail positions"
+        blocks = torch.div(pos, block_size, rounding_mode="floor")
+        safe_blocks = blocks.clamp(max=table.shape[1] - 1)
+        block_ids = table[req].index_select(0, safe_blocks.reshape(-1))
+        block_ids = block_ids.view(qlen, index_width)
+        slots = block_ids * block_size + torch.remainder(pos, block_size)
+        slots = torch.where(valid, slots, torch.full_like(slots, -1))
+        rows.append(slots)
+        lengths.extend(int(end[j] - start[j]) for j in range(qlen))
+    if not rows:
+        return None
+    flat = torch.cat(rows, dim=0).to(dtype=like.dtype)
+    if like.ndim == 3:
+        flat = flat.view(flat.shape[0], *like.shape[1:])
+    lens = torch.tensor(lengths, dtype=torch.int32)
+    return flat.to(device=like.device), lens.to(device=like.device)
+
+
 def _prepare_swa(metadata: Any, plan: PrefillKeepPlan) -> dict[str, Any] | str:
     if int(metadata.num_prefills) != plan.num_prefills:
         return "SWA metadata request split does not match the keep plan"
@@ -521,17 +698,31 @@ def _prepare_swa(metadata: Any, plan: PrefillKeepPlan) -> dict[str, Any] | str:
             return "SWA prefill seq lens do not match the prefill requests"
         prefix = seq_cpu.to(dtype=torch.int64, device="cpu") - new_query.to(torch.int64)
         window = int(getattr(metadata, "prefill_window_size", 0) or 0)
+        replay = _tail_replay_starts(plan, seq_cpu.to(torch.int64), metadata)
+        if isinstance(replay, str):
+            return replay
+        visible = torch.clamp(prefix - replay[plan.num_decodes :], min=0)
         if window > 0:
-            extra = torch.clamp(prefix, min=0, max=window - 1)
+            extra = torch.clamp(visible, max=window - 1)
         else:
-            extra = torch.zeros_like(prefix)
+            extra = torch.zeros_like(visible)
         gather_cpu = (new_query.to(torch.int64) + extra).to(dtype=query_cpu.dtype)
         updates["prefill_query_lens_cpu"] = new_query
+        old_replay = getattr(metadata, "replay_start", None)
+        updates["replay_start"] = replay.to(
+            device=old_replay.device if old_replay is not None else "cpu",
+            dtype=old_replay.dtype if old_replay is not None else torch.int32,
+        )
         gather = getattr(metadata, "prefill_gather_lens", None)
         if gather is not None:
             updates["prefill_gather_lens"] = gather_cpu.to(
                 device=gather.device, dtype=gather.dtype
             )
+        masked = _mask_prefill_swa(plan, seq_cpu.to(torch.int64), replay, metadata)
+        if isinstance(masked, str):
+            return masked
+        if masked is not None:
+            updates["prefill_swa_indices"], updates["prefill_swa_lens"] = masked
     cache = getattr(metadata, "flashinfer_sparse_index_cache", None)
     if isinstance(cache, dict):
         # Layer 20 may have cached full-batch sparse indices. Later layers
@@ -801,8 +992,8 @@ def apply_ced_compaction(
     topk_indices_buffer[: staged_topk.shape[0]].copy_(staged_topk)
     if candidate_block_buffer is not None and staged_candidates is not None:
         candidate_block_buffer[: staged_candidates.shape[0]].copy_(staged_candidates)
-    _log_once(
-        "info",
+    logger.info(
+        "%s",
         ced_compact_message(
             config, planned.full_prefill_tokens, planned.num_prefill_tokens
         ),
@@ -989,7 +1180,9 @@ def compact_after_boundary(
         cudagraph_mode_value=_cudagraph_mode_value(ctx.cudagraph_runtime_mode),
     )
     if block is not None:
-        _log_once("warning", f"DSV41 CED prefill refused: {block}")
+        # Per step, not once: piecewise mixed prefills must be countable
+        # against compaction lines. Graph mode itself is unchanged.
+        logger.info("DSV41 CED prefill refused: %s", block)
         return None
     result = apply_ced_compaction(
         config,

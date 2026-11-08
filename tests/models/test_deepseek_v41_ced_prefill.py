@@ -13,6 +13,7 @@ from vllm.models.deepseek_v41.ced_prefill import (
     CED_PREFILL_ROWS_ENV,
     CedPrefillConfig,
     CedRefusal,
+    accurate_output_rows,
     apply_ced_compaction,
     build_ced_prefill,
     ced_attach_message,
@@ -22,14 +23,16 @@ from vllm.models.deepseek_v41.ced_prefill import (
     compact_layer_count,
     decide_ced_rank,
     dependency_halo_rows,
+    draft_aux_halo_rows,
     full_resolution_boundary,
     plan_prefill_keep,
     reset_ced_prefill_logs,
     restore_token_rows,
 )
 
-# Flash: W=128, 19 compact layers (21..39) -> 128 + 18*127.
-FLASH_HALO_ROWS = 128 + 18 * 127
+# Flash targets [37, 38, 39]: 128 + 127*(39-21). Aux 40 would be 2541.
+FLASH_HALO_ROWS = 128 + 127 * (39 - 21)
+FLASH_FINAL_AUX_ROWS = 128 + 127 * (40 - 21)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -50,6 +53,7 @@ def _flash_hf(**overrides):
         index_source_layer_ids=[2, 8, 14, 20, 24, 28, 32, 36],
         engram_layer_ids=[1, 14],
         sliding_window=128,
+        dspark_target_layer_ids=[37, 38, 39],
         candidate_source_layer_id=20,
         candidate_topk_blocks=2048,
         candidate_block_size=8,
@@ -58,7 +62,7 @@ def _flash_hf(**overrides):
     return SimpleNamespace(**config)
 
 
-def _vllm_config(hf):
+def _vllm_config(hf, *, prefix_caching=False, bounded_replay=True, v2=True):
     parallel = SimpleNamespace(
         prefill_context_parallel_size=1,
         decode_context_parallel_size=1,
@@ -66,6 +70,11 @@ def _vllm_config(hf):
     return SimpleNamespace(
         model_config=SimpleNamespace(hf_config=hf),
         parallel_config=parallel,
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=prefix_caching,
+            swa_bounded_replay=bounded_replay,
+        ),
+        use_v2_model_runner=v2,
     )
 
 
@@ -307,6 +316,9 @@ def _batch(tail_rows: int = 3):
         prefill_window_size=128,
         prefill_seq_lens_cpu_id=None,
         flashinfer_sparse_index_cache={"stale": (1, 2)},
+        replay_start=torch.zeros(2, dtype=torch.int32),
+        block_size=1,
+        block_table=torch.arange(16, dtype=torch.int64).view(1, 16).repeat(2, 1),
     )
     # Mark the seq-lens tensor so the test can see it was not replaced.
     swa.prefill_seq_lens_cpu_id = swa.prefill_seq_lens_cpu
@@ -373,12 +385,18 @@ def test_flag_on_compacts_to_last_n_and_scatter_restores_tail():
     torch.testing.assert_close(result.hidden_states.view(-1), expected)
     assert swa.num_prefill_tokens == 3
     assert tuple(int(v) for v in swa.query_start_loc_cpu.tolist()) == (0, 2, 5)
-    torch.testing.assert_close(
-        swa.prefill_swa_indices.view(-1), torch.tensor([5, 6, 7])
+    # Left edge is clamped to the first kept position (5), same as replay.
+    assert int(swa.replay_start[1]) == 5
+    assert int(swa.replay_start[0]) == 0
+    assert int(swa.prefill_swa_indices.view(-1)[0]) == 5
+    assert int(swa.prefill_swa_lens.max()) <= 3
+    assert (
+        int(swa.prefill_swa_indices.min()) >= 5
+        or int(swa.prefill_swa_indices.min()) == -1
     )
-    # Full context length stays; gather grows by the dropped prefix inside the window.
+    # Full context length stays. Gather does not reach below the tail.
     assert swa.prefill_seq_lens_cpu is seq_lens
-    assert int(swa.prefill_gather_lens[0]) == 3 + min(8 - 3, 127)
+    assert int(swa.prefill_gather_lens[0]) == 3
     assert swa.flashinfer_sparse_index_cache == {}
     # Shared SWA object narrowed once, not twice (still 3, not the tail of 3).
     assert metadata["model.layers.20.attn.swa_cache"].num_prefill_tokens == 3
@@ -476,10 +494,17 @@ def test_missing_indexer_metadata_refuses():
 
 
 def test_dependency_halo_width_and_pp2_default(monkeypatch):
-    assert dependency_halo_rows(128, 19) == FLASH_HALO_ROWS
+    # Confirmed Flash ids [37, 38, 39]. Aux 40 is the final_aux key and is
+    # not in the checkpoint; that width would be 2541.
+    assert draft_aux_halo_rows(128, 39, 21) == FLASH_HALO_ROWS
+    assert draft_aux_halo_rows(128, 40, 21) == FLASH_FINAL_AUX_ROWS == 2541
+    assert dependency_halo_rows(128, 18) == FLASH_HALO_ROWS
+    # 2414 leaves one in-cone row at 0-based layer 39, and 128 at aux 39.
+    assert accurate_output_rows(FLASH_HALO_ROWS, 19, 128) == 1
+    assert accurate_output_rows(FLASH_HALO_ROWS, 18, 128) == 128
+    assert accurate_output_rows(FLASH_FINAL_AUX_ROWS, 19, 128) == 128
     assert compact_layer_count(40, 20) == 19
-    # One compact layer only needs the sliding window itself.
-    assert dependency_halo_rows(128, 1) == 128
+    assert draft_aux_halo_rows(128, 21, 21) == 128
     monkeypatch.setenv(CED_PREFILL_ENV, "1")
     monkeypatch.delenv(CED_PREFILL_ROWS_ENV, raising=False)
     hf = _flash_hf()
@@ -550,6 +575,9 @@ def test_mixed_batch_halo_keeps_each_tail_and_last_token():
         prefill_gather_lens=torch.tensor([5, 3], dtype=torch.int32),
         prefill_window_size=128,
         flashinfer_sparse_index_cache={},
+        replay_start=torch.zeros(3, dtype=torch.int32),
+        block_size=1,
+        block_table=torch.arange(16, dtype=torch.int64).view(1, 16).repeat(3, 1),
     )
     ks = torch.arange(8, dtype=torch.int32)
     indexer = _Indexer(
@@ -609,6 +637,39 @@ def test_mixed_batch_halo_keeps_each_tail_and_last_token():
     assert float(restored[2]) == 0.0
     message = ced_compact_message(config, full_prefill_tokens=8, kept_prefill_tokens=7)
     assert "dependency-preserving tail" in message
+
+
+def test_prefix_cache_without_bounded_replay_refuses(monkeypatch):
+    monkeypatch.setenv(CED_PREFILL_ENV, "1")
+    monkeypatch.delenv(CED_PREFILL_ROWS_ENV, raising=False)
+    hf = _flash_hf()
+    refused = build_ced_prefill(
+        _vllm_config(hf, prefix_caching=True, bounded_replay=False),
+        start_layer=0,
+        end_layer=40,
+        use_sequence_parallel=False,
+        use_mega_moe=False,
+    )
+    assert refused is None
+    # Config bit alone is not enough: V1 turns the feature off.
+    reset_ced_prefill_logs()
+    refused_v1 = build_ced_prefill(
+        _vllm_config(hf, prefix_caching=True, bounded_replay=True, v2=False),
+        start_layer=0,
+        end_layer=40,
+        use_sequence_parallel=False,
+        use_mega_moe=False,
+    )
+    assert refused_v1 is None
+    reset_ced_prefill_logs()
+    allowed = build_ced_prefill(
+        _vllm_config(hf, prefix_caching=True, bounded_replay=True, v2=True),
+        start_layer=0,
+        end_layer=40,
+        use_sequence_parallel=False,
+        use_mega_moe=False,
+    )
+    assert allowed is not None and allowed.tail_rows == FLASH_HALO_ROWS
 
 
 def test_runtime_block_reasons():
