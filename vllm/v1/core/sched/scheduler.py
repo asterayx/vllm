@@ -231,6 +231,12 @@ class Scheduler(SchedulerInterface):
         # IDs of requests preempted since the last call to schedule().
         self.reset_preempted_req_ids: set[str] = set()
 
+        # Real speculative draft token ids keyed by request id. Under PP the
+        # latest ModelRunnerOutput/take_draft_token_ids() microbatch may omit
+        # a request, so grammar bitmasks look up this store instead of leftover
+        # -1 placeholders from AsyncScheduler.
+        self._draft_token_ids_by_req: dict[str, list[int]] = {}
+
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
         self.num_waiting_for_streaming_input: int = 0
@@ -1582,6 +1588,7 @@ class Scheduler(SchedulerInterface):
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
+        self._draft_token_ids_by_req.pop(request.request_id, None)
         # Async scheduling: mark all in-flight output as stale. Its tokens are
         # still delivered on return (dropping them would perturb spec-decode
         # acceptance) but must not mutate the reset counters; each step drains
@@ -1979,10 +1986,12 @@ class Scheduler(SchedulerInterface):
         if not structured_output_request_ids:
             return None
 
+        self._apply_persisted_draft_token_ids(scheduler_output)
         bitmask = self.structured_output_manager.grammar_bitmask(
             self.requests,
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
+            num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
@@ -2262,6 +2271,12 @@ class Scheduler(SchedulerInterface):
             self.kv_holding_waiting.remove_requests(stopped_preempted_reqs)
             self.deferred_waiting.difference_update(stopped_preempted_reqs)
 
+        # Persist this step's CPU-copied drafts after sampled tokens have
+        # advanced the grammar. Store them raw; validate_tokens runs later in
+        # _apply_persisted_draft_token_ids when the FSM is current.
+        if model_runner_output.draft_token_ids is not None:
+            self._persist_raw_draft_token_ids(model_runner_output.draft_token_ids)
+
         error_req_ids = set(self.grammar_compile_error_reqs)
         self.grammar_compile_error_reqs.clear()
         error_req_ids.update(self.encoder_cache_mismatch_reqs)
@@ -2510,24 +2525,84 @@ class Scheduler(SchedulerInterface):
         if self.ec_connector is not None:
             self.ec_connector.update_state_after_free(request, input_id)
 
+    def _persist_raw_draft_token_ids_for_req(
+        self, req_id: str, spec_token_ids: list[int]
+    ) -> Request | None:
+        """Cache raw worker drafts. Does not validate or write spec_token_ids."""
+        request = self.requests.get(req_id)
+        if request is None or request.is_finished():
+            self._draft_token_ids_by_req.pop(req_id, None)
+            return None
+
+        if request.is_prefill_chunk:
+            if request.spec_token_ids:
+                request.spec_token_ids = []
+            self._draft_token_ids_by_req.pop(req_id, None)
+            return None
+
+        self._draft_token_ids_by_req[req_id] = list(spec_token_ids)
+        return request
+
+    def _persist_raw_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+        for req_id, spec_token_ids in zip(
+            draft_token_ids.req_ids,
+            draft_token_ids.draft_token_ids,
+        ):
+            self._persist_raw_draft_token_ids_for_req(req_id, spec_token_ids)
+
+    def _validated_draft_token_ids(
+        self, request: Request, spec_token_ids: list[int]
+    ) -> list[int]:
+        return self.structured_output_manager.validate_tokens(request, spec_token_ids)
+
+    def _apply_persisted_draft_token_ids(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Replace placeholder -1 spec tokens with this request's stored drafts.
+
+        Validates against the current FSM (after this step's accept_tokens).
+        If a request has no stored drafts, leave the placeholders in place.
+        If stored drafts validate to a shorter prefix, pad with -1 and record
+        ``num_invalid_spec_tokens`` so grammar_bitmask can tell that padding
+        apart from a persist miss. Neither case copies row 0 onto later rows.
+        """
+        sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        num_invalid_spec_tokens = scheduler_output.num_invalid_spec_tokens
+        if num_invalid_spec_tokens is None:
+            num_invalid_spec_tokens = {}
+            scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
+
+        for req_id, spec_tokens in list(sched_spec_tokens.items()):
+            if spec_tokens and any(token >= 0 for token in spec_tokens):
+                continue
+            stored = self._draft_token_ids_by_req.get(req_id)
+            if not stored:
+                continue
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            validated = self._validated_draft_token_ids(request, stored)
+            orig_num_spec_tokens = len(spec_tokens) if spec_tokens else len(stored)
+            applied = list(validated[:orig_num_spec_tokens])
+            num_invalid_tokens = orig_num_spec_tokens - len(applied)
+            if num_invalid_tokens:
+                applied.extend([-1] * num_invalid_tokens)
+                num_invalid_spec_tokens[req_id] = num_invalid_tokens
+            sched_spec_tokens[req_id] = applied
+
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
         ):
-            request = self.requests.get(req_id)
-            if request is None or request.is_finished():
-                # The request may have been finished. Skip.
+            request = self._persist_raw_draft_token_ids_for_req(req_id, spec_token_ids)
+            if request is None:
                 continue
-
-            if request.is_prefill_chunk:
-                # Ignore draft tokens for prefill chunks.
-                if request.spec_token_ids:
-                    request.spec_token_ids = []
+            # AsyncScheduler._update_after_schedule already installed the next
+            # step's placeholders; do not clobber them with this step's drafts.
+            if request.spec_token_ids:
                 continue
-
-            # Add newly generated spec token ids to the request.
-            request.spec_token_ids = self.structured_output_manager.validate_tokens(
+            request.spec_token_ids = self._validated_draft_token_ids(
                 request, spec_token_ids
             )
 
@@ -2541,23 +2616,21 @@ class Scheduler(SchedulerInterface):
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
         ):
-            request = self.requests.get(req_id)
-            if request is None or request.is_finished():
-                # The request may have been finished. Skip.
-                continue
-
             placeholder_spec_tokens = sched_spec_tokens.get(req_id)
-            if not placeholder_spec_tokens:
+            to_store = spec_token_ids
+            if placeholder_spec_tokens:
+                # Trim drafts to scheduled number of spec tokens
+                # (needed for chunked prefill case for example).
+                to_store = spec_token_ids[: len(placeholder_spec_tokens)]
+            request = self._persist_raw_draft_token_ids_for_req(req_id, to_store)
+            if request is None or not placeholder_spec_tokens:
                 continue
 
+            # The output is already scheduled; keep request.spec_token_ids
+            # (async placeholders) and write validated drafts onto it.
             orig_num_spec_tokens = len(placeholder_spec_tokens)
-            # Trim drafts to scheduled number of spec tokens
-            # (needed for chunked prefill case for example).
-            del spec_token_ids[orig_num_spec_tokens:]
-            # Filter out spec tokens which do not adhere to the grammar.
-            spec_token_ids = self.structured_output_manager.validate_tokens(
-                request, spec_token_ids
-            )
+            validated = self._validated_draft_token_ids(request, to_store)
+            spec_token_ids = list(validated)
             # Pad to original number of spec tokens.
             num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
             if num_invalid_tokens:
@@ -2567,6 +2640,8 @@ class Scheduler(SchedulerInterface):
             sched_spec_tokens[req_id] = spec_token_ids
 
         scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
+        # Requests omitted from this take still get their stored drafts.
+        self._apply_persisted_draft_token_ids(scheduler_output)
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
@@ -2690,6 +2765,7 @@ class Scheduler(SchedulerInterface):
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        self._draft_token_ids_by_req.pop(request_id, None)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -2917,6 +2993,12 @@ class Scheduler(SchedulerInterface):
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
             spec_decoding_stats=spec_stats,
+            num_missing_draft_bitmask_fills=(
+                self.structured_output_manager.num_missing_draft_bitmask_fills
+            ),
+            num_all_invalid_draft_bitmask_fills=(
+                self.structured_output_manager.num_all_invalid_draft_bitmask_fills
+            ),
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,

@@ -12,6 +12,7 @@ import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
+    DraftTokenIds,
     LogprobsTensors,
     ModelRunnerOutput,
     PoolerOutput,
@@ -22,6 +23,7 @@ from vllm.v1.worker.utils import raise_if_nan_logits
 if TYPE_CHECKING:
     from vllm.distributed.aux_output_connector.worker import PendingAuxOutput
     from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.spec_decode.utils import DraftCopySnapshot
 
 
 @dataclass(frozen=True)
@@ -130,6 +132,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.pending_aux_output = pending_aux_output
+        self._draft_snapshot = None
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
@@ -169,6 +172,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.copy_event.record(copy_stream)
+
+    def attach_drafts(self, snapshot: "DraftCopySnapshot") -> None:
+        """Bind this step's draft copy. get_output waits only on this event."""
+        self._draft_snapshot = snapshot
 
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
@@ -212,6 +219,15 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 "Fault detected in EP all2all communication: "
                 "one or more ranks timed out during dispatch/combine. "
                 f"Mask: {mask.cpu().tolist()}"
+            )
+
+        snapshot = self._draft_snapshot
+        if snapshot is not None:
+            if snapshot.copy_event is not None:
+                snapshot.copy_event.synchronize()
+            self.model_runner_output.draft_token_ids = DraftTokenIds(
+                snapshot.req_ids,
+                snapshot.draft_tokens_np.tolist(),
             )
 
         return self.model_runner_output

@@ -708,7 +708,9 @@ class EngineCore:
             else:
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
-                    # and sample immediately.
+                    # and sample immediately. Real drafts for this request
+                    # were persisted from a prior ModelRunnerOutput in
+                    # update_from_output; get_grammar_bitmask overlays them.
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )

@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict, deque
 from collections.abc import Callable
-from unittest.mock import Mock
+from concurrent.futures import Future
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.engine.core import EngineCore
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 from vllm.v1.structured_output import StructuredOutputGrammar
@@ -811,3 +813,39 @@ def test_resumable_request_handoff():
 
     engine._process_oldest_step()
     assert len(request.output_token_ids) == 1
+
+
+def test_async_non_deferred_path_does_not_take_drafts():
+    """Non-deferred structured+spec steps must not block on take_draft_token_ids.
+
+    Drafts ride back on ModelRunnerOutput and are stored in update_from_output.
+    """
+    core = MagicMock()
+    core.batch_queue = deque()
+    core.batch_queue_size = 2
+    core.is_mm_encoder_only = False
+    core.is_pooling_model = False
+    core.check_for_draft_tokens = True
+    core.scheduler.has_requests.side_effect = [True, False, False]
+    scheduled = core.scheduler.schedule.return_value
+    scheduled.total_num_scheduled_tokens = 16
+    scheduled.pending_structured_output_tokens = False
+    scheduled.has_structured_output_requests = True
+    scheduled.scheduled_spec_decode_tokens = {"req": [-1, -1, -1]}
+
+    output = MagicMock()
+    executed: Future[ModelRunnerOutput | None] = Future()
+    executed.set_result(None)
+    sampled: Future[ModelRunnerOutput | None] = Future()
+    sampled.set_result(output)
+    core.model_executor.execute_model.return_value = executed
+    core.model_executor.sample_tokens.return_value = sampled
+
+    EngineCore.step_with_batch_queue(core)
+    if core.batch_queue:
+        EngineCore.step_with_batch_queue(core)
+
+    core.model_executor.take_draft_token_ids.assert_not_called()
+    core.scheduler.update_draft_token_ids_in_output.assert_not_called()
+    core.scheduler.get_grammar_bitmask.assert_called_with(scheduled)
+    core.model_executor.sample_tokens.assert_called_once()

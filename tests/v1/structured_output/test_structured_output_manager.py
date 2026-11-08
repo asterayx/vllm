@@ -158,10 +158,14 @@ def _run_real_flow(
     assert validated == expected_validated
 
     padded = validated + [-1] * (len(raw_drafts) - len(validated))
+    num_invalid = len(raw_drafts) - len(validated)
     bitmask = manager.grammar_bitmask(
         requests={request.request_id: request},
         structured_output_request_ids=[request.request_id],
         scheduled_spec_decode_tokens={request.request_id: padded},
+        num_invalid_spec_tokens=(
+            {request.request_id: num_invalid} if num_invalid else None
+        ),
     )
     assert bitmask is not None
     assert bitmask.shape[0] == len(raw_drafts) + 1
@@ -426,6 +430,8 @@ def test_initial_constraint_activation(
         # EOS is only valid once the regex has matched; rows after EOS are
         # unconstrained since the request stops there.
         pytest.param(("1", EOS, "2"), ("1", EOS), "CCUU", True, id="terminates"),
+        # All drafts rejected → padded with -1. Do not copy row 0 onto later
+        # rows (those are already in different FSM states).
         pytest.param((EOS, "1"), (), "CUU", False, id="early_eos"),
     ],
 )
@@ -478,6 +484,68 @@ def test_rejected_draft_keeps_later_rows_constrained(tokenizer, backend: str):
     assert _row_pattern(bitmask) == "CCCC"
     assert (bitmask[2] == bitmask[1]).all()
     assert (bitmask[3] == bitmask[1]).all()
+
+
+@pytest.mark.parametrize("backend", REGEX_BACKENDS)
+def test_placeholder_drafts_log_and_do_not_copy_row0(
+    tokenizer, backend: str, caplog_vllm
+):
+    """Missing real drafts must not copy row 0 onto later FSM rows."""
+    manager, request = _build_harness(
+        tokenizer,
+        backend,
+        use_reasoner=False,
+        structured_outputs=StructuredOutputsParams(regex=DIGITS_REGEX),
+    )
+    from vllm.logger import _print_error_once
+
+    _print_error_once.cache_clear()
+    placeholders = [-1, -1, -1]
+    bitmask = manager.grammar_bitmask(
+        requests={request.request_id: request},
+        structured_output_request_ids=[request.request_id],
+        scheduled_spec_decode_tokens={request.request_id: placeholders},
+    )
+    assert bitmask is not None
+    assert manager.num_missing_draft_bitmask_fills == 1
+    assert manager.num_all_invalid_draft_bitmask_fills == 0
+    assert "no real draft token ids" in caplog_vllm.text
+    # Row 0 is constrained; later rows stay unconstrained rather than
+    # replicating the row-0 mask.
+    assert _row_pattern(bitmask) == "CUUU"
+    assert not (bitmask[1] == bitmask[0]).all()
+    assert not (bitmask[2] == bitmask[0]).all()
+    assert not (bitmask[3] == bitmask[0]).all()
+
+
+@pytest.mark.parametrize("backend", REGEX_BACKENDS)
+def test_all_invalid_padded_drafts_are_not_missing(
+    tokenizer, backend: str, caplog_vllm
+):
+    """Validated-empty drafts padded to -1 are not a persist miss."""
+    manager, request = _build_harness(
+        tokenizer,
+        backend,
+        use_reasoner=False,
+        structured_outputs=StructuredOutputsParams(regex=DIGITS_REGEX),
+    )
+    from vllm.logger import _print_error_once
+
+    _print_error_once.cache_clear()
+    placeholders = [-1, -1, -1]
+    bitmask = manager.grammar_bitmask(
+        requests={request.request_id: request},
+        structured_output_request_ids=[request.request_id],
+        scheduled_spec_decode_tokens={request.request_id: placeholders},
+        num_invalid_spec_tokens={request.request_id: len(placeholders)},
+    )
+    assert bitmask is not None
+    assert manager.num_missing_draft_bitmask_fills == 0
+    assert manager.num_all_invalid_draft_bitmask_fills == 1
+    assert "no real draft token ids" not in caplog_vllm.text
+    # Same fill as a persist miss: row 0 constrained, later rows unconstrained.
+    assert _row_pattern(bitmask) == "CUUU"
+    assert not (bitmask[1] == bitmask[0]).all()
 
 
 def test_outlines_termination(tokenizer):

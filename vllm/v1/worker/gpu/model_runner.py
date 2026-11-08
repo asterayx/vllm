@@ -1139,6 +1139,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
+        self.draft_tokens_handler.discard(req_id)
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
@@ -2308,10 +2309,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
-            self.draft_tokens_handler.set_draft_tokens(
+            draft_snapshot = self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],
             )
+            if draft_snapshot is not None:
+                async_output.attach_drafts(draft_snapshot)
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(
                     self.req_states.draft_tokens, input_batch

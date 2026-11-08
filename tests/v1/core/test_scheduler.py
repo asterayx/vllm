@@ -7020,6 +7020,46 @@ class _RecordingGrammar:
         self.seen.append(list(tokens))
         return tokens
 
+    def accept_tokens(self, req_id: str, tokens: list[int]) -> bool:
+        return True
+
+    def is_terminated(self) -> bool:
+        return False
+
+
+class _RejectAllGrammar:
+    """Every draft is grammar-illegal; validate_tokens returns []."""
+
+    def validate_tokens(self, tokens: list[int]) -> list[int]:
+        return []
+
+    def accept_tokens(self, req_id: str, tokens: list[int]) -> bool:
+        return True
+
+    def is_terminated(self) -> bool:
+        return False
+
+
+class _StaleSensitiveGrammar:
+    """Truncates every draft until accept_tokens has advanced the FSM."""
+
+    def __init__(self) -> None:
+        self.accepted: list[int] = []
+        self.validated: list[list[int]] = []
+
+    def accept_tokens(self, req_id: str, tokens: list[int]) -> bool:
+        self.accepted.extend(tokens)
+        return True
+
+    def validate_tokens(self, tokens: list[int]) -> list[int]:
+        self.validated.append(list(tokens))
+        if not self.accepted:
+            return []
+        return tokens
+
+    def is_terminated(self) -> bool:
+        return False
+
 
 def _decode_ready_request(scheduler):
     """Add one request and advance it out of prefill into decode."""
@@ -7088,6 +7128,309 @@ def test_update_draft_token_ids_in_output_strips_padding():
         -1,
     ]
     assert scheduler_output.num_invalid_spec_tokens == {request.request_id: 2}
+
+
+def test_update_from_output_stores_output_carried_drafts():
+    """Drafts attached to ModelRunnerOutput are persisted per request."""
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    request = _decode_ready_request(scheduler)
+    request.structured_output_request = SimpleNamespace(
+        grammar=_RecordingGrammar(), reasoning_ended=True
+    )
+    req_id = request.request_id
+    output = scheduler.schedule()
+    # Isolate persist from sampled-token bookkeeping for this unit test.
+    output.num_scheduled_tokens.clear()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[req_id],
+            req_id_to_index={req_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            draft_token_ids=DraftTokenIds([req_id], [[10, 11, 12]]),
+        ),
+    )
+    assert scheduler._draft_token_ids_by_req[req_id] == [10, 11, 12]
+
+    captured: dict[str, list[int]] = {}
+
+    def fake_bitmask(requests, structured_ids, spec_tokens, **kwargs):
+        captured.update(spec_tokens)
+        return None
+
+    scheduler.structured_output_manager.grammar_bitmask = fake_bitmask
+    grammar_output = scheduler.get_grammar_bitmask(
+        SimpleNamespace(
+            has_structured_output_requests=True,
+            num_scheduled_tokens={req_id: 4},
+            scheduled_spec_decode_tokens={req_id: [-1, -1, -1]},
+            num_invalid_spec_tokens=None,
+        )
+    )
+    assert grammar_output is not None
+    assert captured[req_id] == [10, 11, 12]
+
+
+def test_persisted_drafts_validated_after_grammar_advance():
+    """Output-carried drafts must not be validated until accept_tokens runs.
+
+    A stale FSM would truncate legal drafts to [] and store -1 padding; the
+    bitmask would then unconstrain later rows.
+    """
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    request = _decode_ready_request(scheduler)
+    grammar = _StaleSensitiveGrammar()
+    request.structured_output_request = SimpleNamespace(
+        grammar=grammar, reasoning_ended=True
+    )
+    req_id = request.request_id
+    output = scheduler.schedule()
+    # One sampled token so accept_tokens runs without spec-rejection rollback.
+    output.scheduled_spec_decode_tokens.pop(req_id, None)
+    output.num_scheduled_tokens[req_id] = 1
+    engine_outputs = scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[req_id],
+            req_id_to_index={req_id: 0},
+            sampled_token_ids=[[42]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            draft_token_ids=DraftTokenIds([req_id], [[10, 11, 12]]),
+        ),
+    )
+    assert engine_outputs is not None
+    assert grammar.accepted == [42]
+    # Raw drafts are kept even though validate_tokens would have truncated
+    # them before accept_tokens.
+    assert scheduler._draft_token_ids_by_req[req_id] == [10, 11, 12]
+    assert grammar.validated == []
+
+    captured: dict[str, list[int]] = {}
+
+    def fake_bitmask(requests, structured_ids, spec_tokens, **kwargs):
+        captured.update(spec_tokens)
+        return None
+
+    scheduler.structured_output_manager.grammar_bitmask = fake_bitmask
+    grammar_output = scheduler.get_grammar_bitmask(
+        SimpleNamespace(
+            has_structured_output_requests=True,
+            num_scheduled_tokens={req_id: 4},
+            scheduled_spec_decode_tokens={req_id: [-1, -1, -1]},
+            num_invalid_spec_tokens=None,
+        )
+    )
+    assert grammar_output is not None
+    assert captured[req_id] == [10, 11, 12]
+    assert grammar.validated == [[10, 11, 12]]
+
+
+def test_output_carried_drafts_do_not_clobber_next_step_placeholders():
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    request = _decode_ready_request(scheduler)
+    request.structured_output_request = SimpleNamespace(
+        grammar=_RecordingGrammar(), reasoning_ended=True
+    )
+    req_id = request.request_id
+    output = scheduler.schedule()
+    output.num_scheduled_tokens.clear()
+    # AsyncScheduler._update_after_schedule installs next-step placeholders
+    # after schedule() has already copied this step's spec tokens.
+    request.spec_token_ids = [-1, -1, -1]
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[req_id],
+            req_id_to_index={req_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            draft_token_ids=DraftTokenIds([req_id], [[10, 11, 12]]),
+        ),
+    )
+    assert scheduler._draft_token_ids_by_req[req_id] == [10, 11, 12]
+    assert request.spec_token_ids == [-1, -1, -1]
+
+
+def test_preempt_clears_persisted_drafts():
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    request = _decode_ready_request(scheduler)
+    request.structured_output_request = SimpleNamespace(
+        grammar=_RecordingGrammar(), reasoning_ended=True
+    )
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [[10, 11, 12]])
+    )
+    assert request.request_id in scheduler._draft_token_ids_by_req
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, 0.0)
+    assert request.request_id not in scheduler._draft_token_ids_by_req
+
+
+def test_prefill_chunk_clears_persisted_drafts():
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    request = _decode_ready_request(scheduler)
+    request.structured_output_request = SimpleNamespace(
+        grammar=_RecordingGrammar(), reasoning_ended=True
+    )
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [[10, 11, 12]])
+    )
+    request.is_prefill_chunk = True
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [[21, 22, 23]])
+    )
+    assert request.request_id not in scheduler._draft_token_ids_by_req
+
+
+def test_missing_draft_bitmask_fills_exported_on_scheduler_stats():
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    scheduler.structured_output_manager.num_missing_draft_bitmask_fills = 4
+    scheduler.structured_output_manager.num_all_invalid_draft_bitmask_fills = 7
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_missing_draft_bitmask_fills == 4
+    assert stats.num_all_invalid_draft_bitmask_fills == 7
+
+
+def test_all_invalid_persisted_drafts_are_not_a_persist_miss():
+    """Stored drafts that validate to [] pad to -1 and set num_invalid."""
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    request = _decode_ready_request(scheduler)
+    request.structured_output_request = SimpleNamespace(
+        grammar=_RejectAllGrammar(), reasoning_ended=True
+    )
+    req_id = request.request_id
+    scheduler._draft_token_ids_by_req[req_id] = [10, 11, 12]
+    captured: dict[str, dict] = {}
+
+    def fake_bitmask(
+        requests, structured_ids, spec_tokens, num_invalid_spec_tokens=None
+    ):
+        captured["spec"] = dict(spec_tokens)
+        captured["invalid"] = dict(num_invalid_spec_tokens or {})
+        return None
+
+    scheduler.structured_output_manager.grammar_bitmask = fake_bitmask
+    grammar_output = scheduler.get_grammar_bitmask(
+        SimpleNamespace(
+            has_structured_output_requests=True,
+            num_scheduled_tokens={req_id: 4},
+            scheduled_spec_decode_tokens={req_id: [-1, -1, -1]},
+            num_invalid_spec_tokens=None,
+        )
+    )
+    assert grammar_output is not None
+    assert captured["spec"][req_id] == [-1, -1, -1]
+    assert captured["invalid"][req_id] == 3
+    assert req_id in scheduler._draft_token_ids_by_req
+
+
+def test_missing_persisted_drafts_do_not_set_num_invalid():
+    """Unreplaced placeholders must not look like validated-empty padding."""
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    request = _decode_ready_request(scheduler)
+    request.structured_output_request = SimpleNamespace(
+        grammar=_RejectAllGrammar(), reasoning_ended=True
+    )
+    req_id = request.request_id
+    captured: dict[str, dict] = {}
+
+    def fake_bitmask(
+        requests, structured_ids, spec_tokens, num_invalid_spec_tokens=None
+    ):
+        captured["spec"] = dict(spec_tokens)
+        captured["invalid"] = dict(num_invalid_spec_tokens or {})
+        return None
+
+    scheduler.structured_output_manager.grammar_bitmask = fake_bitmask
+    grammar_output = scheduler.get_grammar_bitmask(
+        SimpleNamespace(
+            has_structured_output_requests=True,
+            num_scheduled_tokens={req_id: 4},
+            scheduled_spec_decode_tokens={req_id: [-1, -1, -1]},
+            num_invalid_spec_tokens=None,
+        )
+    )
+    assert grammar_output is not None
+    assert captured["spec"][req_id] == [-1, -1, -1]
+    assert req_id not in captured["invalid"]
+
+
+def test_grammar_bitmask_uses_persisted_drafts_when_take_omits_request():
+    """PP microbatches can omit a request from take_draft_token_ids().
+
+    Real drafts stored for that request must still replace -1 placeholders
+    before grammar_bitmask() runs.
+    """
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    request = _decode_ready_request(scheduler)
+    request.structured_output_request = SimpleNamespace(
+        grammar=_RecordingGrammar(), reasoning_ended=True
+    )
+
+    real_drafts = [10, 11, 12]
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [list(real_drafts)])
+    )
+    # A later microbatch has drafts only for a different request.
+    scheduler.update_draft_token_ids_in_output(
+        DraftTokenIds(["other"], [[21, 22, 23]]),
+        SimpleNamespace(
+            scheduled_spec_decode_tokens={"other": [-1, -1, -1]},
+            num_invalid_spec_tokens=None,
+        ),
+    )
+
+    captured: dict[str, list[int]] = {}
+
+    def fake_bitmask(requests, structured_ids, spec_tokens, **kwargs):
+        captured.update(spec_tokens)
+        return None
+
+    scheduler.structured_output_manager.grammar_bitmask = fake_bitmask
+    scheduler_output = SimpleNamespace(
+        has_structured_output_requests=True,
+        num_scheduled_tokens={request.request_id: 4},
+        scheduled_spec_decode_tokens={request.request_id: [-1, -1, -1]},
+        num_invalid_spec_tokens=None,
+    )
+
+    grammar_output = scheduler.get_grammar_bitmask(scheduler_output)
+    assert grammar_output is not None
+    assert grammar_output.structured_output_request_ids == [request.request_id]
+    assert captured[request.request_id] == real_drafts
+    assert request.request_id in scheduler._draft_token_ids_by_req
+
+
+def test_update_draft_token_ids_in_output_overlays_omitted_request():
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    request = _decode_ready_request(scheduler)
+    request.structured_output_request = SimpleNamespace(
+        grammar=_RecordingGrammar(), reasoning_ended=True
+    )
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [[10, 11, 12]])
+    )
+
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={request.request_id: [-1, -1, -1]},
+        num_invalid_spec_tokens=None,
+    )
+    scheduler.update_draft_token_ids_in_output(
+        DraftTokenIds(["other"], [[21, 22, 23]]), scheduler_output
+    )
+    assert scheduler_output.scheduled_spec_decode_tokens[request.request_id] == [
+        10,
+        11,
+        12,
+    ]
 
 
 def test_diffusion_canvas_width_defaults_to_the_served_canvas():
