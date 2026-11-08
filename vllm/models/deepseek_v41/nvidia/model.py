@@ -84,6 +84,12 @@ from vllm.models.deepseek_v4.nvidia.model import (
     prepare_mega_gate_routing_metadata,
 )
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+from vllm.models.deepseek_v41.ced_prefill import (
+    CedCompaction,
+    build_ced_prefill,
+    compact_after_boundary,
+    restore_ced_outputs,
+)
 from vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn import (
     DeepseekV4MegaAttnAttention,
 )
@@ -745,6 +751,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        # Opt-in. Unset DSV41_EXP_CED_PREFILL leaves this None and the forward
+        # loop below runs every layer on the full chunk.
+        self.ced_prefill = build_ced_prefill(
+            vllm_config,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            use_sequence_parallel=self.use_sequence_parallel,
+            use_mega_moe=self.use_mega_moe,
+        )
         if self.fuse_mhc_all_reduce:
             # A MoE's top-k finalize folds into the next layer's first mHC
             # boundary, which the last local layer lacks and an engram layer
@@ -943,6 +958,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         _pp_first = get_pp_group().is_first_rank
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
+        ced_keep = None
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -964,6 +980,35 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
             if _NANDBG:
                 _nan_probe(f"L{idx}", hidden=hidden_states, residual=residual, post_mix=post_mix, res_mix=res_mix, pre_mix=pre_mix)
+            if (
+                self.ced_prefill is not None
+                and ced_keep is None
+                and idx == self.ced_prefill.boundary_layer
+            ):
+                # Boundary just wrote full-resolution global KV and index keys
+                # for every row. Later layers see only each prefill's tail.
+                compacted = compact_after_boundary(
+                    self.ced_prefill,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    post_mix=post_mix,
+                    res_mix=res_mix,
+                    pre_mix=pre_mix,
+                    positions=positions,
+                    input_ids=input_ids,
+                    topk_indices_buffer=self.topk_indices_buffer,
+                    candidate_block_buffer=self.candidate_block_buffer,
+                    mega_gate_metadata=mega_gate_metadata,
+                )
+                if isinstance(compacted, CedCompaction):
+                    ced_keep = compacted.keep
+                    hidden_states = compacted.hidden_states
+                    residual = compacted.residual
+                    post_mix = compacted.post_mix
+                    res_mix = compacted.res_mix
+                    pre_mix = compacted.pre_mix
+                    positions = compacted.positions
+                    input_ids = compacted.input_ids
             if previous_aux is not None:
                 # idx is the one-based id of the layer whose post this is.
                 if self.use_sequence_parallel:
@@ -983,6 +1028,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 if self.use_sequence_parallel:
                     final_aux = sp_all_gather(final_aux)[:full_num_tokens]
                 aux_hidden_by_layer[self.end_layer] = final_aux
+
+        if ced_keep is not None:
+            # Sampling and DSpark aux rows are indexed in the original batch.
+            hidden_states, pre_mix, aux_hidden_by_layer = restore_ced_outputs(
+                ced_keep, hidden_states, pre_mix, aux_hidden_by_layer
+            )
 
         aux_hidden_states = [
             aux_hidden_by_layer[layer_id]
