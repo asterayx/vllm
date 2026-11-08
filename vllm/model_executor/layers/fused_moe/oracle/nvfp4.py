@@ -446,6 +446,19 @@ def convert_to_nvfp4_moe_kernel_format(
     elif nvfp4_backend == NvFp4MoeBackend.MARLIN:
         a13_scale = None
         a2_scale = None
+        from vllm.model_executor.layers.fused_moe.triton_nvfp4_w4a16_decode import (
+            maybe_snapshot_nvfp4_w4a16_decode_weights,
+        )
+
+        maybe_snapshot_nvfp4_w4a16_decode_weights(
+            layer,
+            w13=w13,
+            w13_scale=w13_scale,
+            w13_scale_2=w13_scale_2,
+            w2=w2,
+            w2_scale=w2_scale,
+            w2_scale_2=w2_scale_2,
+        )
         (
             w13,
             w13_scale,

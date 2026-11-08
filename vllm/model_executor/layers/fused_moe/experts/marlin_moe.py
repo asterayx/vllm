@@ -582,6 +582,7 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
+        self._w4a16_decode = None
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -676,6 +677,16 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
 class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
     """Marlin-based fused MoE expert implementation."""
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not self.quant_config.use_nvfp4_w4a16:
+            self._w4a16_decode = None
+            return
+        from vllm.model_executor.layers.fused_moe.triton_nvfp4_w4a16_decode import (
+            try_attach_w4a16_decode,
+        )
+
+        self._w4a16_decode = try_attach_w4a16_decode(self, layer)
+
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
@@ -738,6 +749,27 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
 
         ctx = self._lora_context
         if ctx is None:
+            decode = self._w4a16_decode
+            if decode is not None and decode.can_run(
+                hidden_states,
+                topk_ids,
+                activation,
+                apply_router_weight_on_input,
+                expert_map,
+            ):
+                decode(
+                    output=output,
+                    hidden_states=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    activation=activation,
+                    workspace13=workspace13,
+                    workspace2=workspace2,
+                    expert_map=expert_map,
+                    activation_fn=self.activation,
+                    moe_sum_fn=self.moe_sum,
+                )
+                return
             fused_marlin_moe(
                 hidden_states=hidden_states,
                 w1=w1,
