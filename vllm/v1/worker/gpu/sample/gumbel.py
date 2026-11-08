@@ -225,6 +225,7 @@ def gumbel_block_argmax(
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
     PER_TOKEN_COL: tl.constexpr = False,
+    KEY_OFFSET: tl.constexpr = 0,
 ):
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx).to(tl.int64)
     is_valid_req = req_state_idx >= 0
@@ -253,7 +254,7 @@ def gumbel_block_argmax(
     pos = tl.load(pos_ptr + token_idx)
     return gumbel_noised_argmax(
         logits,
-        block,
+        block + KEY_OFFSET,
         mask,
         seed,
         pos,
@@ -287,6 +288,7 @@ def _gumbel_sample_kernel(
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
     PER_TOKEN_COL: tl.constexpr,
+    KEY_OFFSET: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     block_idx = tl.program_id(1)
@@ -317,6 +319,7 @@ def _gumbel_sample_kernel(
         APPLY_TEMPERATURE=APPLY_TEMPERATURE,
         USE_FP64=USE_FP64,
         PER_TOKEN_COL=PER_TOKEN_COL,
+        KEY_OFFSET=KEY_OFFSET,
     )
     token_id = block_idx * BLOCK_SIZE + idx
     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
@@ -334,6 +337,7 @@ def gumbel_sample(
     logits_cache: torch.Tensor | None = None,  # [max_num_reqs, num_cols, vocab_size]
     logits_cache_col: torch.Tensor | None = None,  # scalar or [num_tokens]
     use_fp64: bool = False,
+    key_offset: int = 0,
 ) -> torch.Tensor:
     # Enforce contiguity on non-strided input tensors
     expanded_idx_mapping = expanded_idx_mapping.contiguous()
@@ -374,8 +378,58 @@ def gumbel_sample(
         APPLY_TEMPERATURE=apply_temperature,
         USE_FP64=use_fp64,
         PER_TOKEN_COL=per_token_col,
+        KEY_OFFSET=key_offset,
     )
     # NOTE(woosuk): Use int64 for later indexing.
     max_block_idx = local_max.argmax(dim=-1, keepdim=True)
     sampled = local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
     return sampled
+
+
+def gumbel_sample_with_values(
+    logits: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    temperature: torch.Tensor,
+    seed: torch.Tensor,
+    pos: torch.Tensor,
+    apply_temperature: bool,
+    is_drafting: bool,
+    use_fp64: bool = False,
+    key_offset: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``gumbel_sample`` plus the winning noised value per row."""
+    expanded_idx_mapping = expanded_idx_mapping.contiguous()
+    pos = pos.contiguous()
+    num_tokens, vocab_size = logits.shape
+    block_size = 1024
+    num_blocks = triton.cdiv(vocab_size, block_size)
+    local_argmax = logits.new_empty(num_tokens, num_blocks, dtype=torch.int64)
+    local_max_dtype = torch.float64 if use_fp64 else torch.float32
+    local_max = logits.new_empty(num_tokens, num_blocks, dtype=local_max_dtype)
+    _gumbel_sample_kernel[(num_tokens, num_blocks)](
+        local_argmax,
+        local_argmax.stride(0),
+        local_max,
+        local_max.stride(0),
+        None,
+        0,
+        0,
+        None,
+        logits,
+        logits.stride(0),
+        expanded_idx_mapping,
+        seed,
+        pos,
+        temperature,
+        vocab_size,
+        BLOCK_SIZE=block_size,
+        IS_DRAFTING=is_drafting,
+        APPLY_TEMPERATURE=apply_temperature,
+        USE_FP64=use_fp64,
+        PER_TOKEN_COL=False,
+        KEY_OFFSET=key_offset,
+    )
+    max_block_idx = local_max.argmax(dim=-1, keepdim=True)
+    sampled = local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
+    values = local_max.gather(dim=-1, index=max_block_idx).view(-1)
+    return sampled, values

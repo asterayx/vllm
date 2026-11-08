@@ -188,6 +188,10 @@ _DPSK_VOCAB_LOCAL_ARGMAX = _os.environ.get("DPSK_VOCAB_LOCAL_ARGMAX", "0") == "1
 _DPSK_VOCAB_LOCAL_ARGMAX_CHECK = int(
     _os.environ.get("DPSK_VOCAB_LOCAL_ARGMAX_CHECK", "0")
 )
+# Opt-in vocab-parallel DSpark sample/verify (greedy + temperature>0).
+_DSV41_EXP_VOCAB_PARALLEL_SAMPLE = (
+    _os.environ.get("DSV41_EXP_VOCAB_PARALLEL_SAMPLE", "0") == "1"
+)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1638,6 +1642,48 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 sampler_output.num_sampled,
                 sampler_output.num_rejected,
             )
+
+        if (
+            _DSV41_EXP_VOCAB_PARALLEL_SAMPLE
+            and self.batch_sharder is None
+            and grammar_output is None
+            and input_batch.num_reqs > 0
+            and input_batch.num_draft_tokens > 0
+            and self.rejection_sampler is not None
+            and self.speculator is not None
+            and self.rejection_sampler.can_vocab_parallel_verify(
+                input_batch, self.speculator.draft_logits
+            )
+        ):
+            # Vocab-sharded one-hot verify: no full-vocab target logits
+            # all-gather. Grammar / structured-output stays on the stock
+            # path so bitmask application is unchanged (see PR #12).
+            m = getattr(self.model, "language_model", self.model)
+            compute_local = getattr(self.model, "compute_logits_local", None)
+            if compute_local is None:
+                compute_local = getattr(m, "compute_logits_local", None)
+            if compute_local is not None and hasattr(m, "lm_head"):
+                sample_hidden_states = hidden_states[input_batch.logits_indices]
+                local_logits = compute_local(sample_hidden_states)
+                si = m.lm_head.shard_indices
+                if si.num_org_vocab_padding > 0:
+                    local_logits = local_logits.clone()
+                    local_logits[..., -si.num_org_vocab_padding :] = float("-inf")
+                n_org = si.org_vocab_end_index - si.org_vocab_start_index
+                sampler_output = (
+                    self.rejection_sampler.vocab_parallel_from_local_logits(
+                        local_logits,
+                        input_batch,
+                        si.org_vocab_start_index,
+                        n_org,
+                        m.lm_head.tp_size,
+                    )
+                )
+                return (
+                    sampler_output,
+                    sampler_output.num_sampled,
+                    sampler_output.num_rejected,
+                )
 
         shard_metadata = None
         global_input_batch = input_batch
