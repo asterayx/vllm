@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from enum import Enum
 
 import torch
@@ -263,6 +264,38 @@ def select_nvfp4_moe_backend(
 
     # Handle explicit moe_backend from user.
     runner_backend = config.moe_backend
+    if runner_backend == "auto" and os.environ.get("DSV41_EXP_TRITON_MOE", "0") == "1":
+        from vllm.model_executor.layers.fused_moe.triton_nvfp4_decode import (
+            dsv41_triton_nvfp4_decode_requested,
+        )
+
+        if dsv41_triton_nvfp4_decode_requested():
+            try:
+                backend, experts_cls = _return_or_raise(
+                    NvFp4MoeBackend.B12X,
+                    config,
+                    weight_key,
+                    activation_key,
+                    activation_format,
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "DSV41_EXP_TRITON_MOE=1 requested B12X NvFp4 MoE so the "
+                    "Triton small-M decode kernel can attach, but B12X is "
+                    "unsupported (%s). Falling back to auto selection "
+                    "(typically Marlin on SM120).",
+                    exc,
+                )
+            else:
+                logger.info_once(
+                    "DSV41_EXP_TRITON_MOE=1: using B12X NvFp4 MoE for the "
+                    "target model so Triton NVFP4 decode can run at small M. "
+                    "M above DSV41_EXP_TRITON_MOE_MAX_M uses b12x, not Marlin. "
+                    "Unset the flag to restore auto/Marlin. Draft DSpark "
+                    "experts stay native MXFP4 and are not covered."
+                )
+                return backend, experts_cls
+
     if runner_backend != "auto":
         requested_backend = map_nvfp4_backend(runner_backend)
         if _use_a16(requested_backend, False):

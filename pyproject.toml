@@ -55,6 +55,8 @@ where = ["."]
 include = ["vllm*"]
 
 [tool.ruff.lint.per-file-ignores]
+# Compact NVFP4 Triton kernels; line length and `I` (intermediate) are intentional.
+"vllm/model_executor/layers/fused_moe/triton_nvfp4_decode.py" = ["E501", "E741"]
 # `vllm` is the only installed package; everything else is standalone scripts
 "!vllm/**" = ["INP"]
 "vllm/third_party/**" = ["ALL"]

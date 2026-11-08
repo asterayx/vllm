@@ -229,9 +229,22 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._unit_scales: dict[torch.device, torch.Tensor] = {}
         self._plans: dict[tuple[int, int, MoEActivation, bool], Any] = {}
         self._apply_router_weight_on_input = False
-        # opt5 experiment: Triton NVFP4 decode MoE for M <= MAX_M. Default off -> b12x only.
-        self._tri_enabled = os.environ.get("QWEN4_EXP_TRITON_MOE", "0") == "1"
-        self._tri_max_m = int(os.environ.get("QWEN4_EXP_TRITON_MOE_MAX_M", "96"))
+        # Small-M Triton NVFP4 decode overlay. Default off -> b12x / Marlin only.
+        if (
+            os.environ.get("DSV41_EXP_TRITON_MOE", "0") == "1"
+            or os.environ.get("QWEN4_EXP_TRITON_MOE", "0") == "1"
+        ):
+            from vllm.model_executor.layers.fused_moe.triton_nvfp4_decode import (
+                triton_nvfp4_decode_overlay_opt_in,
+            )
+
+            enabled, max_m, flag_name, profile = triton_nvfp4_decode_overlay_opt_in()
+        else:
+            enabled, max_m, flag_name, profile = False, 0, "", "default"
+        self._tri_enabled = enabled
+        self._tri_max_m = max_m
+        self._tri_flag = flag_name
+        self._tri_profile = profile
         self._tri: Any | None = None
         self._tri_capture_fallbacks = 0
 
@@ -407,10 +420,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     _tri_logged = False
 
     def _tri_setup(self, layer: torch.nn.Module, prepared: Any) -> None:
-        """opt5: build the Triton NVFP4 decode runner when QWEN4_EXP_TRITON_MOE=1."""
+        """Build the Triton NVFP4 decode runner when an opt-in flag is set."""
         self._tri = None
         if not self._tri_enabled or self._tri_max_m <= 0:
             return
+        flag = self._tri_flag or "TRITON_NVFP4_DECODE"
         reason = None
         if self._quant_mode != "nvfp4" or self._source_format != "modelopt_nvfp4":
             reason = f"quant_mode={self._quant_mode} source={self._source_format}"
@@ -429,24 +443,34 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 )
 
                 self._tri = TritonNvfp4DecodeMoE(
-                    prepared, int(self.moe_config.experts_per_token), self._tri_max_m
+                    prepared,
+                    int(self.moe_config.experts_per_token),
+                    self._tri_max_m,
+                    profile=self._tri_profile,
                 )
             except Exception as exc:  # disable, keep b12x
                 reason = f"{type(exc).__name__}: {exc}"
         if reason is not None:
-            logger.warning("QWEN4_EXP_TRITON_MOE: disabled for this layer (%s)", reason)
+            logger.warning("%s: disabled for this layer (%s)", flag, reason)
         elif not B12xExperts._tri_logged:
             B12xExperts._tri_logged = True
             logger.info(
-                "QWEN4_EXP_TRITON_MOE=1: Triton NVFP4 decode MoE for M<=%d "
-                "(E=%d H=%d I=%d topk=%d), b12x above",
-                self._tri_max_m, self._tri.E, self._tri.H, self._tri.I, self._tri.topk,
+                "%s=1: Triton NVFP4 decode MoE for M<=%d "
+                "(E=%d H=%d I=%d topk=%d cfg=%s), b12x above",
+                flag,
+                self._tri_max_m,
+                self._tri.E,
+                self._tri.H,
+                self._tri.I,
+                self._tri.topk,
+                self._tri.c,
             )
 
-    def _tri_usable(self, M: int, topk: int, activation: MoEActivation,
-                    hidden_states: torch.Tensor) -> bool:
+    def _tri_usable(
+        self, M: int, topk: int, activation: MoEActivation, hidden_states: torch.Tensor
+    ) -> bool:
         tri = self._tri
-        if tri is None or M > self._tri_max_m or M <= 0:
+        if tri is None or self._tri_max_m < M or M <= 0:
             return False
         if topk != tri.topk or activation != MoEActivation.SILU:
             return False
@@ -457,8 +481,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         if not tri.has_scratch(M) and _is_current_stream_capturing():
             self._tri_capture_fallbacks += 1
             if self._tri_capture_fallbacks == 1:
-                logger.warning("QWEN4_EXP_TRITON_MOE: M=%d not warmed before capture; "
-                               "b12x used for it", M)
+                logger.warning(
+                    "%s: M=%d not warmed before capture; b12x used for it",
+                    self._tri_flag or "TRITON_NVFP4_DECODE",
+                    M,
+                )
             return False
         return True
 
@@ -511,8 +538,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             ):
                 return (
                     False,
-                    "MXFP4 W4A8 requires hidden size divisible by 256 and "
-                    "per-rank intermediate size divisible by 32",
+                    (
+                        "MXFP4 W4A8 requires hidden size divisible by 256 and "
+                        "per-rank intermediate size divisible by 32"
+                    ),
                 )
         return mk.FusedMoEExperts.is_supported_config(
             cls, moe_config, weight_key, activation_key, activation_format
@@ -759,11 +788,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 unit_scale_contract=self._quant_mode == "w4a16",
             )
         if self._tri is not None:
+            flag = self._tri_flag or "TRITON_NVFP4_DECODE"
             if not self._tri.flipped():
-                logger.warning("QWEN4_EXP_TRITON_MOE: w13 not flipped after b12x warmup")
+                logger.warning("%s: w13 not flipped after b12x warmup", flag)
             else:
                 warmed = self._tri.warmup(token_counts, dtype)
-                logger.info("QWEN4_EXP_TRITON_MOE: warmed Triton MoE for M=%s", warmed)
+                logger.info("%s: warmed Triton MoE for M=%s", flag, warmed)
         return len(launch_tokens)
 
     def workspace_shapes(
@@ -820,7 +850,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         topk_ids = _normalize_topk_ids(topk_ids)
         topk_weights = _normalize_topk_weights(topk_weights)
         if self._tri is not None and self._tri_usable(
-            int(hidden_states.shape[0]), int(topk_ids.shape[1]), activation, hidden_states
+            int(hidden_states.shape[0]),
+            int(topk_ids.shape[1]),
+            activation,
+            hidden_states,
         ):
             self._tri(hidden_states, topk_weights, topk_ids, output)
             return

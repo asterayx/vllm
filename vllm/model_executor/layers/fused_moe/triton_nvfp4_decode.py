@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Experimental Triton NVFP4 (W4A4) decode MoE for small token counts (opt5).
+"""Experimental Triton NVFP4 (W4A4) decode MoE for small token counts.
 
-Used by B12xExperts only when QWEN4_EXP_TRITON_MOE=1 and M <= QWEN4_EXP_TRITON_MOE_MAX_M
-(default 96). Default off -> b12x path unchanged.
+Hosted by B12xExperts when an opt-in flag is set and M <= MAX_M:
+  * QWEN4_EXP_TRITON_MOE=1 — Qwen path, default MAX_M=96
+  * DSV41_EXP_TRITON_MOE=1 — DeepSeek-V4.x NVFP4 target MoE; auto backend
+    switches from Marlin to B12X so this kernel can attach. Unset restores
+    auto/Marlin. Draft DSpark experts stay native MXFP4 and are not covered.
 
 Reads b12x's *prepared* expert tensors in place (no copies):
   w1_fp4 [E, 2I, H/2] u8 in kernel order [up; gate] (after b12x's one-time w31 flip),
-  w2_fp4 [E, H, I/2] u8, 128x4-swizzled e4m3 block scales, per-expert fp32 alphas / a-gscales.
+    w2_fp4 [E, H, I/2] u8, 128x4-swizzled e4m3 block scales, per-expert fp32 alphas / a-gscales.
 Pipeline: xq (x -> FP4 + e4m3 sf, shared a1_gscale) -> fc1 (tl.dot_scaled NVFP4 MMA, SiLU*up,
 bf16, re-quant with a2_gscale[e]) -> fc2 (dot_scaled, *alpha2, [bf16], *router_w, fp32 atomic
 scatter) -> fin (fp32 -> bf16, re-zero accumulator).
@@ -25,8 +28,208 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
-_DEFAULT_CFG = dict(BM=16, BN1=32, BK1=512, W1=4, S1=2, BN2=128, BK2=64, W2=4, S2=2,
-                    FB=1024, XB=256)
+DSV41_TRITON_MOE_ENV = "DSV41_EXP_TRITON_MOE"
+QWEN_TRITON_MOE_ENV = "QWEN4_EXP_TRITON_MOE"
+_DSV41_MODEL_TYPES = frozenset(
+    {
+        "deepseek_v4",
+        "deepseek_v4_text",
+        "deepseek_v41",
+        "deepseek_v41_text",
+    }
+)
+
+# RTX PRO 5000 Blackwell (sm_120). DSv4.1-Flash TP4 expert shapes.
+SM120_NUM_SMS = 110
+DSV41_FLASH_HIDDEN = 5120
+DSV41_FLASH_INTERMEDIATE = 2304
+DSV41_FLASH_INTERMEDIATE_TP4 = DSV41_FLASH_INTERMEDIATE // 4  # 576
+DSV41_FLASH_TOPK = 6
+DSV41_FLASH_EXPERTS = 384
+DSV41_DECODE_MS = (4, 8, 16, 24)
+
+_DEFAULT_CFG = dict(
+    BM=16,
+    BN1=32,
+    BK1=512,
+    W1=4,
+    S1=2,
+    BN2=128,
+    BK2=64,
+    W2=4,
+    S2=2,
+    FB=1024,
+    XB=256,
+)
+_BN1_CANDIDATES = (32, 64, 16)
+_BN2_CANDIDATES = (128, 256, 64)
+_BK1_CANDIDATES = (512, 256)
+_BK2_CANDIDATES = (64, 32)
+
+
+def current_hf_model_type() -> str | None:
+    try:
+        from vllm.config import get_current_vllm_config
+
+        hf_config = get_current_vllm_config().model_config.hf_config
+    except Exception:
+        return None
+    return getattr(hf_config, "model_type", None)
+
+
+def dsv41_triton_nvfp4_decode_requested() -> bool:
+    """True when DSV41_EXP_TRITON_MOE=1 applies to this process.
+
+    Honors the env when model_type is unset (unit tests / early init). Other
+    model types ignore the flag so it cannot change Qwen's backend selection.
+    """
+    if os.environ.get(DSV41_TRITON_MOE_ENV, "0") != "1":
+        return False
+    model_type = current_hf_model_type()
+    return model_type is None or model_type in _DSV41_MODEL_TYPES
+
+
+def triton_nvfp4_decode_overlay_opt_in() -> tuple[bool, int, str, str]:
+    """B12xExperts overlay: (enabled, max_m, flag_name, tile_profile)."""
+    dsv41 = os.environ.get(DSV41_TRITON_MOE_ENV, "0") == "1"
+    qwen = os.environ.get(QWEN_TRITON_MOE_ENV, "0") == "1"
+    if dsv41:
+        raw = os.environ.get("DSV41_EXP_TRITON_MOE_MAX_M")
+        if raw is None:
+            raw = os.environ.get("QWEN4_EXP_TRITON_MOE_MAX_M", "96")
+        return True, int(raw), DSV41_TRITON_MOE_ENV, "dsv41_sm120"
+    if qwen:
+        raw = os.environ.get("QWEN4_EXP_TRITON_MOE_MAX_M", "96")
+        return True, int(raw), QWEN_TRITON_MOE_ENV, "default"
+    return False, 0, "", "default"
+
+
+def cfg_divides_shapes(
+    cfg: dict[str, int], hidden_size: int, intermediate_size: int
+) -> bool:
+    return (
+        intermediate_size % cfg["BN1"] == 0
+        and hidden_size % cfg["BN2"] == 0
+        and hidden_size % cfg["BK1"] == 0
+        and hidden_size % cfg["XB"] == 0
+        and intermediate_size % cfg["BK2"] == 0
+    )
+
+
+def estimate_fc1_ctas(
+    num_tokens: int,
+    topk: int,
+    intermediate_size: int,
+    bn1: int,
+    num_experts: int | None = None,
+) -> int:
+    """Upper-bound FC1 grid size: one BM-padded block per routed pair."""
+    pairs = max(int(num_tokens) * int(topk), 1)
+    if num_experts is not None:
+        pairs = min(pairs, int(num_experts))
+    n_tiles = max(int(intermediate_size) // max(int(bn1), 1), 1)
+    return pairs * n_tiles
+
+
+def parse_tile_override(raw: str | None, base: dict[str, int]) -> dict[str, int]:
+    if not raw:
+        return dict(base)
+    out = dict(base)
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        key, _, value = part.partition("=")
+        key = key.strip().upper()
+        if key not in out:
+            raise ValueError(f"unknown Triton NVFP4 decode tile key {key}")
+        out[key] = int(value.strip())
+    return out
+
+
+def _first_divisor(size: int, candidates: tuple[int, ...]) -> int | None:
+    for cand in candidates:
+        if size % cand == 0:
+            return cand
+    return None
+
+
+def choose_triton_nvfp4_decode_cfg(
+    hidden_size: int,
+    intermediate_size: int,
+    *,
+    profile: str = "default",
+    num_sms: int | None = None,
+    topk: int = DSV41_FLASH_TOPK,
+    num_experts: int = DSV41_FLASH_EXPERTS,
+) -> dict[str, int]:
+    """Pick tiles that divide (H, I). ``dsv41_sm120`` targets 110 SMs.
+
+    BN1 stays on the proven 32-wide NVFP4 MMA tile when it divides I. If M=4
+    FC1 CTAs would under-fill ``num_sms``, BN1 shrinks to 16. Override with
+    DSV41_EXP_TRITON_MOE_TILE=BM=16,BN1=32,...
+    """
+    cfg = dict(_DEFAULT_CFG)
+    if profile == "dsv41_sm120":
+        sms = SM120_NUM_SMS if num_sms is None else int(num_sms)
+        bn1 = _first_divisor(intermediate_size, _BN1_CANDIDATES)
+        if bn1 is not None:
+            m4 = estimate_fc1_ctas(
+                4, topk, intermediate_size, bn1, num_experts
+            )
+            if m4 < sms and intermediate_size % 16 == 0:
+                bn1 = 16
+            cfg["BN1"] = bn1
+        bn2 = _first_divisor(hidden_size, _BN2_CANDIDATES)
+        if bn2 is not None:
+            cfg["BN2"] = bn2
+        bk1 = _first_divisor(hidden_size, _BK1_CANDIDATES)
+        if bk1 is not None:
+            cfg["BK1"] = bk1
+        bk2 = _first_divisor(intermediate_size, _BK2_CANDIDATES)
+        if bk2 is not None:
+            cfg["BK2"] = bk2
+    env_key = (
+        "DSV41_EXP_TRITON_MOE_TILE"
+        if profile == "dsv41_sm120"
+        else "QWEN4_EXP_TRITON_MOE_TILE"
+    )
+    cfg = parse_tile_override(os.environ.get(env_key), cfg)
+    if not cfg_divides_shapes(cfg, hidden_size, intermediate_size):
+        raise ValueError(
+            f"tile does not divide shapes H={hidden_size} I={intermediate_size} "
+            f"cfg={cfg}"
+        )
+    return cfg
+
+
+def decode_occupancy_rows(
+    cfg: dict[str, int],
+    hidden_size: int,
+    intermediate_size: int,
+    *,
+    topk: int = DSV41_FLASH_TOPK,
+    num_sms: int = SM120_NUM_SMS,
+    num_experts: int = DSV41_FLASH_EXPERTS,
+    token_counts: tuple[int, ...] = DSV41_DECODE_MS,
+) -> list[dict[str, float]]:
+    rows = []
+    fc2_n = max(hidden_size // cfg["BN2"], 1)
+    for m in token_counts:
+        fc1 = estimate_fc1_ctas(
+            m, topk, intermediate_size, cfg["BN1"], num_experts
+        )
+        fc2 = min(m * topk, num_experts) * fc2_n
+        rows.append(
+            {
+                "M": m,
+                "fc1_ctas": fc1,
+                "fc2_ctas": fc2,
+                "fc1_waves": fc1 / num_sms,
+                "fc2_waves": fc2 / num_sms,
+            }
+        )
+    return rows
 
 
 @triton.jit
@@ -222,24 +425,57 @@ def _w13_flipped(prepared: Any) -> bool:
     return key in _impl._W13_NORMALIZED_STORAGES
 
 
+def _cuda_sm_count() -> int | None:
+    if not torch.cuda.is_available():
+        return None
+    try:
+        return int(torch.cuda.get_device_properties(0).multi_processor_count)
+    except Exception:
+        return None
+
+
 class TritonNvfp4DecodeMoE:
     """Per-layer runner over b12x prepared experts."""
 
-    def __init__(self, prepared: Any, topk: int, max_m: int):
-        c = dict(_DEFAULT_CFG)
-        self.c = c
+    def __init__(
+        self,
+        prepared: Any,
+        topk: int,
+        max_m: int,
+        cfg: dict[str, int] | None = None,
+        profile: str = "default",
+    ):
         E = int(prepared.num_experts)
         H = int(prepared.hidden_size)
         I = int(prepared.intermediate_size)
         self.E, self.H, self.I, self.topk, self.max_m = E, H, I, int(topk), int(max_m)
-        if I % c["BN1"] or H % c["BN2"] or H % c["BK1"] or H % c["XB"]:
-            raise ValueError(f"tile does not divide shapes E={E} H={H} I={I}")
+        self.profile = profile
+        if cfg is None:
+            cfg = choose_triton_nvfp4_decode_cfg(
+                H,
+                I,
+                profile=profile,
+                num_sms=_cuda_sm_count(),
+                topk=int(topk),
+                num_experts=E,
+            )
+        self.c = dict(cfg)
+        if not cfg_divides_shapes(self.c, H, I):
+            raise ValueError(
+                f"tile does not divide shapes E={E} H={H} I={I} cfg={self.c}"
+            )
         self.prepared = prepared
         self.w1 = prepared.w1_fp4.view(torch.uint8)
         self.w2 = prepared.w2_fp4.view(torch.uint8)
-        if tuple(self.w1.shape) != (E, 2 * I, H // 2) or tuple(self.w2.shape) != (E, H, I // 2):
-            raise ValueError(f"unexpected packed weight shapes {tuple(self.w1.shape)} "
-                             f"{tuple(self.w2.shape)}")
+        if tuple(self.w1.shape) != (E, 2 * I, H // 2) or tuple(self.w2.shape) != (
+            E,
+            H,
+            I // 2,
+        ):
+            raise ValueError(
+                f"unexpected packed weight shapes {tuple(self.w1.shape)} "
+                f"{tuple(self.w2.shape)}"
+            )
         self.s1 = prepared.w1_blockscale.view(torch.float8_e4m3fn).reshape(E, -1)
         self.s2 = prepared.w2_blockscale.view(torch.float8_e4m3fn).reshape(E, -1)
 
@@ -250,14 +486,20 @@ class TritonNvfp4DecodeMoE:
         self.a1, self.a2 = f(prepared.w1_alphas), f(prepared.w2_alphas)
         self.g1, self.g2 = f(prepared.a1_gscale), f(prepared.a2_gscale)
         if not bool((self.g1 == self.g1[0]).all()):
-            raise ValueError("a1_gscale is not shared across experts (xq pre-pass needs it)")
+            raise ValueError(
+                "a1_gscale is not shared across experts (xq pre-pass needs it)"
+            )
         self.C41 = (H // 16 + 3) // 4
         self.C42 = (I // 16 + 3) // 4
         if self.s1.shape[1] != ((2 * I + 127) // 128 * 128) * self.C41 * 4 or \
                 self.s2.shape[1] != ((H + 127) // 128 * 128) * self.C42 * 4:
-            raise ValueError(f"unexpected swizzled scale sizes {tuple(self.s1.shape)} "
-                             f"{tuple(self.s2.shape)}")
-        env = os.environ.get("QWEN4_EXP_TRITON_MOE_DOWNBF16")
+            raise ValueError(
+                f"unexpected swizzled scale sizes {tuple(self.s1.shape)} "
+                f"{tuple(self.s2.shape)}"
+            )
+        env = os.environ.get("DSV41_EXP_TRITON_MOE_DOWNBF16")
+        if env is None:
+            env = os.environ.get("QWEN4_EXP_TRITON_MOE_DOWNBF16")
         self.downbf16_override = None if env is None else int(env)
         self.dev = self.w1.device
         self._flipped = False
