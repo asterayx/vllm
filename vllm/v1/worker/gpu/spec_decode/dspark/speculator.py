@@ -32,6 +32,11 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.sample.vocab_parallel import (
+    reduce_max_idx,
+    vocab_parallel_sample_enabled,
+    vocab_shard_gumbel_sample,
+)
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
@@ -158,6 +163,15 @@ class DSparkSpeculator(DFlashSpeculator):
             )
         return sampled
 
+    def _vocab_shard_supported(self) -> bool:
+        return (
+            not self.use_confidence_head
+            and getattr(self, "acceptance_estimator", None) is None
+            and self.draft_watermarker is None
+            and hasattr(self.model, "vocab_local_argmax_supported")
+            and self.model.vocab_local_argmax_supported()
+        )
+
     def _use_vocab_local_argmax(self) -> bool:
         cached = getattr(self, "_vocab_local_argmax_ok", None)
         if cached is not None:
@@ -165,18 +179,32 @@ class DSparkSpeculator(DFlashSpeculator):
         ok = (
             _DPSK_VOCAB_LOCAL_ARGMAX
             and self.draft_logits is None
-            and not self.use_confidence_head
-            and getattr(self, "acceptance_estimator", None) is None
-            and self.draft_watermarker is None
-            and hasattr(self.model, "vocab_local_argmax_supported")
-            and self.model.vocab_local_argmax_supported()
+            and self._vocab_shard_supported()
         )
         self._vocab_local_argmax_ok = bool(ok)
         logger.info("DSpark vocab-local greedy argmax drafting: %s", ok)
         return self._vocab_local_argmax_ok
 
+    def _use_vocab_parallel_sample(self) -> bool:
+        cached = getattr(self, "_vocab_parallel_sample_ok", None)
+        if cached is not None:
+            return cached
+        ok = vocab_parallel_sample_enabled() and self._vocab_shard_supported()
+        self._vocab_parallel_sample_ok = bool(ok)
+        logger.info(
+            "DSpark vocab-parallel sample drafting: %s (gumbel=%s)",
+            ok,
+            ok and self.draft_logits is not None,
+        )
+        return self._vocab_parallel_sample_ok
+
     def _sample_sequential_local_argmax(
         self, num_reqs: int, head_hidden: torch.Tensor
+    ) -> None:
+        self._sample_sequential_vocab_shard(num_reqs, head_hidden, use_gumbel=False)
+
+    def _sample_sequential_vocab_shard(
+        self, num_reqs: int, head_hidden: torch.Tensor, *, use_gumbel: bool
     ) -> None:
         from vllm.distributed import (
             get_tensor_model_parallel_world_size,
@@ -186,38 +214,70 @@ class DSparkSpeculator(DFlashSpeculator):
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
-        # [num_sample, shard] local logits; no all-gather.
+        # [num_sample, padded_shard] local logits; no full-vocab all-gather.
         base_local = self.model.compute_draft_logits_local(sample_hidden)
         lm_head = self.model.lm_head
         si = lm_head.shard_indices
-        num_pad = si.num_org_vocab_padding
         n_org = si.org_vocab_end_index - si.org_vocab_start_index
         vocab_start = si.org_vocab_start_index
-        base_local = base_local[:, :n_org].reshape(num_reqs, n_spec, n_org)
+        padded_width = base_local.shape[-1]
+        if si.num_org_vocab_padding > 0:
+            base_local = base_local.clone()
+            base_local[:, n_org:] = float("-inf")
+        base_local = base_local.reshape(num_reqs, n_spec, padded_width)
         tp = get_tensor_model_parallel_world_size()
-        del num_pad
+        idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+        sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
 
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        local_steps = None
+        if use_gumbel and self.draft_logits is not None:
+            local_steps = base_local.new_full(
+                (num_reqs, n_spec, padded_width), float("-inf")
+            )
         for i in range(n_spec):
             markov_embed = self.model.markov_embed(prev)
             bias = self.model.markov_bias_local(markov_embed)
-            logits_i = base_local[:, i] + bias
-            vals, idx = logits_i.max(dim=-1)
-            gidx = idx + vocab_start
-            if tp > 1:
-                pair = torch.stack([vals.float(), gidx.float()], dim=-1)
-                gathered = tensor_model_parallel_all_gather(pair, dim=-1)
-                gathered = gathered.view(num_reqs, tp, 2)
-                best = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
-                tok = gathered[:, :, 1].gather(-1, best).squeeze(-1).to(torch.int64)
+            logits_i = base_local[:, i, :n_org] + bias
+            if use_gumbel:
+                tok = vocab_shard_gumbel_sample(
+                    logits_i,
+                    idx_map[:, i],
+                    self.temperature,
+                    self.seeds,
+                    sample_pos[:, i] - 1,
+                    vocab_start,
+                    apply_temperature=True,
+                    is_drafting=True,
+                    use_fp64=self.use_fp64_gumbel,
+                    tp_size=tp,
+                )
+                if local_steps is not None:
+                    local_steps[:, i, :n_org] = logits_i
             else:
-                tok = gidx.to(torch.int64)
+                vals, idx = logits_i.max(dim=-1)
+                tok = reduce_max_idx(vals, idx + vocab_start, tp_size=tp)
             self.draft_tokens[:num_reqs, i] = tok
             prev = tok
+        if local_steps is not None:
+            # Equal-sized padded shards so the all-gather is legal; slice to
+            # org vocab after concatenate, matching LogitsProcessor.
+            gathered = tensor_model_parallel_all_gather(local_steps, dim=-1)
+            org_vocab = self.draft_logits.shape[-1]
+            self.draft_logits[:num_reqs, :n_spec, :org_vocab].copy_(
+                gathered[..., :org_vocab]
+            )
 
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)
+            return
+        if self._use_vocab_parallel_sample():
+            self._sample_sequential_vocab_shard(
+                num_reqs,
+                head_hidden,
+                use_gumbel=self.draft_logits is not None,
+            )
             return
         if self._use_vocab_local_argmax():
             self._sample_sequential_local_argmax(num_reqs, head_hidden)

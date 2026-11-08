@@ -21,6 +21,17 @@ from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+from vllm.v1.worker.gpu.sample.vocab_parallel import (
+    apply_row_temperature,
+    gather_token_logits,
+    mask_rejected_token,
+    one_hot_ratio_verify,
+    proposal_tokens_from_draft_sampled,
+    shard_logsumexp,
+    vocab_parallel_sample_enabled,
+    vocab_shard_argmax,
+    vocab_shard_gumbel_sample,
+)
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
@@ -412,6 +423,138 @@ class RejectionSampler:
         if states.max_num_logprobs(idx_np) != NO_LOGPROBS:
             return False
         return bool(np.all(states.temperature.np[idx_np] == 0.0))
+
+    def _needs_full_vocab_sampling(self, idx_np: np.ndarray) -> bool:
+        """True when top-p/k, min_p, penalties, or other processors need V."""
+        states = self.sampler.sampling_states
+        if np.any(states.top_p.np[idx_np] != 1.0):
+            return True
+        if np.any(states.top_k.np[idx_np] != states.vocab_size):
+            return True
+        if np.any(states.min_p.np[idx_np] != 0.0):
+            return True
+        if np.any(self.sampler.penalties_state.use_penalty[idx_np]):
+            return True
+        tb = self.sampler.thinking_budget_state
+        if getattr(tb, "enabled", False) and np.any(tb.use_thinking_budget[idx_np]):
+            return True
+        for proc in self.sampler.logits_processors:
+            use_bias = getattr(proc, "use_logit_bias", None)
+            if use_bias is not None and np.any(use_bias[idx_np]):
+                return True
+            num_bad = getattr(proc, "num_bad_words", None)
+            if num_bad is not None and np.any(num_bad.np[idx_np] > 0):
+                return True
+        return False
+
+    def can_vocab_parallel_verify(
+        self, input_batch: InputBatch, draft_logits: torch.Tensor | None
+    ) -> bool:
+        """One-hot-draft verify without a full-vocab target logits all-gather.
+
+        Covers greedy and temperature>0 (no top-p/k, logprobs, grammar, block
+        verification, or probabilistic draft logits). Structured-output /
+        grammar still uses the stock path so bitmask application stays on
+        gathered logits (PR #12 persists drafts independently of this).
+        """
+        if not vocab_parallel_sample_enabled():
+            return False
+        if (
+            draft_logits is not None
+            or self.watermark_key is not None
+            or self.synthetic_conditional_rates is not None
+            or self.use_block_verification
+            or self.enable_adaptive_verification
+            or self.sampler.compute_nans
+            or getattr(self.sampler, "trace_replay_state", None) is not None
+        ):
+            return False
+        idx_np = input_batch.idx_mapping_np
+        if self._needs_full_vocab_sampling(idx_np):
+            return False
+        states = self.sampler.sampling_states
+        return states.max_num_logprobs(idx_np) == NO_LOGPROBS
+
+    def vocab_parallel_from_local_logits(
+        self,
+        local_logits: torch.Tensor,
+        input_batch: InputBatch,
+        vocab_start: int,
+        n_org: int,
+        tp_size: int,
+    ) -> SamplerOutput:
+        """Verify greedy or sampled one-hot drafts from a vocab shard."""
+        if n_org < local_logits.shape[-1]:
+            local_logits = local_logits[..., :n_org].contiguous()
+        draft_sampled, pos = gather_draft_sampled(
+            input_batch.input_ids,
+            input_batch.positions,
+            input_batch.logits_indices,
+            input_batch.expanded_idx_mapping,
+            input_batch.expanded_local_pos,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        states = self.sampler.sampling_states
+        temperature = states.temperature.gpu
+        seed = states.seeds.gpu
+        expanded = input_batch.expanded_idx_mapping
+        top_tokens = vocab_shard_argmax(local_logits, vocab_start, tp_size=tp_size)
+        scaled = apply_row_temperature(local_logits, expanded, temperature)
+        target_lse = shard_logsumexp(scaled, tp_size=tp_size)
+        proposal_tokens = proposal_tokens_from_draft_sampled(
+            draft_sampled, input_batch.cu_num_logits
+        )
+        proposal_logit = gather_token_logits(
+            scaled, proposal_tokens, vocab_start, n_org, tp_size=tp_size
+        )
+        sampled, num_sampled, resample_row, resample_draft = one_hot_ratio_verify(
+            top_tokens,
+            proposal_logit,
+            target_lse,
+            draft_sampled,
+            pos,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            temperature,
+            seed,
+            self.num_speculative_steps,
+        )
+        need_resample = resample_row >= 0
+        if torch.any(need_resample):
+            sel = need_resample.nonzero(as_tuple=True)[0]
+            rows = resample_row[sel]
+            residual = mask_rejected_token(
+                scaled[rows], resample_draft[sel], vocab_start, n_org
+            )
+            resampled = vocab_shard_gumbel_sample(
+                residual,
+                expanded[rows],
+                temperature,
+                seed,
+                pos[rows],
+                vocab_start,
+                apply_temperature=False,
+                is_drafting=False,
+                use_fp64=self.sampler.use_fp64_gumbel,
+                tp_size=tp_size,
+            )
+            sampled[sel, num_sampled[sel]] = resampled
+            num_sampled = num_sampled.clone()
+            num_sampled[sel] += 1
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
 
     def greedy_from_top_tokens(
         self, top_tokens: torch.Tensor, input_batch: InputBatch

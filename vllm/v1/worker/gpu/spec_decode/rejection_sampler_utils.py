@@ -723,6 +723,8 @@ def _seeded_resample_argmax(
         IS_DRAFTING=False,
         APPLY_TEMPERATURE=False,
         USE_FP64=USE_FP64,
+        PER_TOKEN_COL=False,
+        KEY_OFFSET=0,
     )
 
 
