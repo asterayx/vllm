@@ -15,14 +15,21 @@ from vllm.models.deepseek_v41.ced_prefill import (
     CedRefusal,
     apply_ced_compaction,
     build_ced_prefill,
+    ced_attach_message,
+    ced_compact_message,
     ced_prefill_enabled,
     ced_runtime_block_reason,
+    compact_layer_count,
     decide_ced_rank,
+    dependency_halo_rows,
     full_resolution_boundary,
     plan_prefill_keep,
     reset_ced_prefill_logs,
     restore_token_rows,
 )
+
+# Flash: W=128, 19 compact layers (21..39) -> 128 + 18*127.
+FLASH_HALO_ROWS = 128 + 18 * 127
 
 pytestmark = pytest.mark.cpu_test
 
@@ -113,14 +120,32 @@ def test_flag_on_attaches_at_flash_boundary(monkeypatch):
     )
     assert built is not None
     assert built.boundary_layer == 20
-    assert built.tail_rows == 128
+    assert built.compact_layers == 19
+    assert built.formula_rows == FLASH_HALO_ROWS
+    assert built.tail_rows == FLASH_HALO_ROWS
+    assert built.rows_overridden is False
     assert built.reindex_after_boundary is True
+    attach = ced_attach_message(built)
+    assert "dependency-preserving tail" in attach
+    assert "last 128 rows" not in attach
+    assert str(FLASH_HALO_ROWS) in attach
 
 
 def test_tail_rows_knob_defaults_and_overrides(monkeypatch):
     monkeypatch.setenv(CED_PREFILL_ENV, "1")
     hf = _flash_hf()
+    monkeypatch.delenv(CED_PREFILL_ROWS_ENV, raising=False)
+    default = build_ced_prefill(
+        _vllm_config(hf),
+        start_layer=0,
+        end_layer=40,
+        use_sequence_parallel=False,
+        use_mega_moe=False,
+    )
+    assert default is not None and default.tail_rows == FLASH_HALO_ROWS
+
     monkeypatch.setenv(CED_PREFILL_ROWS_ENV, "64")
+    reset_ced_prefill_logs()
     built = build_ced_prefill(
         _vllm_config(hf),
         start_layer=0,
@@ -129,6 +154,9 @@ def test_tail_rows_knob_defaults_and_overrides(monkeypatch):
         use_mega_moe=False,
     )
     assert built is not None and built.tail_rows == 64
+    assert built.rows_overridden is True
+    assert built.formula_rows == FLASH_HALO_ROWS
+    assert "overrides the dependency-preserving halo" in ced_attach_message(built)
 
     monkeypatch.setenv(CED_PREFILL_ROWS_ENV, "nope")
     reset_ced_prefill_logs()
@@ -445,6 +473,142 @@ def test_missing_indexer_metadata_refuses():
     assert isinstance(result, CedRefusal)
     assert "indexer" in result.reason
     assert swa.num_prefill_tokens == before
+
+
+def test_dependency_halo_width_and_pp2_default(monkeypatch):
+    assert dependency_halo_rows(128, 19) == FLASH_HALO_ROWS
+    assert compact_layer_count(40, 20) == 19
+    # One compact layer only needs the sliding window itself.
+    assert dependency_halo_rows(128, 1) == 128
+    monkeypatch.setenv(CED_PREFILL_ENV, "1")
+    monkeypatch.delenv(CED_PREFILL_ROWS_ENV, raising=False)
+    hf = _flash_hf()
+    decoder = build_ced_prefill(
+        _vllm_config(hf),
+        start_layer=20,
+        end_layer=40,
+        use_sequence_parallel=False,
+        use_mega_moe=False,
+    )
+    encoder = build_ced_prefill(
+        _vllm_config(hf),
+        start_layer=0,
+        end_layer=20,
+        use_sequence_parallel=False,
+        use_mega_moe=False,
+    )
+    assert decoder is not None and decoder.tail_rows == FLASH_HALO_ROWS
+    assert encoder is None
+
+
+def test_halo_keeps_cone_decode_rows_and_short_chunks():
+    decode = 4
+    prefill = 3000
+    plan = plan_prefill_keep(
+        [0, decode, decode + prefill],
+        num_decodes=1,
+        num_decode_tokens=decode,
+        tail_rows=FLASH_HALO_ROWS,
+    )
+    assert not isinstance(plan, str)
+    assert plan.keep_indices[:decode] == tuple(range(decode))
+    tail = plan.keep_indices[decode:]
+    assert len(tail) == FLASH_HALO_ROWS
+    assert tail[0] == decode + prefill - FLASH_HALO_ROWS
+    assert tail[-1] == decode + prefill - 1
+    assert plan.dropped_prefill_rows == prefill - FLASH_HALO_ROWS
+
+    short = plan_prefill_keep(
+        [0, 100], num_decodes=0, num_decode_tokens=0, tail_rows=FLASH_HALO_ROWS
+    )
+    assert not isinstance(short, str)
+    assert short.dropped_prefill_rows == 0
+    assert short.keep_indices == tuple(range(100))
+
+
+def test_mixed_batch_halo_keeps_each_tail_and_last_token():
+    # 2 decode tokens, prefill A of 5 (keep last 4), prefill B of 3 (keep all).
+    full = 10
+    tail = 4
+    qsl = torch.tensor([0, 2, 7, 10], dtype=torch.int32)
+    swa = SimpleNamespace(
+        num_decodes=1,
+        num_prefills=2,
+        num_decode_tokens=2,
+        num_prefill_tokens=8,
+        query_start_loc_cpu=qsl.clone(),
+        query_start_loc=qsl.clone(),
+        slot_mapping=torch.arange(full, dtype=torch.int64),
+        is_valid_token=torch.ones(full, dtype=torch.bool),
+        token_to_req_indices=torch.tensor([0, 0, 1, 1, 1, 1, 1, 2, 2, 2]),
+        prefill_swa_indices=torch.arange(8).view(8, 1),
+        prefill_swa_lens=torch.arange(8),
+        prefill_left_visible=None,
+        prefill_right_visible=None,
+        prefill_query_lens_cpu=torch.tensor([5, 3], dtype=torch.int32),
+        prefill_seq_lens_cpu=torch.tensor([5, 3], dtype=torch.int32),
+        prefill_gather_lens=torch.tensor([5, 3], dtype=torch.int32),
+        prefill_window_size=128,
+        flashinfer_sparse_index_cache={},
+    )
+    ks = torch.arange(8, dtype=torch.int32)
+    indexer = _Indexer(
+        num_decodes=1,
+        num_decode_tokens=2,
+        num_prefills=2,
+        num_prefill_tokens=8,
+        slot_mapping=torch.arange(full, dtype=torch.int64),
+        prefill=_Prefill(
+            chunks=[
+                _Chunk(
+                    cu_seqlen_ks=ks.clone(),
+                    cu_seqlen_ke=ks.clone() + 3,
+                    token_to_seq=torch.tensor([0, 0, 0, 0, 0, 1, 1, 1]),
+                    token_start=2,
+                    token_end=10,
+                )
+            ]
+        ),
+        seq_lens=torch.tensor([2, 5, 3], dtype=torch.int32),
+    )
+    hidden = torch.arange(full, dtype=torch.float32).view(full, 1)
+    config = CedPrefillConfig(
+        boundary_layer=20,
+        tail_rows=tail,
+        reindex_after_boundary=True,
+        window=4,
+        compact_layers=1,
+        formula_rows=tail,
+        rows_overridden=False,
+    )
+    result = apply_ced_compaction(
+        config,
+        {
+            "model.layers.21.attn.swa_cache": swa,
+            "model.layers.20.attn.indexer.k_cache": indexer,
+        },
+        hidden_states=hidden,
+        residual=None,
+        post_mix=None,
+        res_mix=None,
+        pre_mix=hidden.clone(),
+        positions=torch.arange(full),
+        input_ids=torch.arange(full),
+        topk_indices_buffer=torch.arange(full, dtype=torch.int32).view(full, 1),
+        candidate_block_buffer=None,
+    )
+    assert not isinstance(result, CedRefusal)
+    assert result is not None
+    assert result.keep.keep_index.tolist() == [0, 1, 3, 4, 5, 6, 7, 8, 9]
+    # Decode rows stay the original prefix. A's first row (index 2) is the
+    # only drop; B is shorter than the tail and is kept whole.
+    restored = restore_token_rows(result.hidden_states, result.keep)
+    assert restored.shape[0] == full
+    for last in (1, 6, 9):
+        assert float(restored[last]) == float(last)
+    assert float(restored[2]) == 0.0
+    message = ced_compact_message(config, full_prefill_tokens=8, kept_prefill_tokens=7)
+    assert "dependency-preserving tail" in message
 
 
 def test_runtime_block_reasons():

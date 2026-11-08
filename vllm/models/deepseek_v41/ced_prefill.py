@@ -5,9 +5,19 @@
 CED, as used by the V4.1 design: the boundary layer (the last ratio-1 KV
 source that also writes index keys) still runs on every row of the current
 prefill chunk, so the full-resolution global KV and index keys land in the
-cache. Later decoder layers then run only on the last ``tail_rows`` (default
-128, the sliding window) of each prefill request. Those layers' long-context
-attention keeps reading that global cache; only the queries shrink.
+cache. Later decoder layers then run on a dependency-preserving tail of each
+prefill request. Long-context attention still reads the global cache; only
+the queries shrink.
+
+The tail is wider than the sliding window. Causal SWA of width ``W`` at each
+of the ``D`` compact layers needs ``W - 1`` extra positions of the previous
+layer, and decode reads the last ``W`` keys at the final layer, so the first
+compact layer must see
+
+    W + (D - 1) * (W - 1)
+
+rows ending at the chunk. That is 2414 on Flash (``W=128``, 19 layers after
+layer 20). ``DSV41_EXP_CED_PREFILL_ROWS``, when set, replaces that width.
 
 Unset ``DSV41_EXP_CED_PREFILL`` leaves the full-chunk prefill untouched.
 
@@ -38,7 +48,8 @@ logger = init_logger(__name__)
 
 CED_PREFILL_ENV = "DSV41_EXP_CED_PREFILL"
 CED_PREFILL_ROWS_ENV = "DSV41_EXP_CED_PREFILL_ROWS"
-DEFAULT_CED_TAIL_ROWS = 128
+# Used only when the checkpoint does not set ``sliding_window``.
+DEFAULT_CED_WINDOW = 128
 
 _LAYER_ID = re.compile(r"\.layers\.(\d+)\.")
 _logged: set[str] = set()
@@ -61,18 +72,52 @@ def ced_prefill_enabled() -> bool:
     return os.environ.get(CED_PREFILL_ENV, "0") == "1"
 
 
-def ced_tail_rows_from_env() -> tuple[int, str | None]:
-    """Return ``(rows, error)``. Default is 128 when the knob is unset."""
+def ced_rows_override() -> tuple[int | None, str | None]:
+    """Explicit tail width, or ``(None, None)`` when the knob is unset.
+
+    Unset means the dependency-preserving halo, not the bare sliding window.
+    """
     raw = os.environ.get(CED_PREFILL_ROWS_ENV)
     if raw is None or raw == "":
-        return DEFAULT_CED_TAIL_ROWS, None
+        return None, None
     try:
         rows = int(raw)
     except ValueError:
-        return 0, f"{CED_PREFILL_ROWS_ENV}={raw!r} is not an integer"
+        return None, f"{CED_PREFILL_ROWS_ENV}={raw!r} is not an integer"
     if rows <= 0:
-        return 0, f"{CED_PREFILL_ROWS_ENV}={rows} must be positive"
+        return None, f"{CED_PREFILL_ROWS_ENV}={rows} must be positive"
     return rows, None
+
+
+def sliding_window_of(hf_config: Any) -> int:
+    window = getattr(hf_config, "sliding_window", None)
+    if isinstance(window, int) and window > 0:
+        return window
+    return DEFAULT_CED_WINDOW
+
+
+def compact_layer_count(num_hidden_layers: int, boundary: int) -> int:
+    """Decoder layers that run after the boundary and therefore see the tail."""
+    return max(0, num_hidden_layers - boundary - 1)
+
+
+def dependency_halo_rows(window: int, compact_layers: int) -> int:
+    """Trailing rows whose final-layer states match a full prefill.
+
+    Args:
+        window: Causal SWA width (``sliding_window``).
+        compact_layers: How many decoder layers consume the tail.
+
+    Returns:
+        ``window + (compact_layers - 1) * (window - 1)`` when both are
+        positive, else 0. The last ``window`` outputs of the final compact
+        layer then have a complete local cone, which is what the sampled
+        token and the next decode step's SWA read.
+
+    """
+    if window <= 0 or compact_layers <= 0:
+        return 0
+    return window + (compact_layers - 1) * (window - 1)
 
 
 def full_resolution_boundary(hf_config: Any) -> int | None:
@@ -111,6 +156,58 @@ class CedPrefillConfig:
     boundary_layer: int
     tail_rows: int
     reindex_after_boundary: bool
+    window: int = DEFAULT_CED_WINDOW
+    compact_layers: int = 0
+    formula_rows: int = 0
+    rows_overridden: bool = False
+
+
+def ced_attach_message(config: CedPrefillConfig) -> str:
+    """One-time attach line. Names the halo unless a row override is set."""
+    if config.rows_overridden:
+        return (
+            "DSV41 CED prefill attached: after layer "
+            f"{config.boundary_layer} writes full-resolution global KV and "
+            f"index keys, later decoder layers compute the last "
+            f"{config.tail_rows} prefill rows ({CED_PREFILL_ROWS_ENV} "
+            f"overrides the dependency-preserving halo of "
+            f"{config.formula_rows}). Unset {CED_PREFILL_ENV} keeps full "
+            "prefill."
+        )
+    lookback_layers = max(0, config.compact_layers - 1)
+    return (
+        "DSV41 CED prefill attached: after layer "
+        f"{config.boundary_layer} writes full-resolution global KV and index "
+        "keys, later decoder layers compute a dependency-preserving tail of "
+        f"{config.tail_rows} rows per prefill chunk (sliding window "
+        f"{config.window} plus {lookback_layers} layers of "
+        f"{config.window - 1}-token left context). Unset {CED_PREFILL_ENV} "
+        "keeps full prefill."
+    )
+
+
+def ced_compact_message(
+    config: CedPrefillConfig, full_prefill_tokens: int, kept_prefill_tokens: int
+) -> str:
+    """First-compaction line. The boundary write count stays in the message."""
+    wrote = (
+        "boundary wrote full-resolution global KV and index keys for all "
+        f"{full_prefill_tokens} prefill rows; decoder layers see "
+        f"{kept_prefill_tokens}"
+    )
+    if config.rows_overridden:
+        return (
+            "DSV41 CED prefill compacted to the last "
+            f"{config.tail_rows} prefill rows after layer {config.boundary_layer} "
+            f"({CED_PREFILL_ROWS_ENV} overrides the dependency-preserving halo "
+            f"of {config.formula_rows}; {wrote})."
+        )
+    return (
+        "DSV41 CED prefill compacted to a dependency-preserving tail of "
+        f"{config.tail_rows} rows after layer {config.boundary_layer} "
+        f"(sliding window {config.window}, {config.compact_layers} decoder "
+        f"layers after the boundary; {wrote})."
+    )
 
 
 def decide_ced_rank(
@@ -188,11 +285,26 @@ def build_ced_prefill(
         return None
     hf_config = vllm_config.model_config.hf_config
     parallel = vllm_config.parallel_config
-    tail_rows, tail_error = ced_tail_rows_from_env()
-    boundary = full_resolution_boundary(hf_config)
+    override, tail_error = ced_rows_override()
     if tail_error is not None:
         _log_once("warning", f"DSV41 CED prefill refused: {tail_error}")
         return None
+    boundary = full_resolution_boundary(hf_config)
+    window = sliding_window_of(hf_config)
+    compact_layers = (
+        compact_layer_count(int(hf_config.num_hidden_layers), boundary)
+        if boundary is not None
+        else 0
+    )
+    formula_rows = dependency_halo_rows(window, compact_layers)
+    if override is None:
+        # A zero formula means there is no compact stack. Pass a positive
+        # placeholder so decide_ced_rank can report the real reason.
+        tail_rows = formula_rows if formula_rows > 0 else 1
+        rows_overridden = False
+    else:
+        tail_rows = override
+        rows_overridden = True
     engram_ids = getattr(hf_config, "engram_layer_ids", None) or ()
     decision, reason = decide_ced_rank(
         boundary=boundary,
@@ -223,19 +335,17 @@ def build_ced_prefill(
         _log_once("warning", f"DSV41 CED prefill refused: {reason}")
         return None
     assert boundary is not None
-    logger.info(
-        "DSV41 CED prefill attached: after layer %d writes full-resolution "
-        "global KV and index keys, later decoder layers compute the last %d "
-        "rows of each prefill chunk. Unset %s keeps full prefill.",
-        boundary,
-        tail_rows,
-        CED_PREFILL_ENV,
-    )
-    return CedPrefillConfig(
+    config = CedPrefillConfig(
         boundary_layer=boundary,
         tail_rows=tail_rows,
         reindex_after_boundary=_reindex_after(hf_config, boundary),
+        window=window,
+        compact_layers=compact_layers,
+        formula_rows=formula_rows,
+        rows_overridden=rows_overridden,
     )
+    logger.info("%s", ced_attach_message(config))
+    return config
 
 
 @dataclass(frozen=True)
@@ -266,8 +376,10 @@ def plan_prefill_keep(
     """Plan the compact batch. A plan with ``dropped_prefill_rows == 0`` is a no-op.
 
     Decode requests (DSpark / speculative verify included) stay whole. Each
-    prefill request keeps its last ``tail_rows`` query rows. The tail still
-    ends at the original context length, so long-context reads stay valid.
+    prefill request keeps its last ``tail_rows`` query rows. Callers pass the
+    dependency-preserving halo as that width unless an env override is set.
+    The tail still ends at the original context length, so long-context
+    reads stay valid.
     """
     if tail_rows <= 0:
         return "tail rows must be positive"
@@ -691,11 +803,9 @@ def apply_ced_compaction(
         candidate_block_buffer[: staged_candidates.shape[0]].copy_(staged_candidates)
     _log_once(
         "info",
-        "DSV41 CED prefill compacted to the last "
-        f"{config.tail_rows} prefill rows after layer {config.boundary_layer} "
-        "(boundary wrote full-resolution global KV and index keys for all "
-        f"{planned.full_prefill_tokens} prefill rows; decoder layers see "
-        f"{planned.num_prefill_tokens}).",
+        ced_compact_message(
+            config, planned.full_prefill_tokens, planned.num_prefill_tokens
+        ),
     )
     return CedCompaction(
         keep=CedKeep(
