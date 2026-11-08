@@ -1991,6 +1991,7 @@ class Scheduler(SchedulerInterface):
             self.requests,
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
+            num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
@@ -2561,8 +2562,9 @@ class Scheduler(SchedulerInterface):
 
         Validates against the current FSM (after this step's accept_tokens).
         If a request has no stored drafts, leave the placeholders in place.
-        grammar_bitmask() logs an error rather than copying row 0 onto later
-        rows (those rows are already in different FSM states).
+        If stored drafts validate to a shorter prefix, pad with -1 and record
+        ``num_invalid_spec_tokens`` so grammar_bitmask can tell that padding
+        apart from a persist miss. Neither case copies row 0 onto later rows.
         """
         sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         num_invalid_spec_tokens = scheduler_output.num_invalid_spec_tokens
@@ -2993,6 +2995,9 @@ class Scheduler(SchedulerInterface):
             spec_decoding_stats=spec_stats,
             num_missing_draft_bitmask_fills=(
                 self.structured_output_manager.num_missing_draft_bitmask_fills
+            ),
+            num_all_invalid_draft_bitmask_fills=(
+                self.structured_output_manager.num_all_invalid_draft_bitmask_fills
             ),
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,

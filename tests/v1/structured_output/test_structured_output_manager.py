@@ -158,10 +158,14 @@ def _run_real_flow(
     assert validated == expected_validated
 
     padded = validated + [-1] * (len(raw_drafts) - len(validated))
+    num_invalid = len(raw_drafts) - len(validated)
     bitmask = manager.grammar_bitmask(
         requests={request.request_id: request},
         structured_output_request_ids=[request.request_id],
         scheduled_spec_decode_tokens={request.request_id: padded},
+        num_invalid_spec_tokens=(
+            {request.request_id: num_invalid} if num_invalid else None
+        ),
     )
     assert bitmask is not None
     assert bitmask.shape[0] == len(raw_drafts) + 1
@@ -504,6 +508,7 @@ def test_placeholder_drafts_log_and_do_not_copy_row0(
     )
     assert bitmask is not None
     assert manager.num_missing_draft_bitmask_fills == 1
+    assert manager.num_all_invalid_draft_bitmask_fills == 0
     assert "no real draft token ids" in caplog_vllm.text
     # Row 0 is constrained; later rows stay unconstrained rather than
     # replicating the row-0 mask.
@@ -511,6 +516,36 @@ def test_placeholder_drafts_log_and_do_not_copy_row0(
     assert not (bitmask[1] == bitmask[0]).all()
     assert not (bitmask[2] == bitmask[0]).all()
     assert not (bitmask[3] == bitmask[0]).all()
+
+
+@pytest.mark.parametrize("backend", REGEX_BACKENDS)
+def test_all_invalid_padded_drafts_are_not_missing(
+    tokenizer, backend: str, caplog_vllm
+):
+    """Validated-empty drafts padded to -1 are not a persist miss."""
+    manager, request = _build_harness(
+        tokenizer,
+        backend,
+        use_reasoner=False,
+        structured_outputs=StructuredOutputsParams(regex=DIGITS_REGEX),
+    )
+    from vllm.logger import _print_error_once
+
+    _print_error_once.cache_clear()
+    placeholders = [-1, -1, -1]
+    bitmask = manager.grammar_bitmask(
+        requests={request.request_id: request},
+        structured_output_request_ids=[request.request_id],
+        scheduled_spec_decode_tokens={request.request_id: placeholders},
+        num_invalid_spec_tokens={request.request_id: len(placeholders)},
+    )
+    assert bitmask is not None
+    assert manager.num_missing_draft_bitmask_fills == 0
+    assert manager.num_all_invalid_draft_bitmask_fills == 1
+    assert "no real draft token ids" not in caplog_vllm.text
+    # Same fill as a persist miss: row 0 constrained, later rows unconstrained.
+    assert _row_pattern(bitmask) == "CUUU"
+    assert not (bitmask[1] == bitmask[0]).all()
 
 
 def test_outlines_termination(tokenizer):

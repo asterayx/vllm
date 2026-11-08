@@ -206,6 +206,7 @@ class SchedulerStats:
 
     spec_decoding_stats: SpecDecodingStats | None = None
     num_missing_draft_bitmask_fills: int = 0
+    num_all_invalid_draft_bitmask_fills: int = 0
     kv_connector_stats: dict[str, Any] | None = None
     ec_connector_stats: dict[str, Any] | None = None
 

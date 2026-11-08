@@ -57,9 +57,11 @@ class StructuredOutputManager:
 
         self._grammar_bitmask: torch.Tensor | None = None
         self._full_mask = torch.tensor(-1, dtype=torch.int32)
-        # Incremented when grammar_bitmask sees all-negative placeholders
-        # instead of persisted real drafts. That path must not copy row 0.
+        # Placeholders were never replaced by persisted drafts.
         self.num_missing_draft_bitmask_fills = 0
+        # Persisted drafts existed but validate_tokens padded the whole
+        # row to -1. Distinct from a persist miss; must not copy row 0.
+        self.num_all_invalid_draft_bitmask_fills = 0
 
         max_batch_size = self.vllm_config.scheduler_config.max_num_seqs
         self.fill_bitmask_parallel_threshold = 128
@@ -319,6 +321,7 @@ class StructuredOutputManager:
         requests: dict[str, "Request"],
         structured_output_request_ids: list[str],
         scheduled_spec_decode_tokens: dict[str, list[int]],
+        num_invalid_spec_tokens: dict[str, int] | None = None,
     ) -> "npt.NDArray[np.int32] | None":
         # Prepare the structured output bitmask for this batch.
         if not structured_output_request_ids:
@@ -388,17 +391,25 @@ class StructuredOutputManager:
 
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, list())
                 if req_tokens and all(token < 0 for token in req_tokens):
-                    # Persisted per-request drafts should have replaced these
-                    # placeholders. Copying row 0 onto later rows is unsafe:
-                    # later FSM states can reject a row-0-legal token or
-                    # resample an illegal one.
-                    self.num_missing_draft_bitmask_fills += 1
-                    logger.error_once(
-                        "Structured-output grammar bitmask has no real draft "
-                        "token ids; later rows will not be advanced from "
-                        "persisted drafts. See "
-                        "vllm:num_missing_draft_bitmask_fills."
+                    # All-negative is either unreplaced V2+PP placeholders or
+                    # stored drafts whose validated prefix was empty and
+                    # padded to -1. Copying row 0 onto later rows is unsafe
+                    # in both cases. Only the persist miss is an error.
+                    n_invalid = (
+                        num_invalid_spec_tokens.get(req_id, 0)
+                        if num_invalid_spec_tokens
+                        else 0
                     )
+                    if n_invalid >= len(req_tokens):
+                        self.num_all_invalid_draft_bitmask_fills += 1
+                    else:
+                        self.num_missing_draft_bitmask_fills += 1
+                        logger.error_once(
+                            "Structured-output grammar bitmask has no real "
+                            "draft token ids; later rows will not be advanced "
+                            "from persisted drafts. See "
+                            "vllm:num_missing_draft_bitmask_fills."
+                        )
 
                 constraint_start = self._get_constraint_start(
                     request, strip_speculative_padding(req_tokens)

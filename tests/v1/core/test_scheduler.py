@@ -7027,6 +7027,19 @@ class _RecordingGrammar:
         return False
 
 
+class _RejectAllGrammar:
+    """Every draft is grammar-illegal; validate_tokens returns []."""
+
+    def validate_tokens(self, tokens: list[int]) -> list[int]:
+        return []
+
+    def accept_tokens(self, req_id: str, tokens: list[int]) -> bool:
+        return True
+
+    def is_terminated(self) -> bool:
+        return False
+
+
 class _StaleSensitiveGrammar:
     """Truncates every draft until accept_tokens has advanced the FSM."""
 
@@ -7144,7 +7157,7 @@ def test_update_from_output_stores_output_carried_drafts():
 
     captured: dict[str, list[int]] = {}
 
-    def fake_bitmask(requests, structured_ids, spec_tokens):
+    def fake_bitmask(requests, structured_ids, spec_tokens, **kwargs):
         captured.update(spec_tokens)
         return None
 
@@ -7199,7 +7212,7 @@ def test_persisted_drafts_validated_after_grammar_advance():
 
     captured: dict[str, list[int]] = {}
 
-    def fake_bitmask(requests, structured_ids, spec_tokens):
+    def fake_bitmask(requests, structured_ids, spec_tokens, **kwargs):
         captured.update(spec_tokens)
         return None
 
@@ -7279,9 +7292,75 @@ def test_prefill_chunk_clears_persisted_drafts():
 def test_missing_draft_bitmask_fills_exported_on_scheduler_stats():
     scheduler = create_scheduler(num_speculative_tokens=3)
     scheduler.structured_output_manager.num_missing_draft_bitmask_fills = 4
+    scheduler.structured_output_manager.num_all_invalid_draft_bitmask_fills = 7
     stats = scheduler.make_stats()
     assert stats is not None
     assert stats.num_missing_draft_bitmask_fills == 4
+    assert stats.num_all_invalid_draft_bitmask_fills == 7
+
+
+def test_all_invalid_persisted_drafts_are_not_a_persist_miss():
+    """Stored drafts that validate to [] pad to -1 and set num_invalid."""
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    request = _decode_ready_request(scheduler)
+    request.structured_output_request = SimpleNamespace(
+        grammar=_RejectAllGrammar(), reasoning_ended=True
+    )
+    req_id = request.request_id
+    scheduler._draft_token_ids_by_req[req_id] = [10, 11, 12]
+    captured: dict[str, dict] = {}
+
+    def fake_bitmask(
+        requests, structured_ids, spec_tokens, num_invalid_spec_tokens=None
+    ):
+        captured["spec"] = dict(spec_tokens)
+        captured["invalid"] = dict(num_invalid_spec_tokens or {})
+        return None
+
+    scheduler.structured_output_manager.grammar_bitmask = fake_bitmask
+    grammar_output = scheduler.get_grammar_bitmask(
+        SimpleNamespace(
+            has_structured_output_requests=True,
+            num_scheduled_tokens={req_id: 4},
+            scheduled_spec_decode_tokens={req_id: [-1, -1, -1]},
+            num_invalid_spec_tokens=None,
+        )
+    )
+    assert grammar_output is not None
+    assert captured["spec"][req_id] == [-1, -1, -1]
+    assert captured["invalid"][req_id] == 3
+    assert req_id in scheduler._draft_token_ids_by_req
+
+
+def test_missing_persisted_drafts_do_not_set_num_invalid():
+    """Unreplaced placeholders must not look like validated-empty padding."""
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    request = _decode_ready_request(scheduler)
+    request.structured_output_request = SimpleNamespace(
+        grammar=_RejectAllGrammar(), reasoning_ended=True
+    )
+    req_id = request.request_id
+    captured: dict[str, dict] = {}
+
+    def fake_bitmask(
+        requests, structured_ids, spec_tokens, num_invalid_spec_tokens=None
+    ):
+        captured["spec"] = dict(spec_tokens)
+        captured["invalid"] = dict(num_invalid_spec_tokens or {})
+        return None
+
+    scheduler.structured_output_manager.grammar_bitmask = fake_bitmask
+    grammar_output = scheduler.get_grammar_bitmask(
+        SimpleNamespace(
+            has_structured_output_requests=True,
+            num_scheduled_tokens={req_id: 4},
+            scheduled_spec_decode_tokens={req_id: [-1, -1, -1]},
+            num_invalid_spec_tokens=None,
+        )
+    )
+    assert grammar_output is not None
+    assert captured["spec"][req_id] == [-1, -1, -1]
+    assert req_id not in captured["invalid"]
 
 
 def test_grammar_bitmask_uses_persisted_drafts_when_take_omits_request():
@@ -7311,7 +7390,7 @@ def test_grammar_bitmask_uses_persisted_drafts_when_take_omits_request():
 
     captured: dict[str, list[int]] = {}
 
-    def fake_bitmask(requests, structured_ids, spec_tokens):
+    def fake_bitmask(requests, structured_ids, spec_tokens, **kwargs):
         captured.update(spec_tokens)
         return None
 
