@@ -2,14 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in small-M NVFP4 W4A16 decode MoE on top of Marlin.
 
-``DSV41_EXP_FUSED_W4A16_MOE=1`` snapshots checkpoint-layout NVFP4 weights
-before Marlin shuffle and, for M <= MAX_M, runs the in-tree Triton NVFP4
-weight-only GEMM (``fused_moe_nvfp4_emulation_kernel``) **without**
-activation QDQ. That is W4A16: bf16 activations, NVFP4 weights dequantized
-as ``e2m1 * block_scale * global_scale``, then Marlin's SwiGLU clamp.
+``DSV41_EXP_FUSED_W4A16_MOE=1`` keeps a view of checkpoint-layout NVFP4
+weights *after* Marlin conversion has allocated its shuffled tensors, then
+for M <= MAX_M runs the in-tree Triton NVFP4 weight-only GEMM
+(``fused_moe_nvfp4_emulation_kernel``) **without** activation QDQ. That is
+W4A16: bf16 activations, NVFP4 weights dequantized as
+``e2m1 * block_scale * global_scale``, then Marlin's SwiGLU clamp.
 
-Unset / default stays bit-for-bit Marlin. Large-M stays Marlin. This is not
-the W4A4 ``triton_nvfp4_decode`` overlay (``DSV41_EXP_TRITON_MOE`` / b12x).
+The pack shares checkpoint storage (no clone). Cloning the full expert pack
+*before* Marlin permute/scale conversion is a startup OOM on 72GB / 0.91:
+peak = clone + conversion temporaries. Marlin does not write back into the
+checkpoint tensors, so a view is enough for the small-M path.
+
+Unset / default stays bit-for-bit Marlin (no extra view, no extra peak).
+Large-M stays Marlin. This is not the W4A4 ``triton_nvfp4_decode`` overlay
+(``DSV41_EXP_TRITON_MOE`` / b12x).
 
 The overlay refuses to enable when ``swiglu_limit`` is unset so the
 checkpoint clamp is never skipped.
@@ -98,6 +105,19 @@ def _expert_scale(scale: torch.Tensor, num_experts: int) -> torch.Tensor:
     return t.contiguous()
 
 
+def _hold_checkpoint_tensor(t: torch.Tensor) -> torch.Tensor:
+    """Keep checkpoint-layout storage without cloning the full pack.
+
+    Marlin conversion allocates new shuffled tensors and does not mutate
+    these. A clone here was the 72GB startup OOM (clone + permute/scale
+    temps). ``contiguous()`` is a no-op (view) when the tensor already is.
+    """
+    held = t.detach()
+    if not held.is_contiguous():
+        held = held.contiguous()
+    return held
+
+
 @dataclass
 class Nvfp4W4A16DecodePack:
     """Checkpoint-layout NVFP4 tensors (linear block scales, not Marlin)."""
@@ -121,6 +141,21 @@ class Nvfp4W4A16DecodePack:
     def intermediate_size(self) -> int:
         return int(self.w2.shape[2]) * 2
 
+    def shares_weight_storage(
+        self,
+        w13: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2: torch.Tensor,
+        w2_scale: torch.Tensor,
+    ) -> bool:
+        """True when the pack is a view of the checkpoint weight/scale tensors."""
+        return (
+            self.w13.data_ptr() == w13.data_ptr()
+            and self.w13_scale.data_ptr() == w13_scale.data_ptr()
+            and self.w2.data_ptr() == w2.data_ptr()
+            and self.w2_scale.data_ptr() == w2_scale.data_ptr()
+        )
+
 
 def maybe_snapshot_nvfp4_w4a16_decode_weights(
     layer: torch.nn.Module,
@@ -132,10 +167,11 @@ def maybe_snapshot_nvfp4_w4a16_decode_weights(
     w2_scale: torch.Tensor,
     w2_scale_2: torch.Tensor,
 ) -> Nvfp4W4A16DecodePack | None:
-    """Clone checkpoint-layout NVFP4 tensors before Marlin shuffle.
+    """Hold checkpoint-layout NVFP4 tensors without cloning the pack.
 
-    Returns None when the env flag is unset so the default path allocates
-    nothing extra.
+    Must run *after* Marlin conversion so permute/scale temporaries do not
+    coexist with an extra full-size copy. Returns None when the env flag is
+    unset so the default path allocates nothing extra.
     """
     if not fused_w4a16_decode_enabled():
         if hasattr(layer, LAYER_PACK_ATTR):
@@ -143,11 +179,11 @@ def maybe_snapshot_nvfp4_w4a16_decode_weights(
         return None
 
     pack = Nvfp4W4A16DecodePack(
-        w13=w13.detach().contiguous().clone(),
-        w13_scale=w13_scale.detach().contiguous().clone(),
+        w13=_hold_checkpoint_tensor(w13),
+        w13_scale=_hold_checkpoint_tensor(w13_scale),
         w13_scale_2=_expert_scale(w13_scale_2, int(w13.shape[0])),
-        w2=w2.detach().contiguous().clone(),
-        w2_scale=w2_scale.detach().contiguous().clone(),
+        w2=_hold_checkpoint_tensor(w2),
+        w2_scale=_hold_checkpoint_tensor(w2_scale),
         w2_scale_2=_expert_scale(w2_scale_2, int(w2.shape[0])),
     )
     setattr(layer, LAYER_PACK_ATTR, pack)

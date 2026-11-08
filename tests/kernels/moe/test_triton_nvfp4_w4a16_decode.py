@@ -103,27 +103,8 @@ def test_refuses_non_silu_and_router_weight(monkeypatch: pytest.MonkeyPatch):
     )
 
 
-def test_snapshot_only_when_flag_on(monkeypatch: pytest.MonkeyPatch):
-    pack = _make_pack()
-    layer = SimpleNamespace()
-    monkeypatch.delenv(ENV_FLAG, raising=False)
-    assert (
-        maybe_snapshot_nvfp4_w4a16_decode_weights(
-            layer,
-            w13=pack.w13,
-            w13_scale=pack.w13_scale,
-            w13_scale_2=pack.w13_scale_2,
-            w2=pack.w2,
-            w2_scale=pack.w2_scale,
-            w2_scale_2=pack.w2_scale_2,
-        )
-        is None
-    )
-    assert not hasattr(layer, LAYER_PACK_ATTR)
-
-    monkeypatch.setenv(ENV_FLAG, "1")
-    snapped = maybe_snapshot_nvfp4_w4a16_decode_weights(
-        layer,
+def _snapshot_kwargs(pack: Nvfp4W4A16DecodePack):
+    return dict(
         w13=pack.w13,
         w13_scale=pack.w13_scale,
         w13_scale_2=pack.w13_scale_2,
@@ -131,18 +112,66 @@ def test_snapshot_only_when_flag_on(monkeypatch: pytest.MonkeyPatch):
         w2_scale=pack.w2_scale,
         w2_scale_2=pack.w2_scale_2,
     )
+
+
+def _track_full_pack_clones(
+    monkeypatch: pytest.MonkeyPatch, pack: Nvfp4W4A16DecodePack
+) -> list[tuple[int, ...]]:
+    """Record `.clone()` of the full w13/w2/scale tensors (the OOM peak)."""
+    watched = {
+        pack.w13.data_ptr(),
+        pack.w13_scale.data_ptr(),
+        pack.w2.data_ptr(),
+        pack.w2_scale.data_ptr(),
+    }
+    cloned_shapes: list[tuple[int, ...]] = []
+    orig_clone = torch.Tensor.clone
+
+    def tracking_clone(self, *args, **kwargs):
+        if self.data_ptr() in watched:
+            cloned_shapes.append(tuple(self.shape))
+        return orig_clone(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "clone", tracking_clone)
+    return cloned_shapes
+
+
+def test_snapshot_only_when_flag_on(monkeypatch: pytest.MonkeyPatch):
+    pack = _make_pack()
+    layer = SimpleNamespace()
+    monkeypatch.delenv(ENV_FLAG, raising=False)
+    cloned = _track_full_pack_clones(monkeypatch, pack)
+    assert (
+        maybe_snapshot_nvfp4_w4a16_decode_weights(layer, **_snapshot_kwargs(pack))
+        is None
+    )
+    assert not hasattr(layer, LAYER_PACK_ATTR)
+    assert cloned == []
+
+    monkeypatch.setenv(ENV_FLAG, "1")
+    snapped = maybe_snapshot_nvfp4_w4a16_decode_weights(
+        layer,
+        **_snapshot_kwargs(pack),
+    )
     assert snapped is not None
     assert getattr(layer, LAYER_PACK_ATTR) is snapped
-    assert snapped.w13.data_ptr() != pack.w13.data_ptr()
+    assert snapped.shares_weight_storage(
+        pack.w13, pack.w13_scale, pack.w2, pack.w2_scale
+    )
+    assert cloned == []
 
 
-def test_marlin_convert_snapshots_before_shuffle(
+def test_marlin_convert_snapshots_after_shuffle_without_clone(
     monkeypatch: pytest.MonkeyPatch,
 ):
     pack = _make_pack()
     layer = SimpleNamespace()
+    pack_during_prepare: object | None = "unset"
+    cloned = _track_full_pack_clones(monkeypatch, pack)
 
     def fake_prepare(**kwargs):
+        nonlocal pack_during_prepare
+        pack_during_prepare = getattr(layer, LAYER_PACK_ATTR, None)
         shuffled = kwargs["w13"] + 1
         return (
             shuffled,
@@ -172,9 +201,14 @@ def test_marlin_convert_snapshots_before_shuffle(
         a2_scale=None,
         is_act_and_mul=True,
     )
+    assert pack_during_prepare is None
     snapped = getattr(layer, LAYER_PACK_ATTR)
     assert torch.equal(snapped.w13, pack.w13)
     assert not torch.equal(w13, pack.w13)
+    assert snapped.shares_weight_storage(
+        pack.w13, pack.w13_scale, pack.w2, pack.w2_scale
+    )
+    assert cloned == []
 
     monkeypatch.delenv(ENV_FLAG, raising=False)
     layer2 = SimpleNamespace()
@@ -192,6 +226,7 @@ def test_marlin_convert_snapshots_before_shuffle(
         is_act_and_mul=True,
     )
     assert not hasattr(layer2, LAYER_PACK_ATTR)
+    assert cloned == []
 
 
 def test_w4a16_auto_stays_marlin_with_flag(
@@ -219,7 +254,9 @@ def test_w4a16_auto_stays_marlin_with_flag(
     assert experts_cls is MarlinExperts
 
 
-def test_try_attach_logs_and_requires_clamp(monkeypatch: pytest.MonkeyPatch):
+def test_try_attach_logs_and_requires_clamp(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
     import vllm.model_executor.layers.fused_moe.triton_nvfp4_w4a16_decode as mod
 
     monkeypatch.setenv(ENV_FLAG, "1")
@@ -237,14 +274,29 @@ def test_try_attach_logs_and_requires_clamp(monkeypatch: pytest.MonkeyPatch):
             is_lora_enabled=False,
         ),
     )
-    runner = try_attach_w4a16_decode(experts, layer)
+    with caplog.at_level("INFO", logger=mod.logger.name):
+        runner = try_attach_w4a16_decode(experts, layer)
     assert isinstance(runner, Nvfp4W4A16DecodeMoE)
     assert runner.max_m == 64
     assert runner.clamp_limit == 10.0
+    assert any(
+        "DSV41_EXP_FUSED_W4A16_MOE=1: fused NVFP4 W4A16 decode MoE for M<=64"
+        in rec.getMessage()
+        and "swiglu_limit=10.0" in rec.getMessage()
+        and "Marlin above" in rec.getMessage()
+        for rec in caplog.records
+    )
 
     monkeypatch.setattr(mod, "_ATTACH_LOGGED", False)
     experts.activation_config.clamp_limit = None
-    assert try_attach_w4a16_decode(experts, layer) is None
+    caplog.clear()
+    with caplog.at_level("WARNING", logger=mod.logger.name):
+        assert try_attach_w4a16_decode(experts, layer) is None
+    assert any(
+        rec.getMessage()
+        == "DSV41_EXP_FUSED_W4A16_MOE: disabled for this layer (swiglu_limit is unset)"
+        for rec in caplog.records
+    )
 
 
 def test_can_run_small_m_only(monkeypatch: pytest.MonkeyPatch):
@@ -288,7 +340,7 @@ def test_w4a16_dequant_multiplies_block_and_global_scale():
     assert out[0, 1].item() == pytest.approx(0.0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="CUDA required")
 def test_w4a16_decode_kernel_gpu_smoke():
     from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe import (
         invoke_fused_moe_nvfp4_emulation_kernel,
@@ -324,5 +376,5 @@ def test_w4a16_decode_kernel_gpu_smoke():
         cfg,
         compute_type=tl.bfloat16,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.isfinite(out.float()).all()
