@@ -432,10 +432,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             reason = "apply_router_weight_on_input"
         elif layer.activation != MoEActivation.SILU:
             reason = f"activation={layer.activation}"
-        elif self._swiglu_params(layer.activation)[0] is not None:
-            reason = "swiglu clamp limit set"
         elif self.moe_config.in_dtype != torch.bfloat16:
             reason = f"in_dtype={self.moe_config.in_dtype}"
+        limit, alpha, beta = self._swiglu_params(layer.activation)
+        if reason is None and (alpha is not None or beta is not None):
+            # SILU clamp is implemented; SWIGLUOAI alpha/beta is not.
+            reason = "swiglu alpha/beta set"
         if reason is None:
             try:
                 from vllm.model_executor.layers.fused_moe.triton_nvfp4_decode import (
@@ -447,6 +449,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                     int(self.moe_config.experts_per_token),
                     self._tri_max_m,
                     profile=self._tri_profile,
+                    swiglu_limit=limit,
                 )
             except Exception as exc:  # disable, keep b12x
                 reason = f"{type(exc).__name__}: {exc}"
@@ -456,13 +459,14 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             B12xExperts._tri_logged = True
             logger.info(
                 "%s=1: Triton NVFP4 decode MoE for M<=%d "
-                "(E=%d H=%d I=%d topk=%d cfg=%s), b12x above",
+                "(E=%d H=%d I=%d topk=%d swiglu_limit=%s cfg=%s), b12x above",
                 flag,
                 self._tri_max_m,
                 self._tri.E,
                 self._tri.H,
                 self._tri.I,
                 self._tri.topk,
+                self._tri.swiglu_limit,
                 self._tri.c,
             )
 

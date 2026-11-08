@@ -11,11 +11,12 @@ Hosted by B12xExperts when an opt-in flag is set and M <= MAX_M:
 Reads b12x's *prepared* expert tensors in place (no copies):
   w1_fp4 [E, 2I, H/2] u8 in kernel order [up; gate] (after b12x's one-time w31 flip),
     w2_fp4 [E, H, I/2] u8, 128x4-swizzled e4m3 block scales, per-expert fp32 alphas / a-gscales.
-Pipeline: xq (x -> FP4 + e4m3 sf, shared a1_gscale) -> fc1 (tl.dot_scaled NVFP4 MMA, SiLU*up,
-bf16, re-quant with a2_gscale[e]) -> fc2 (dot_scaled, *alpha2, [bf16], *router_w, fp32 atomic
-scatter) -> fin (fp32 -> bf16, re-zero accumulator).
+Pipeline: xq (x -> FP4 + e4m3 sf, shared a1_gscale) -> fc1 (tl.dot_scaled NVFP4 MMA, SiLU*up
+with optional SwiGLU clamp, bf16, re-quant with a2_gscale[e]) -> fc2 (dot_scaled, *alpha2,
+[bf16], *router_w, fp32 atomic scatter) -> fin (fp32 -> bf16, re-zero accumulator).
 Quantization numerics mirror b12x: QMODE 1 = micro kernel (M <= 8), QMODE 2 = dynamic
-kernel fast_math (M > 8).
+kernel fast_math (M > 8). SwiGLU clamp matches Marlin/b12x SILU: gate.clamp(max=L),
+up.clamp(-L, L), then silu(gate)*up. DSv4.1 checkpoints set L=10.0.
 """
 
 import os
@@ -102,6 +103,35 @@ def triton_nvfp4_decode_overlay_opt_in() -> tuple[bool, int, str, str]:
         raw = os.environ.get("QWEN4_EXP_TRITON_MOE_MAX_M", "96")
         return True, int(raw), QWEN_TRITON_MOE_ENV, "default"
     return False, 0, "", "default"
+
+
+def normalize_swiglu_clamp_limit(limit: float | None) -> float | None:
+    """Positive clamp limit, else None. Marlin/b12x skip clamp when limit <= 0."""
+    if limit is None:
+        return None
+    limit_f = float(limit)
+    return limit_f if limit_f > 0.0 else None
+
+
+def silu_mul_with_optional_clamp(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    *,
+    limit: float | None = None,
+) -> torch.Tensor:
+    """CPU reference for fused FC1 SILU.
+
+    Matches Marlin ``silu_and_mul_with_clamp`` / b12x SILU (alpha=1, beta=0):
+    ``silu(gate.clamp(max=L)) * up.clamp(-L, L)``. ``limit is None`` is
+    unclamped ``silu(gate) * up``.
+    """
+    g = gate.to(torch.float32)
+    u = up.to(torch.float32)
+    limit_f = normalize_swiglu_clamp_limit(limit)
+    if limit_f is not None:
+        g = torch.clamp(g, max=limit_f)
+        u = torch.clamp(u, min=-limit_f, max=limit_f)
+    return g * torch.sigmoid(g) * u
 
 
 def cfg_divides_shapes(
@@ -250,7 +280,11 @@ def _sf_off(r, kb, C4: tl.constexpr):  # 128x4 swizzled e4m3 scale offset; C4 = 
 
 
 @triton.jit
-def _silu_mul(g, u, QMODE: tl.constexpr):
+def _silu_mul(g, u, QMODE: tl.constexpr, HAS_CLAMP: tl.constexpr, LIMIT: tl.constexpr):
+    # Marlin/b12x SILU: gate.clamp(max=L), up.clamp(-L, L), then silu(gate)*up.
+    if HAS_CLAMP:
+        g = tl.minimum(g, LIMIT)
+        u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
     if QMODE == 2:  # b12x: rcp_approx(1 + exp_fast(-g)); gate * sig * up
         sig = _rcp(1.0 + _ex2(-g * 1.4426950408889634))
     else:
@@ -307,7 +341,8 @@ def _xq_kernel(x_ptr, g1_ptr, xq_ptr, xs_ptr, H: tl.constexpr, BK: tl.constexpr,
 def _fc1_kernel(xq_ptr, xs_ptr, w1_ptr, s1_ptr, a1_ptr, g2_ptr, sorted_ptr, eid_ptr, npost_ptr,
                 iq_ptr, is_ptr, num_pairs, TOPK: tl.constexpr, H: tl.constexpr, I: tl.constexpr,
                 S1PE: tl.constexpr, C4: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
-                BK: tl.constexpr, QMODE: tl.constexpr):
+                BK: tl.constexpr, QMODE: tl.constexpr, HAS_CLAMP: tl.constexpr,
+                LIMIT: tl.constexpr):
     pm = tl.program_id(0)
     pn = tl.program_id(1)
     if pm * BM >= tl.load(npost_ptr):
@@ -335,7 +370,8 @@ def _fc1_kernel(xq_ptr, xs_ptr, w1_ptr, s1_ptr, a1_ptr, g2_ptr, sorted_ptr, eid_
         sg = tl.load(sbase + _sf_off((I + n)[:, None], kb[None, :], C4))
         acc_u = tl.dot_scaled(xa, xs, "e2m1", tl.trans(wu), su, "e2m1", acc_u)
         acc_g = tl.dot_scaled(xa, xs, "e2m1", tl.trans(wg), sg, "e2m1", acc_g)
-    inter = _silu_mul(acc_g * al1, acc_u * al1, QMODE).to(tl.bfloat16).to(tl.float32)
+    inter = _silu_mul(acc_g * al1, acc_u * al1, QMODE, HAS_CLAMP, LIMIT).to(
+        tl.bfloat16).to(tl.float32)
     q, s = _quant_codes(inter, gs2, BM, BN, QMODE)
     tl.store(iq_ptr + rows[:, None] * (I // 2) + (pn * BN // 2 + tl.arange(0, BN // 2))[None, :],
              q, mask=valid[:, None])
@@ -444,12 +480,14 @@ class TritonNvfp4DecodeMoE:
         max_m: int,
         cfg: dict[str, int] | None = None,
         profile: str = "default",
+        swiglu_limit: float | None = None,
     ):
         E = int(prepared.num_experts)
         H = int(prepared.hidden_size)
         I = int(prepared.intermediate_size)
         self.E, self.H, self.I, self.topk, self.max_m = E, H, I, int(topk), int(max_m)
         self.profile = profile
+        self.swiglu_limit = normalize_swiglu_clamp_limit(swiglu_limit)
         if cfg is None:
             cfg = choose_triton_nvfp4_decode_cfg(
                 H,
@@ -537,11 +575,13 @@ class TritonNvfp4DecodeMoE:
         nb = min(s.max_blocks, min(npairs, self.E) + npairs // c["BM"])
         _xq_kernel[(M, self.H // c["XB"])](x, self.g1, s.xq, s.xs, self.H, BK=c["XB"],
                                             QMODE=qmode, num_warps=2)
+        has_clamp = 1 if self.swiglu_limit is not None else 0
+        clamp_limit = 0.0 if self.swiglu_limit is None else float(self.swiglu_limit)
         _fc1_kernel[(nb, self.I // c["BN1"])](
             s.xq, s.xs, self.w1, self.s1, self.a1, self.g2, s.sorted, s.eids, s.npost,
             s.iq, s.isc, npairs, self.topk, self.H, self.I, self.s1.shape[1], self.C41,
-            BM=c["BM"], BN=c["BN1"], BK=c["BK1"], QMODE=qmode,
-            num_warps=c["W1"], num_stages=c["S1"])
+            BM=c["BM"], BN=c["BN1"], BK=c["BK1"], QMODE=qmode, HAS_CLAMP=has_clamp,
+            LIMIT=clamp_limit, num_warps=c["W1"], num_stages=c["S1"])
         _fc2_kernel[(nb, self.H // c["BN2"])](
             s.iq, s.isc, self.w2, self.s2, self.a2, topk_w, s.sorted, s.eids, s.npost, s.acc,
             npairs, self.topk, self.H, self.I, self.s2.shape[1], self.C42,
