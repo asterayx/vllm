@@ -224,7 +224,7 @@ FLOW_CASES = [
             prefix='{"a"',
             raw_drafts=("z", ":", ' "', "b"),
             expected_validated=(),
-            expected_row_pattern="CUUUU",
+            expected_row_pattern="CCCCC",
             expected_reasoning=True,
             expect_terminated=False,
             reasoning_ended=True,
@@ -426,7 +426,9 @@ def test_initial_constraint_activation(
         # EOS is only valid once the regex has matched; rows after EOS are
         # unconstrained since the request stops there.
         pytest.param(("1", EOS, "2"), ("1", EOS), "CCUU", True, id="terminates"),
-        pytest.param((EOS, "1"), (), "CUU", False, id="early_eos"),
+        # All drafts rejected → padded with -1. Keep every row constrained
+        # rather than unconstraining after the first placeholder.
+        pytest.param((EOS, "1"), (), "CCC", False, id="early_eos"),
     ],
 )
 def test_regex_flow(
@@ -478,6 +480,28 @@ def test_rejected_draft_keeps_later_rows_constrained(tokenizer, backend: str):
     assert _row_pattern(bitmask) == "CCCC"
     assert (bitmask[2] == bitmask[1]).all()
     assert (bitmask[3] == bitmask[1]).all()
+
+
+@pytest.mark.parametrize("backend", REGEX_BACKENDS)
+def test_placeholder_drafts_keep_later_rows_constrained(tokenizer, backend: str):
+    """All -1 placeholders must not unconstrain later draft rows or bonus."""
+    manager, request = _build_harness(
+        tokenizer,
+        backend,
+        use_reasoner=False,
+        structured_outputs=StructuredOutputsParams(regex=DIGITS_REGEX),
+    )
+    placeholders = [-1, -1, -1]
+    bitmask = manager.grammar_bitmask(
+        requests={request.request_id: request},
+        structured_output_request_ids=[request.request_id],
+        scheduled_spec_decode_tokens={request.request_id: placeholders},
+    )
+    assert bitmask is not None
+    assert _row_pattern(bitmask) == "CCCC"
+    assert (bitmask[1] == bitmask[0]).all()
+    assert (bitmask[2] == bitmask[0]).all()
+    assert (bitmask[3] == bitmask[0]).all()
 
 
 def test_outlines_termination(tokenizer):

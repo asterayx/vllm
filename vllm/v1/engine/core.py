@@ -707,6 +707,18 @@ class EngineCore:
                 future = cast(Future[ModelRunnerOutput], exec_future)
             else:
                 if not scheduler_output.pending_structured_output_tokens:
+                    # Placeholders may already be 0 under PP stagger, so this
+                    # path still needs the request's real drafts for the mask.
+                    if (
+                        self.check_for_draft_tokens
+                        and scheduler_output.has_structured_output_requests
+                        and scheduler_output.scheduled_spec_decode_tokens
+                    ):
+                        draft_token_ids = self.model_executor.take_draft_token_ids()
+                        if draft_token_ids is not None:
+                            self.scheduler.update_draft_token_ids_in_output(
+                                draft_token_ids, scheduler_output
+                            )
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
                     grammar_output = self.scheduler.get_grammar_bitmask(

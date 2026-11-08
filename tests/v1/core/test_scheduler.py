@@ -7090,6 +7090,76 @@ def test_update_draft_token_ids_in_output_strips_padding():
     assert scheduler_output.num_invalid_spec_tokens == {request.request_id: 2}
 
 
+def test_grammar_bitmask_uses_persisted_drafts_when_take_omits_request():
+    """PP microbatches can omit a request from take_draft_token_ids().
+
+    Real drafts stored for that request must still replace -1 placeholders
+    before grammar_bitmask() runs.
+    """
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    request = _decode_ready_request(scheduler)
+    request.structured_output_request = SimpleNamespace(
+        grammar=_RecordingGrammar(), reasoning_ended=True
+    )
+
+    real_drafts = [10, 11, 12]
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [list(real_drafts)])
+    )
+    # A later microbatch has drafts only for a different request.
+    scheduler.update_draft_token_ids_in_output(
+        DraftTokenIds(["other"], [[21, 22, 23]]),
+        SimpleNamespace(
+            scheduled_spec_decode_tokens={"other": [-1, -1, -1]},
+            num_invalid_spec_tokens=None,
+        ),
+    )
+
+    captured: dict[str, list[int]] = {}
+
+    def fake_bitmask(requests, structured_ids, spec_tokens):
+        captured.update(spec_tokens)
+        return None
+
+    scheduler.structured_output_manager.grammar_bitmask = fake_bitmask
+    scheduler_output = SimpleNamespace(
+        has_structured_output_requests=True,
+        num_scheduled_tokens={request.request_id: 4},
+        scheduled_spec_decode_tokens={request.request_id: [-1, -1, -1]},
+        num_invalid_spec_tokens=None,
+    )
+
+    grammar_output = scheduler.get_grammar_bitmask(scheduler_output)
+    assert grammar_output is not None
+    assert grammar_output.structured_output_request_ids == [request.request_id]
+    assert captured[request.request_id] == real_drafts
+    assert request.request_id in scheduler._draft_token_ids_by_req
+
+
+def test_update_draft_token_ids_in_output_overlays_omitted_request():
+    scheduler = create_scheduler(num_speculative_tokens=3)
+    request = _decode_ready_request(scheduler)
+    request.structured_output_request = SimpleNamespace(
+        grammar=_RecordingGrammar(), reasoning_ended=True
+    )
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [[10, 11, 12]])
+    )
+
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={request.request_id: [-1, -1, -1]},
+        num_invalid_spec_tokens=None,
+    )
+    scheduler.update_draft_token_ids_in_output(
+        DraftTokenIds(["other"], [[21, 22, 23]]), scheduler_output
+    )
+    assert scheduler_output.scheduled_spec_decode_tokens[request.request_id] == [
+        10,
+        11,
+        12,
+    ]
+
+
 def test_diffusion_canvas_width_defaults_to_the_served_canvas():
     def req(extra):
         return SimpleNamespace(sampling_params=SimpleNamespace(extra_args=extra))

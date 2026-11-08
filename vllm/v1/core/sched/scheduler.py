@@ -231,6 +231,12 @@ class Scheduler(SchedulerInterface):
         # IDs of requests preempted since the last call to schedule().
         self.reset_preempted_req_ids: set[str] = set()
 
+        # Real speculative draft token ids keyed by request id. Under PP the
+        # latest take_draft_token_ids() microbatch may omit a request, so
+        # grammar bitmasks look up this store instead of leftover -1
+        # placeholders from AsyncScheduler.
+        self._draft_token_ids_by_req: dict[str, list[int]] = {}
+
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
         self.num_waiting_for_streaming_input: int = 0
@@ -1979,6 +1985,7 @@ class Scheduler(SchedulerInterface):
         if not structured_output_request_ids:
             return None
 
+        self._apply_persisted_draft_token_ids(scheduler_output)
         bitmask = self.structured_output_manager.grammar_bitmask(
             self.requests,
             structured_output_request_ids,
@@ -2510,26 +2517,67 @@ class Scheduler(SchedulerInterface):
         if self.ec_connector is not None:
             self.ec_connector.update_state_after_free(request, input_id)
 
+    def _store_draft_token_ids(
+        self, req_id: str, spec_token_ids: list[int]
+    ) -> list[int] | None:
+        """Validate and persist draft token ids for a request.
+
+        Returns the validated draft ids, or None if the request should be
+        skipped. Stored drafts survive later take_draft_token_ids() calls that
+        omit this request (PP microbatching).
+        """
+        request = self.requests.get(req_id)
+        if request is None or request.is_finished():
+            self._draft_token_ids_by_req.pop(req_id, None)
+            return None
+
+        if request.is_prefill_chunk:
+            # Ignore draft tokens for prefill chunks.
+            if request.spec_token_ids:
+                request.spec_token_ids = []
+            return None
+
+        validated = self.structured_output_manager.validate_tokens(
+            request, spec_token_ids
+        )
+        request.spec_token_ids = validated
+        self._draft_token_ids_by_req[req_id] = list(validated)
+        return validated
+
+    def _apply_persisted_draft_token_ids(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Replace placeholder -1 spec tokens with this request's stored drafts.
+
+        If a request has no stored drafts, leave the placeholders in place;
+        grammar_bitmask() must not unconstrain later rows from those -1s.
+        """
+        sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        num_invalid_spec_tokens = scheduler_output.num_invalid_spec_tokens
+        if num_invalid_spec_tokens is None:
+            num_invalid_spec_tokens = {}
+            scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
+
+        for req_id, spec_tokens in list(sched_spec_tokens.items()):
+            if spec_tokens and any(token >= 0 for token in spec_tokens):
+                continue
+            stored = self._draft_token_ids_by_req.get(req_id)
+            if not stored:
+                continue
+            orig_num_spec_tokens = len(spec_tokens) if spec_tokens else len(stored)
+            applied = list(stored[:orig_num_spec_tokens])
+            num_invalid_tokens = orig_num_spec_tokens - len(applied)
+            if num_invalid_tokens:
+                applied.extend([-1] * num_invalid_tokens)
+                num_invalid_spec_tokens[req_id] = num_invalid_tokens
+            sched_spec_tokens[req_id] = applied
+
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
         ):
-            request = self.requests.get(req_id)
-            if request is None or request.is_finished():
-                # The request may have been finished. Skip.
-                continue
-
-            if request.is_prefill_chunk:
-                # Ignore draft tokens for prefill chunks.
-                if request.spec_token_ids:
-                    request.spec_token_ids = []
-                continue
-
-            # Add newly generated spec token ids to the request.
-            request.spec_token_ids = self.structured_output_manager.validate_tokens(
-                request, spec_token_ids
-            )
+            self._store_draft_token_ids(req_id, spec_token_ids)
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
@@ -2541,23 +2589,18 @@ class Scheduler(SchedulerInterface):
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
         ):
-            request = self.requests.get(req_id)
-            if request is None or request.is_finished():
-                # The request may have been finished. Skip.
-                continue
-
             placeholder_spec_tokens = sched_spec_tokens.get(req_id)
-            if not placeholder_spec_tokens:
+            to_store = spec_token_ids
+            if placeholder_spec_tokens:
+                # Trim drafts to scheduled number of spec tokens
+                # (needed for chunked prefill case for example).
+                to_store = spec_token_ids[: len(placeholder_spec_tokens)]
+            validated = self._store_draft_token_ids(req_id, to_store)
+            if validated is None or not placeholder_spec_tokens:
                 continue
 
             orig_num_spec_tokens = len(placeholder_spec_tokens)
-            # Trim drafts to scheduled number of spec tokens
-            # (needed for chunked prefill case for example).
-            del spec_token_ids[orig_num_spec_tokens:]
-            # Filter out spec tokens which do not adhere to the grammar.
-            spec_token_ids = self.structured_output_manager.validate_tokens(
-                request, spec_token_ids
-            )
+            spec_token_ids = list(validated)
             # Pad to original number of spec tokens.
             num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
             if num_invalid_tokens:
@@ -2567,6 +2610,8 @@ class Scheduler(SchedulerInterface):
             sched_spec_tokens[req_id] = spec_token_ids
 
         scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
+        # Requests omitted from this take still get their stored drafts.
+        self._apply_persisted_draft_token_ids(scheduler_output)
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
@@ -2690,6 +2735,7 @@ class Scheduler(SchedulerInterface):
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        self._draft_token_ids_by_req.pop(request_id, None)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)

@@ -384,6 +384,24 @@ class StructuredOutputManager:
                     assert isinstance(grammar, StructuredOutputGrammar)
 
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, list())
+                bitmask = self._grammar_bitmask
+                if req_tokens and all(token < 0 for token in req_tokens):
+                    # No real drafts were available (PP take omitted this
+                    # request). Constrain every draft row and the bonus row
+                    # from the current grammar state rather than treating -1
+                    # placeholders as padding that unconstrains later rows.
+                    apply_bitmask = self._get_constraint_start(request, ()) == 0
+                    num_rows = len(req_tokens)
+                    if not (self.vllm_config.model_config.is_diffusion and req_tokens):
+                        num_rows += 1
+                    self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
+                    first_index = cumulative_index
+                    cumulative_index += 1
+                    for _ in range(num_rows - 1):
+                        bitmask[cumulative_index].copy_(bitmask[first_index])
+                        cumulative_index += 1
+                    continue
+
                 constraint_start = self._get_constraint_start(
                     request, strip_speculative_padding(req_tokens)
                 )
