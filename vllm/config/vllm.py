@@ -1400,6 +1400,19 @@ class VllmConfig:
         self.engram_config.verify_model_config(model_config)
         self.engram_config.resolve_dp_shared_memory(self.parallel_config)
         self.engram_config.verify_parallel_config(self.parallel_config)
+        if (
+            self.engram_config.storage_path
+            and model_config is not None
+            and not model_config.enforce_eager
+            and not envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+        ):
+            # The file-backed lookup copies hash indices to the host, which a
+            # non-breakable CUDA graph capture cannot contain.
+            raise ValueError(
+                "Engram storage_path gathers rows on the host and cannot run "
+                "inside CUDA graphs. Use --enforce-eager or set "
+                "VLLM_USE_BREAKABLE_CUDAGRAPH=1."
+            )
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
 
     def __post_init__(self):

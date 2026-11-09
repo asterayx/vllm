@@ -29,6 +29,9 @@ from vllm.model_executor.layers.indexer_topk import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
+from vllm.model_executor.layers.sm120_paged_mqa_logits import (
+    sm120_deepgemm_supports_paged_logits,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
@@ -319,17 +322,19 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
-_DPSK_INDEXER_SM120_FIX = os.environ.get("DPSK_INDEXER_SM120_FIX", "0") == "1"
+# The Triton kernel is the SM120 default for pages DeepGEMM cannot take.
+# DPSK_INDEXER_SM120_FIX=0 falls back to the eager torch reference, which
+# syncs the host and cannot run under CUDA graph capture.
+_DPSK_INDEXER_SM120_FIX = os.environ.get("DPSK_INDEXER_SM120_FIX", "1") == "1"
 
 
 def _sm120_needs_ref_paged_logits(kv_cache: torch.Tensor, use_fp4_cache: bool) -> bool:
-    """SM120 DeepGEMM fp8 paged MQA logits only supports 64-row pages; the
-    DeepSeek-V4.1 ratio-1 indexer uses 128-row pages there."""
+    """True when SM120 must bypass DeepGEMM (DSv4.1 ratio-1 uses 128-row pages)."""
     return (
         current_platform.is_cuda()
         and not use_fp4_cache
         and current_platform.is_device_capability_family(120)
-        and kv_cache.shape[1] != 64
+        and not sm120_deepgemm_supports_paged_logits(kv_cache.shape[1])
     )
 
 
@@ -348,11 +353,19 @@ def _paged_mqa_logits_ref_fp8(
     page = int(kv_cache.stride(0))
     nb_total = kv_cache.shape[0]
     out = torch.full(
-        (B * N, max_model_len), float("-inf"), dtype=torch.float32,
+        (B * N, max_model_len),
+        float("-inf"),
+        dtype=torch.float32,
         device=q_fp8.device,
     )
     if B == 0:
         return out
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "The SM120 torch reference paged MQA logits path syncs the host and "
+            "cannot be captured in a CUDA graph. Leave DPSK_INDEXER_SM120_FIX "
+            "unset (or =1) to use the Triton kernel."
+        )
     cl = context_lens.reshape(B, -1)
     max_len = int(cl.max().item())
     max_len = min(max_len, max_model_len)
@@ -369,8 +382,11 @@ def _paged_mqa_logits_ref_fp8(
         b1 = min(B, b0 + chunk)
         pages = flat[bt[b0:b1]]  # [b, nblk, bs*(D+4)]
         k = (
-            pages[..., : bs * D].contiguous().view(torch.float8_e4m3fn)
-            .view(b1 - b0, nblk, bs, D).float()
+            pages[..., : bs * D]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+            .view(b1 - b0, nblk, bs, D)
+            .float()
         )
         sc = pages[..., bs * D : bs * (D + 4)].contiguous().view(torch.float32)
         sc = sc.view(b1 - b0, nblk, bs)

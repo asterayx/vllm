@@ -357,15 +357,25 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     # --- DPSK_VOCAB_LOCAL_ARGMAX: vocab-shard-local greedy drafting ----------
     def vocab_local_argmax_supported(self) -> bool:
+        """Whether shard-local argmax gives the same draft as the stock path.
+
+        Requires draft ids to be target ids, a replicated Markov w2 covering
+        the whole lm_head vocab, no logit transforms, no separate head dtype,
+        and an lm_head sharded over the same TP group the gather uses.
+        """
         lp = self.logits_processor
         w2 = self.model.markov_head.markov_w2
         return (
-            lp.soft_cap is None
+            self.draft_id_to_target_id is None
+            and lp.soft_cap is None
             and lp.scale == 1.0
             and not lp.logits_as_input
+            and lp.head_dtype in (None, self.lm_head.weight.dtype)
+            and self.lm_head.tp_size == get_tensor_model_parallel_world_size()
             and getattr(w2, "tp_size", 1) == 1
             and hasattr(w2, "weight")
             and w2.weight.dim() == 2
+            and w2.weight.shape[0] == self.lm_head.org_vocab_size
             and type(w2.quant_method).__name__
             in ("UnquantizedEmbeddingMethod", "UnquantizedLinearMethod")
         )

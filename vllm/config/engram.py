@@ -54,7 +54,12 @@ class EngramConfig:
     """Directory for file-backed (NVMe) CPU-offloaded tables. When set, tables
     live in MAP_SHARED files under this path (reclaimable page cache, no
     pinned host RAM) and lookups gather rows on the CPU before upload.
-    Requires cpu_offload=True, dp_shared_memory off and use_thp off."""
+    Requires cpu_offload=True, dp_shared_memory off and use_thp off. The
+    host gather syncs every Engram layer, so it needs --enforce-eager or
+    VLLM_USE_BREAKABLE_CUDAGRAPH=1, and it is only fast while the page cache
+    still holds the tables: a cold miss faults a whole page per 264 B row.
+    Each process maps a private, already-unlinked file, so files never
+    collide across servers and are reclaimed on exit."""
 
     use_thp: bool = False
     """Back private CPU-offloaded tables with transparent huge pages (best
@@ -105,6 +110,7 @@ class EngramConfig:
             self.dp_shared_memory = (
                 self.cpu_offload
                 and not self.use_thp
+                and not self.storage_path
                 and parallel_config.data_parallel_size > 1
                 and not parallel_config.enable_elastic_ep
             )

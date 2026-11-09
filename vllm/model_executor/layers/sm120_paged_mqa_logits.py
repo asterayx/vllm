@@ -9,11 +9,20 @@ Page layout (segregated, same as `_paged_mqa_logits_ref_fp8`):
 
 logits[b*N + n, t] = scale[t] * sum_h w[b,n,h] * relu(q[b,n,h,:] . k[t,:])
 for t < context_lens[b, n], else -inf.  Output: [B*N, max_model_len] fp32.
-Gated by DPSK_INDEXER_SM120_FIX=1. No host syncs (graph/capture friendly).
+Default on SM120 (DPSK_INDEXER_SM120_FIX=0 opts out). No host syncs (graph/capture
+friendly).
 """
+
 import torch
-import triton
-import triton.language as tl
+
+from vllm.triton_utils import tl, triton
+
+SM120_DEEPGEMM_PAGED_LOGITS_BLOCK_SIZE = 64
+
+
+def sm120_deepgemm_supports_paged_logits(block_size: int) -> bool:
+    """SM120 DeepGEMM fp8 paged MQA logits only supports 64-row pages."""
+    return block_size == SM120_DEEPGEMM_PAGED_LOGITS_BLOCK_SIZE
 
 
 @triton.jit
@@ -59,8 +68,11 @@ def _sm120_paged_mqa_logits_kernel(
     blk = t0 // BS
     if (t0 >= maxcl) or (blk >= bt_width):
         for n in tl.static_range(N):
-            tl.store(out_ptr + (b * N + n).to(tl.int64) * out_stride + offs_t,
-                     neg_inf, mask=tmask)
+            tl.store(
+                out_ptr + (b * N + n).to(tl.int64) * out_stride + offs_t,
+                neg_inf,
+                mask=tmask,
+            )
         return
 
     page = tl.load(bt_ptr + b * bt_stride + blk)
@@ -77,8 +89,9 @@ def _sm120_paged_mqa_logits_kernel(
     offs_h = tl.arange(0, H)
     for n in tl.static_range(N):
         row = b * N + n
-        q = tl.load(q_ptr + (row * H + offs_h[:, None]).to(tl.int64) * D
-                    + offs_d[None, :])  # fp8 [H, D]
+        q = tl.load(
+            q_ptr + (row * H + offs_h[:, None]).to(tl.int64) * D + offs_d[None, :]
+        )  # fp8 [H, D]
         if not FP8_DOT:
             q = q.to(tl.bfloat16)
         s = tl.dot(q, tl.trans(k), out_dtype=tl.float32)  # [H, BT]
@@ -108,8 +121,9 @@ def sm120_paged_mqa_logits_fp8(
     B, N, H, D = q_fp8.shape
     bs = kv_cache.shape[1]
     if out is None:
-        out = torch.empty((B * N, max_model_len), dtype=torch.float32,
-                          device=q_fp8.device)
+        out = torch.empty(
+            (B * N, max_model_len), dtype=torch.float32, device=q_fp8.device
+        )
     if B == 0:
         return out
     q = q_fp8.contiguous()
@@ -130,10 +144,28 @@ def sm120_paged_mqa_logits_fp8(
     assert bs % BT == 0
     grid = (B, triton.cdiv(max_model_len, BT))
     _sm120_paged_mqa_logits_kernel[grid](
-        q, kv_cache, w, cl, bt, out,
-        int(kv_cache.stride(0)), kv_cache.shape[0], bt.stride(0), bt.shape[1],
-        cl.stride(0), w.stride(0), out.stride(0), max_model_len,
-        N=N, CLN=CLN, H=H, D=D, BS=bs, BT=BT, FP8_DOT=_FP8_DOT,
-        num_warps=4, num_stages=1,
+        q,
+        kv_cache,
+        w,
+        cl,
+        bt,
+        out,
+        int(kv_cache.stride(0)),
+        kv_cache.shape[0],
+        bt.stride(0),
+        bt.shape[1],
+        cl.stride(0),
+        w.stride(0),
+        out.stride(0),
+        max_model_len,
+        N=N,
+        CLN=CLN,
+        H=H,
+        D=D,
+        BS=bs,
+        BT=BT,
+        FP8_DOT=_FP8_DOT,
+        num_warps=4,
+        num_stages=1,
     )
     return out

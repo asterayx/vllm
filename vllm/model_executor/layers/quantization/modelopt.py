@@ -1758,6 +1758,21 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return ModelOptKVCacheMethod(self)
             return None
 
+        # DSpark drafter on NVFP4 DeepSeek-V4.x checkpoints: mtp.* routed experts
+        # ship as native MXFP4 (packed int8 + e8m0 group-32 scales), not NVFP4.
+        # Allocating them as NVFP4 leaves weight_scale_2/input_scale
+        # uninitialized and the draft is NaN (0% acceptance). Checked before
+        # the exclusion list so it holds whether or not the checkpoint lists
+        # those experts there. Only the drafter's own quant config sets it.
+        if isinstance(layer, RoutedExperts) and getattr(
+            self, "dspark_draft_moe_mxfp4", False
+        ):
+            from vllm.model_executor.layers.quantization.mxfp4 import (
+                Mxfp4MoEMethod,
+            )
+
+            return Mxfp4MoEMethod(layer.moe_config)
+
         # Excluded layers
         if self.is_layer_excluded(prefix):
             if isinstance(layer, (LinearBase, ParallelLMHead)):
@@ -1778,17 +1793,6 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             return build_linear_method(getattr(self, subcfg_attr), quant_algo, prefix)
 
         if isinstance(layer, RoutedExperts):
-            # DSpark drafter on NVFP4 checkpoints: mtp.* routed experts ship as
-            # native MXFP4 (int8 packed + e8m0 group-32 scales) and are listed
-            # in the ignore set, not as NVFP4. Allocating them as NVFP4 leaves
-            # weight_scale_2/input_scale uninitialized -> NaN draft (yzss
-            # 2026-11-04, 0% MTP acceptance).
-            if getattr(self, "dspark_draft_moe_mxfp4", False):
-                from vllm.model_executor.layers.quantization.mxfp4 import (
-                    Mxfp4MoEMethod,
-                )
-
-                return Mxfp4MoEMethod(layer.moe_config)
             if quant_algo in _BLOCK_FP8_MOE_ALGOS:
                 return Fp8MoEMethod(self.fp8_block_config, layer)
             if quant_algo == "FP8":

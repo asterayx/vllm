@@ -178,10 +178,7 @@ class DSparkSpeculator(DFlashSpeculator):
     def _sample_sequential_local_argmax(
         self, num_reqs: int, head_hidden: torch.Tensor
     ) -> None:
-        from vllm.distributed import (
-            get_tensor_model_parallel_world_size,
-            tensor_model_parallel_all_gather,
-        )
+        from vllm.distributed import tensor_model_parallel_all_gather
 
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
@@ -190,12 +187,12 @@ class DSparkSpeculator(DFlashSpeculator):
         base_local = self.model.compute_draft_logits_local(sample_hidden)
         lm_head = self.model.lm_head
         si = lm_head.shard_indices
-        num_pad = si.num_org_vocab_padding
         n_org = si.org_vocab_end_index - si.org_vocab_start_index
         vocab_start = si.org_vocab_start_index
         base_local = base_local[:, :n_org].reshape(num_reqs, n_spec, n_org)
-        tp = get_tensor_model_parallel_world_size()
-        del num_pad
+        # vocab_local_argmax_supported() guarantees this equals the TP group
+        # that tensor_model_parallel_all_gather uses.
+        tp = lm_head.tp_size
 
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
         for i in range(n_spec):

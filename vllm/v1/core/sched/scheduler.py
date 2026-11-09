@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -73,10 +74,11 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
-import os as _dpsk_os
-_DPSK_PP_MICROBATCH = _dpsk_os.environ.get("DPSK_PP_MICROBATCH", "0") == "1"
-
 logger = init_logger(__name__)
+
+# DPSK_PP_MICROBATCH=1: cap decodes per step to ceil(n / pp_size) so each PP
+# stage gets a distinct request group in flight.
+_DPSK_PP_MICROBATCH = os.environ.get("DPSK_PP_MICROBATCH", "0") == "1"
 
 
 class Scheduler(SchedulerInterface):
@@ -636,8 +638,9 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
-        # try55 DPSK_PP_MICROBATCH: cap decodes per step to ceil(n/pp) so PP
-        # stages each get a distinct request group (A/B) in flight.
+        # DPSK_PP_MICROBATCH: cap decodes per step to ceil(n / pp_size). The
+        # count advances only when a decode is actually scheduled, so a request
+        # skipped later in the loop does not take a slot from the rest.
         _dpsk_mb_cap = None
         if _DPSK_PP_MICROBATCH and self.use_pp and len(self.running) >= 2:
             _pp = self.parallel_config.pipeline_parallel_size
@@ -670,11 +673,10 @@ class Scheduler(SchedulerInterface):
                 _dpsk_mb_cap is not None
                 and not request.is_prefill_chunk
                 and self.current_step >= request.next_decode_eligible_step
+                and _dpsk_mb_count >= _dpsk_mb_cap
             ):
-                if _dpsk_mb_count >= _dpsk_mb_cap:
-                    req_index += 1
-                    continue
-                _dpsk_mb_count += 1
+                req_index += 1
+                continue
 
             if self.current_step < request.next_decode_eligible_step:
                 # V2+PP+async: enforce `pp_size` steps between same-req decodes
@@ -847,6 +849,8 @@ class Scheduler(SchedulerInterface):
             # Schedule the request.
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
+            if _dpsk_mb_cap is not None and not request.is_prefill_chunk:
+                _dpsk_mb_count += 1
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -2451,6 +2455,7 @@ class Scheduler(SchedulerInterface):
         assert safe_frontier >= 0
         request.num_computed_tokens = safe_frontier
         request.spec_token_ids = []
+        self._draft_token_ids_by_req.pop(request.request_id, None)
         request.drop_stale_output = True
         request.num_stale_output_tokens = request.num_in_flight_tokens
         request.num_output_placeholders = 0
