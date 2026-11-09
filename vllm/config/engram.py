@@ -55,9 +55,10 @@ class EngramConfig:
     live in MAP_SHARED files under this path (reclaimable page cache, no
     pinned host RAM) and lookups gather rows on the CPU before upload.
     Requires cpu_offload=True, dp_shared_memory off and use_thp off. The
-    host gather syncs every Engram layer, so it needs --enforce-eager or
-    VLLM_USE_BREAKABLE_CUDAGRAPH=1, and it is only fast while the page cache
-    still holds the tables: a cold miss faults a whole page per 264 B row.
+    host gather syncs every Engram layer, so it needs breakable CUDA graphs
+    (the DeepSeek-V4.1 default) or --enforce-eager, and it is only fast while
+    the page cache still holds the tables: a cold miss faults a whole page per
+    264 B row.
     Each process maps a private, already-unlinked file, so files never
     collide across servers and are reclaimed on exit."""
 

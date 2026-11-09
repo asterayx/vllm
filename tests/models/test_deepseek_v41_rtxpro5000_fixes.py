@@ -144,3 +144,30 @@ def test_fp8_skinny_max_m_takes_tp_minimum(monkeypatch):
     fp8_skinny_linear._agree_on_max_m_across_tp()
 
     assert fp8_skinny_linear._SHAPE_MAXM == {(0, 512, 1024): 16, (1, 256, 1024): 32}
+
+
+@pytest.mark.parametrize(
+    ("env", "default_arch", "expected"),
+    [
+        (None, True, True),
+        (None, False, False),
+        ("0", True, False),
+        ("1", False, True),
+    ],
+)
+def test_engram_storage_path_sees_auto_enabled_breakable_graphs(
+    monkeypatch, env, default_arch, expected
+):
+    """DSv4.1 auto-enables breakable graphs after the Engram check runs."""
+    from vllm.config.vllm import VllmConfig
+
+    if env is None:
+        monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", env)
+    monkeypatch.delenv("VLLM_BATCH_INVARIANT", raising=False)
+    stub = SimpleNamespace(
+        _uses_breakable_cudagraph_by_default=lambda: default_arch,
+        _uses_breakable_cudagraph_for_batch_invariance=lambda: False,
+    )
+    assert VllmConfig._breakable_cudagraph_will_be_enabled(stub) is expected

@@ -834,6 +834,15 @@ class VllmConfig:
             shapes += [(2 * intermediate // tp, hidden), (hidden, intermediate // tp)]
         return any(shape in table for shape in shapes)
 
+    def _breakable_cudagraph_will_be_enabled(self) -> bool:
+        """Predict _maybe_enable_breakable_cudagraph before it runs."""
+        if "VLLM_USE_BREAKABLE_CUDAGRAPH" in os.environ:
+            return envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+        return self._uses_breakable_cudagraph_by_default() or (
+            envs.VLLM_BATCH_INVARIANT
+            and self._uses_breakable_cudagraph_for_batch_invariance()
+        )
+
     def _maybe_enable_breakable_cudagraph(self) -> bool:
         if (
             "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
@@ -1404,14 +1413,16 @@ class VllmConfig:
             self.engram_config.storage_path
             and model_config is not None
             and not model_config.enforce_eager
-            and not envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+            and not self._breakable_cudagraph_will_be_enabled()
         ):
-            # The file-backed lookup copies hash indices to the host, which a
-            # non-breakable CUDA graph capture cannot contain.
+            # The file-backed lookup copies hash indices to the host. Breakable
+            # graphs run it eagerly at each replay; a non-breakable capture
+            # cannot contain it.
             raise ValueError(
                 "Engram storage_path gathers rows on the host and cannot run "
-                "inside CUDA graphs. Use --enforce-eager or set "
-                "VLLM_USE_BREAKABLE_CUDAGRAPH=1."
+                "inside non-breakable CUDA graphs. Remove "
+                "VLLM_USE_BREAKABLE_CUDAGRAPH=0 (DeepSeek-V4.1 enables breakable "
+                "graphs by default) or use --enforce-eager."
             )
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
 
