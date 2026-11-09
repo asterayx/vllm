@@ -322,10 +322,10 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
-# The Triton kernel is the SM120 default for pages DeepGEMM cannot take.
-# DPSK_INDEXER_SM120_FIX=0 falls back to the eager torch reference, which
-# syncs the host and cannot run under CUDA graph capture.
-_DPSK_INDEXER_SM120_FIX = os.environ.get("DPSK_INDEXER_SM120_FIX", "1") == "1"
+# DPSK_INDEXER_SM120_FIX=1 uses the Triton kernel for SM120 pages DeepGEMM
+# cannot take. It stays opt-in until it has an on-box accuracy eval. The torch
+# reference used otherwise syncs the host and refuses CUDA graph capture.
+_DPSK_INDEXER_SM120_FIX = os.environ.get("DPSK_INDEXER_SM120_FIX", "0") == "1"
 
 
 def _sm120_needs_ref_paged_logits(kv_cache: torch.Tensor, use_fp4_cache: bool) -> bool:
@@ -363,8 +363,8 @@ def _paged_mqa_logits_ref_fp8(
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "The SM120 torch reference paged MQA logits path syncs the host and "
-            "cannot be captured in a CUDA graph. Leave DPSK_INDEXER_SM120_FIX "
-            "unset (or =1) to use the Triton kernel."
+            "cannot be captured in a CUDA graph. Set DPSK_INDEXER_SM120_FIX=1 to "
+            "use the Triton kernel."
         )
     cl = context_lens.reshape(B, -1)
     max_len = int(cl.max().item())

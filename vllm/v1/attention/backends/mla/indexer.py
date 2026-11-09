@@ -1604,7 +1604,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     )
                 )
             ):
-                # SM120 pages DeepGEMM cannot take use the Triton logits kernel.
+                # Skipped on SM120 for pages DeepGEMM logits cannot take.
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,

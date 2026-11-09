@@ -131,15 +131,14 @@ def test_fp8_skinny_max_m_takes_tp_minimum(monkeypatch):
     )
 
     def fake_all_reduce(tensor, op, group):
-        keys = sorted(fake_all_reduce.local)
-        if tensor.numel() == 2:
+        if op == torch.distributed.ReduceOp.MAX:
             other = torch.tensor([len(peer), -len(peer)])
             tensor.copy_(torch.maximum(tensor, other))
         else:
-            other = torch.tensor([peer[k] for k in keys])
+            assert op == torch.distributed.ReduceOp.MIN
+            other = torch.tensor([peer[k] for k in sorted(peer)])
             tensor.copy_(torch.minimum(tensor, other))
 
-    fake_all_reduce.local = dict(fp8_skinny_linear._SHAPE_MAXM)
     monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
     fp8_skinny_linear._agree_on_max_m_across_tp()

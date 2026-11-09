@@ -9,7 +9,7 @@ Page layout (segregated, same as `_paged_mqa_logits_ref_fp8`):
 
 logits[b*N + n, t] = scale[t] * sum_h w[b,n,h] * relu(q[b,n,h,:] . k[t,:])
 for t < context_lens[b, n], else -inf.  Output: [B*N, max_model_len] fp32.
-Default on SM120 (DPSK_INDEXER_SM120_FIX=0 opts out). No host syncs (graph/capture
+Enabled with DPSK_INDEXER_SM120_FIX=1. No host syncs (graph/capture
 friendly).
 """
 
