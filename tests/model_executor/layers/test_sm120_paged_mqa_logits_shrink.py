@@ -17,6 +17,8 @@ import torch
 from vllm.model_executor.layers import sm120_paged_mqa_logits as shrink
 from vllm.model_executor.layers.sm120_paged_mqa_logits import (
     INDEXER_LOGITS_SHRINK_ENV,
+    commit_indexer_logits_shrink,
+    deepgemm_paged_logits_width,
     resolve_sm120_paged_logits_width,
     sm120_paged_mqa_logits_fp8,
 )
@@ -150,17 +152,17 @@ def test_allocation_width_follows_the_decision(monkeypatch):
     assert shrunk.shape == (0, expected)
     assert expected < _MAX_MODEL_LEN
 
-    captured = sm120_paged_mqa_logits_fp8(
-        q,
-        kv,
-        weights,
-        context,
-        block_table,
-        _MAX_MODEL_LEN,
-        used_len=_USED,
-        capturing=True,
-    )
-    assert captured.shape == (0, _MAX_MODEL_LEN)
+    with pytest.raises(RuntimeError, match="cuda graph capture"):
+        sm120_paged_mqa_logits_fp8(
+            q,
+            kv,
+            weights,
+            context,
+            block_table,
+            _MAX_MODEL_LEN,
+            used_len=_USED,
+            capturing=True,
+        )
 
 
 def test_launch_width_matches_allocation_and_is_not_silently_full(monkeypatch):
@@ -226,38 +228,76 @@ def test_active_path_emits_the_attach_line(monkeypatch):
     assert lines[0].startswith("DSV41_EXP_INDEXER_LOGITS_SHRINK active:")
 
 
-def test_capture_path_emits_fallback_rather_than_shrinking(monkeypatch):
+def test_capture_path_refuses_full_width_instead_of_staying_silent(monkeypatch):
     monkeypatch.setenv(INDEXER_LOGITS_SHRINK_ENV, "1")
-    lines: list[str] = []
-    monkeypatch.setattr(shrink.logger, "info_once", lines.append)
+    errors: list[str] = []
+    monkeypatch.setattr(shrink.logger, "error", errors.append)
     q, kv, weights, context, block_table = _empty_inputs(0)
-    out = sm120_paged_mqa_logits_fp8(
-        q,
-        kv,
-        weights,
-        context,
-        block_table,
-        _MAX_MODEL_LEN,
-        used_len=_USED,
-        capturing=True,
+    with pytest.raises(RuntimeError, match="cuda graph capture") as raised:
+        sm120_paged_mqa_logits_fp8(
+            q,
+            kv,
+            weights,
+            context,
+            block_table,
+            _MAX_MODEL_LEN,
+            used_len=_USED,
+            capturing=True,
+        )
+    assert "DSV41_EXP_INDEXER_LOGITS_SHRINK fallback" in str(raised.value)
+    assert errors
+    assert "cuda graph capture" in errors[0]
+
+
+def test_deepgemm_pages_shrink_when_the_flag_is_on():
+    """SM120 V4.1 indexer pages are 64, so decode stays on DeepGEMM."""
+    off = deepgemm_paged_logits_width(
+        _MAX_MODEL_LEN, _USED, 64, enabled=False, capturing=False
     )
-    assert out.shape[1] == _MAX_MODEL_LEN
-    assert lines
-    assert "fallback" in lines[0]
-    assert "cuda graph capture" in lines[0]
+    assert off.width == _MAX_MODEL_LEN
+    assert off.active is False
+    assert off.log_line is None
+
+    on = deepgemm_paged_logits_width(
+        _MAX_MODEL_LEN, _USED, 64, enabled=True, capturing=False
+    )
+    assert on.active is True
+    assert on.width >= _USED
+    assert on.width < _MAX_MODEL_LEN
+    assert on.width % 64 == 0
+    assert on.log_line is not None
+    assert on.log_line.startswith(
+        "DSV41_EXP_INDEXER_LOGITS_SHRINK active: DeepGEMM fp8_fp4_paged_mqa_logits "
+    )
+    assert f"width={on.width}" in on.log_line
+    assert "was not used" not in on.log_line
+
+    # A context that ends mid-page still covers the last DeepGEMM page.
+    partial = deepgemm_paged_logits_width(
+        _MAX_MODEL_LEN, 129, 64, enabled=True, capturing=False
+    )
+    assert partial.width >= 192
+    assert partial.width % 64 == 0
 
 
-def test_unused_backend_logs_only_when_the_flag_is_set(monkeypatch):
-    lines: list[str] = []
-    monkeypatch.setattr(shrink.logger, "info_once", lines.append)
+def test_deepgemm_shrink_refuses_cuda_graph_capture():
+    decision = deepgemm_paged_logits_width(
+        _MAX_MODEL_LEN, _USED, 64, enabled=True, capturing=True
+    )
+    with pytest.raises(RuntimeError, match="DeepGEMM fp8_fp4_paged_mqa_logits"):
+        commit_indexer_logits_shrink(decision)
+
+
+def test_unshrinkable_backend_raises_only_when_the_flag_is_set(monkeypatch):
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        _refuse_unshrinkable_indexer_logits,
+    )
+
     monkeypatch.delenv(INDEXER_LOGITS_SHRINK_ENV, raising=False)
-    shrink.log_sm120_logits_shrink_unused("DeepGEMM fp8_fp4_paged_mqa_logits")
-    assert lines == []
+    _refuse_unshrinkable_indexer_logits("DeepGEMM fp8_fp4_paged_mqa_logits")
     monkeypatch.setenv(INDEXER_LOGITS_SHRINK_ENV, "1")
-    shrink.log_sm120_logits_shrink_unused("DeepGEMM fp8_fp4_paged_mqa_logits")
-    assert len(lines) == 1
-    assert "fallback" in lines[0]
-    assert "was not used" in lines[0]
+    with pytest.raises(RuntimeError, match="refusing to keep the full-width"):
+        _refuse_unshrinkable_indexer_logits("XPU paged MQA logits")
 
 
 def test_indexer_wires_shrink_to_max_seq_len_and_full_graph_break():
@@ -266,6 +306,9 @@ def test_indexer_wires_shrink_to_max_seq_len_and_full_graph_break():
     source = inspect.getsource(indexer)
     assert "used_len=int(attn_metadata_narrowed.max_seq_len)" in source
     assert "break_on_full=_indexer_logits_shrink_breaks_full_graph" in source
+    assert "deepgemm_paged_logits_width" in source
+    assert "was not used (DeepGEMM fp8_fp4_paged_mqa_logits)" not in source
+    assert "max_model_len=logits_width" in source
     assert indexer._indexer_logits_shrink_breaks_full_graph() is (
         shrink.indexer_logits_shrink_enabled()
     )

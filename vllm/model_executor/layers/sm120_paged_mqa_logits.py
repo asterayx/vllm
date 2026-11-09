@@ -17,6 +17,7 @@ DSV41_EXP_INDEXER_LOGITS_SHRINK=1 allocates and stores only the used context
 still position t. Unset keeps the full-width allocation and launch.
 """
 
+import math
 import numbers
 import os
 from typing import NamedTuple
@@ -32,6 +33,9 @@ logger = init_logger(__name__)
 INDEXER_LOGITS_SHRINK_ENV = "DSV41_EXP_INDEXER_LOGITS_SHRINK"
 # Top-k row stride must stay a multiple of 4. The kernel tile is at most 128.
 _LOGITS_WIDTH_ALIGN = 128
+_SM120_BACKEND = "sm120_paged_mqa_logits"
+_DEEPGEMM_BACKEND = "DeepGEMM fp8_fp4_paged_mqa_logits"
+_QUIET_WIDTH_REASONS = frozenset({"disabled", "full_bound"})
 
 
 class Sm120LogitsWidth(NamedTuple):
@@ -67,14 +71,19 @@ def _align_up(n: int, align: int) -> int:
     return (n + align - 1) // align * align
 
 
-def _fallback(max_model_len: int, reason: str, detail: str) -> Sm120LogitsWidth:
+def _fallback(
+    max_model_len: int,
+    reason: str,
+    detail: str,
+    backend: str,
+) -> Sm120LogitsWidth:
     return Sm120LogitsWidth(
         width=max_model_len,
         active=False,
         reason=reason,
         log_line=(
-            "DSV41_EXP_INDEXER_LOGITS_SHRINK fallback: sm120_paged_mqa_logits "
-            f"keeps full width {max_model_len} ({detail})"
+            "DSV41_EXP_INDEXER_LOGITS_SHRINK fallback: "
+            f"{backend} keeps full width {max_model_len} ({detail})"
         ),
     )
 
@@ -86,6 +95,8 @@ def resolve_sm120_paged_logits_width(
     enabled: bool,
     capturing: bool = False,
     out_width: int | None = None,
+    align: int = _LOGITS_WIDTH_ALIGN,
+    backend: str = _SM120_BACKEND,
 ) -> Sm120LogitsWidth:
     """Choose the fp32 logits width for ``sm120_paged_mqa_logits_fp8``.
 
@@ -98,9 +109,12 @@ def resolve_sm120_paged_logits_width(
         capturing: This launch would be recorded into a CUDA graph whose
             replay can outgrow ``used_len``.
         out_width: Width of a caller-provided output, if any.
+        align: Row alignment. DeepGEMM writes whole KV pages, so its align
+            must be a multiple of the page size.
+        backend: Name used in the active and fallback log lines.
 
     Returns:
-        The width to allocate and to pass as the kernel's ``L``.
+        The width to allocate and to pass as the kernel's output length.
 
     """
     if not enabled:
@@ -110,12 +124,14 @@ def resolve_sm120_paged_logits_width(
             max_model_len,
             "cuda_graph_capture",
             "cuda graph capture; replay can outgrow the capture-time context",
+            backend,
         )
     if isinstance(used_len, bool) or not isinstance(used_len, numbers.Integral):
         return _fallback(
             max_model_len,
             "missing_used_len",
             "used length was not provided",
+            backend,
         )
     used = int(used_len)
     if used <= 0 or max_model_len <= 0:
@@ -123,14 +139,17 @@ def resolve_sm120_paged_logits_width(
             max_model_len,
             "invalid_used_len",
             f"used_len={used_len} is not a positive length",
+            backend,
         )
     if used > max_model_len:
         return _fallback(
             max_model_len,
             "used_len_exceeds_max_model_len",
             f"used_len={used} exceeds max_model_len",
+            backend,
         )
-    width = min(max_model_len, _align_up(used, _LOGITS_WIDTH_ALIGN))
+    align_to = align if align > 0 else _LOGITS_WIDTH_ALIGN
+    width = min(max_model_len, _align_up(used, align_to))
     if width >= max_model_len:
         return Sm120LogitsWidth(max_model_len, False, "full_bound", None)
     if out_width is not None and out_width != width:
@@ -138,26 +157,71 @@ def resolve_sm120_paged_logits_width(
             max_model_len,
             "preallocated_out",
             f"preallocated logits width {out_width} is not the shrunk width {width}",
+            backend,
         )
     return Sm120LogitsWidth(
         width=width,
         active=True,
         reason="shrunk",
         log_line=(
-            "DSV41_EXP_INDEXER_LOGITS_SHRINK active: sm120_paged_mqa_logits "
-            f"fp32 width={width} used_len={used} max_model_len={max_model_len}"
+            "DSV41_EXP_INDEXER_LOGITS_SHRINK active: "
+            f"{backend} fp32 width={width} used_len={used} "
+            f"max_model_len={max_model_len}"
         ),
     )
 
 
-def log_sm120_logits_shrink_unused(backend: str) -> None:
-    """Log when the shrink flag is set but this decode call cannot use it."""
-    if not indexer_logits_shrink_enabled():
-        return
-    logger.info_once(
-        "DSV41_EXP_INDEXER_LOGITS_SHRINK fallback: sm120_paged_mqa_logits "
-        f"was not used ({backend}); logits stay full width"
+def deepgemm_paged_logits_width(
+    max_model_len: int,
+    used_len: int | None,
+    page_size: int,
+    *,
+    enabled: bool,
+    capturing: bool,
+) -> Sm120LogitsWidth:
+    """Width for ``fp8_fp4_paged_mqa_logits``.
+
+    SM120 DeepSeek-V4.1 indexer pages are 32 or 64, which DeepGEMM accepts,
+    so ``DPSK_INDEXER_SM120_FIX`` does not select the Triton kernel. The
+    DeepGEMM ``max_model_len`` argument is the output row width. Rounding up
+    to a multiple of both the page size and 128 keeps every page the kernel
+    writes for ``used_len`` inside the row. Column ``t`` stays position ``t``.
+    """
+    page = page_size if page_size > 0 else 1
+    return resolve_sm120_paged_logits_width(
+        max_model_len,
+        used_len,
+        enabled=enabled,
+        capturing=capturing,
+        align=math.lcm(page, _LOGITS_WIDTH_ALIGN),
+        backend=_DEEPGEMM_BACKEND,
     )
+
+
+def commit_indexer_logits_shrink(decision: Sm120LogitsWidth) -> int:
+    """Return the logits width, or raise if shrink was requested and refused.
+
+    ``disabled`` and ``full_bound`` keep today's width with no log. An active
+    shrink logs the attach line. Any other reason refuses the launch instead
+    of continuing at full width.
+
+    Raises:
+        RuntimeError: Shrink was requested and this launch would stay full
+            width.
+
+    """
+    if decision.reason in _QUIET_WIDTH_REASONS:
+        return decision.width
+    if decision.active:
+        if decision.log_line is not None:
+            logger.info_once(decision.log_line)
+        return decision.width
+    message = decision.log_line or (
+        "DSV41_EXP_INDEXER_LOGITS_SHRINK fallback: refusing full-width "
+        f"logits ({decision.reason})"
+    )
+    logger.error(message)
+    raise RuntimeError(message)
 
 
 @triton.jit
@@ -302,11 +366,16 @@ def sm120_paged_mqa_logits_fp8(
 ) -> torch.Tensor:
     """Score paged fp8 keys into fp32 logits of shape ``[B*N, width]``.
 
-    ``width`` is ``max_model_len`` unless ``DSV41_EXP_INDEXER_LOGITS_SHRINK=1``
-    and this launch is not being captured. ``used_len`` is the host upper bound
-    on context; the shrunk row is that bound aligned up to 128, and column ``t``
-    stays position ``t``. ``capturing=None`` reads the current stream. A captured
-    launch keeps the full width because replay cannot grow it.
+    ``width`` is ``max_model_len`` unless ``DSV41_EXP_INDEXER_LOGITS_SHRINK=1``.
+    ``used_len`` is the host upper bound on context; the shrunk row is that
+    bound aligned up to 128, and column ``t`` stays position ``t``.
+    ``capturing=None`` reads the current stream. A captured launch raises:
+    replay cannot grow a recorded width.
+
+    Raises:
+        RuntimeError: Shrink was requested and this launch is being captured
+            or otherwise cannot leave the full width.
+
     """
     b, n, h, d = q_fp8.shape
     bs = kv_cache.shape[1]
@@ -320,12 +389,9 @@ def sm120_paged_mqa_logits_fp8(
         capturing=capturing,
         out_width=None if out is None else int(out.shape[1]),
     )
-    if decision.log_line is not None:
-        logger.info_once(decision.log_line)
+    width = commit_indexer_logits_shrink(decision)
     if out is None:
-        out = torch.empty(
-            (b * n, decision.width), dtype=torch.float32, device=q_fp8.device
-        )
+        out = torch.empty((b * n, width), dtype=torch.float32, device=q_fp8.device)
     if b == 0:
         return out
     q = q_fp8.contiguous()
@@ -344,7 +410,7 @@ def sm120_paged_mqa_logits_fp8(
         bt = bt.to(torch.int32)
     bt_tile = min(bs, 128)
     assert bs % bt_tile == 0
-    # Flag off: decision.width is max_model_len, same launch as before.
+    # Flag off: width is max_model_len, same launch as before.
     _launch_sm120_paged_mqa_logits(
         q,
         kv_cache,
@@ -352,7 +418,7 @@ def sm120_paged_mqa_logits_fp8(
         cl,
         bt,
         out,
-        decision.width,
+        width,
         n=n,
         cln=cln,
         h=h,

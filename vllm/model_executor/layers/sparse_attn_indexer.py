@@ -332,16 +332,16 @@ def _indexer_logits_shrink_breaks_full_graph() -> bool:
     return os.environ.get("DSV41_EXP_INDEXER_LOGITS_SHRINK", "0") == "1"
 
 
-def _log_indexer_logits_shrink_unused(backend: str) -> None:
-    """One-time fallback when the shrink flag is set but this backend is not
-    the SM120 Triton paged logits path."""
+def _refuse_unshrinkable_indexer_logits(backend: str) -> None:
+    """Raise when shrink is on and this backend cannot change its row width."""
     if os.environ.get("DSV41_EXP_INDEXER_LOGITS_SHRINK", "0") != "1":
         return
-    from vllm.model_executor.layers.sm120_paged_mqa_logits import (
-        log_sm120_logits_shrink_unused,
+    message = (
+        "DSV41_EXP_INDEXER_LOGITS_SHRINK fallback: cannot shrink "
+        f"{backend}; refusing to keep the full-width logits"
     )
-
-    log_sm120_logits_shrink_unused(backend)
+    logger.error(message)
+    raise RuntimeError(message)
 
 
 def _sm120_needs_ref_paged_logits(kv_cache: torch.Tensor, use_fp4_cache: bool) -> bool:
@@ -808,7 +808,7 @@ def sparse_attn_indexer(
             seq_lens_xpu = (
                 seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
             )
-            _log_indexer_logits_shrink_unused("XPU paged MQA logits")
+            _refuse_unshrinkable_indexer_logits("XPU paged MQA logits")
             logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
                 padded_q_quant_cast,
                 kv_cache,
@@ -840,7 +840,7 @@ def sparse_attn_indexer(
                 used_len=int(attn_metadata_narrowed.max_seq_len),
             )
         elif _sm120_needs_ref_paged_logits(kv_cache, use_fp4_cache):
-            _log_indexer_logits_shrink_unused(
+            _refuse_unshrinkable_indexer_logits(
                 "DPSK_INDEXER_SM120_FIX is unset; the fp32 reference keeps "
                 "the full max_model_len width"
             )
@@ -853,7 +853,28 @@ def sparse_attn_indexer(
                 max_model_len,
             )
         else:
-            _log_indexer_logits_shrink_unused("DeepGEMM fp8_fp4_paged_mqa_logits")
+            # SM120 V4.1 indexer pages are 32 or 64, so DeepGEMM stays
+            # selected even with DPSK_INDEXER_SM120_FIX=1. Its max_model_len
+            # argument is the fp32 row width; a shorter value keeps column t
+            # as position t. Unset passes max_model_len unchanged.
+            from vllm.model_executor.layers.sm120_paged_mqa_logits import (
+                commit_indexer_logits_shrink,
+                cuda_stream_capturing,
+                deepgemm_paged_logits_width,
+                indexer_logits_shrink_enabled,
+            )
+
+            logits_width = max_model_len
+            if indexer_logits_shrink_enabled():
+                logits_width = commit_indexer_logits_shrink(
+                    deepgemm_paged_logits_width(
+                        max_model_len,
+                        int(attn_metadata_narrowed.max_seq_len),
+                        int(kv_cache.shape[1]),
+                        enabled=True,
+                        capturing=cuda_stream_capturing(),
+                    )
+                )
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
@@ -861,7 +882,7 @@ def sparse_attn_indexer(
                 seq_lens,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
+                max_model_len=logits_width,
                 clean_logits=False,
                 indices=decode_metadata.indices,
             )
