@@ -2,13 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
 
-import os as _dpsk_os
-# try59: DPSK_PP_NO_AG=1 -> PP send full tensor per TP rank (no TP-sliced send + AllGather)
-_DPSK_PP_NO_AG = _dpsk_os.environ.get("DPSK_PP_NO_AG", "0") == "1"
 import gc
 import os
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
 from fnmatch import filter as fnmatch_filter
@@ -106,6 +104,10 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 
+# DPSK_PP_NO_AG=1: PP sends the full tensor per TP rank (no TP-sliced send +
+# all-gather).
+_DPSK_PP_NO_AG = os.environ.get("DPSK_PP_NO_AG", "0") == "1"
+
 
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
     spec_config = vllm_config.speculative_config
@@ -182,55 +184,72 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
-_DPSK_PREP_AHEAD = _dpsk_os.environ.get("DPSK_PREP_AHEAD", "0") == "1"
-_DPSK_PP_META_CACHE = _dpsk_os.environ.get("DPSK_PP_META_CACHE", "0") == "1"
+_DPSK_PREP_AHEAD = os.environ.get("DPSK_PREP_AHEAD", "0") == "1"
+_DPSK_PP_META_CACHE = os.environ.get("DPSK_PP_META_CACHE", "0") == "1"
 
 
-def _dpsk_meta_key(so):
-    """try63: identical on all PP stages; only uniform batches are cached."""
+def _dpsk_meta_key(so) -> tuple[int, ...] | None:
+    """PP metadata-cache key, computed identically on every stage.
+
+    Only uniform batches are cached. The key also carries how many requests
+    are new and how many carry spec tokens, because a final prefill chunk and
+    a spec decode with the same token count dispatch to different CUDA-graph
+    paddings and therefore send different tensor shapes.
+    """
     if not _DPSK_PP_META_CACHE:
         return None
     v = list(so.num_scheduled_tokens.values())
     if not v or min(v) != max(v):
         return None
-    return (so.total_num_scheduled_tokens, len(v), v[0])
+    return (
+        so.total_num_scheduled_tokens,
+        len(v),
+        v[0],
+        len(so.scheduled_new_reqs),
+        len(so.scheduled_spec_decode_tokens),
+    )
 
 
 class _DpskThreadedRecvTensors(AsyncIntermediateTensors):
-    """try61: irecv_tensor_dict on a helper thread; .tensors joins it."""
+    """Run irecv_tensor_dict on a persistent helper thread.
 
-    def __init__(self, device, all_gather_tensors) -> None:
-        import threading
+    Accessing ``.tensors`` waits for the helper. The helper is a single
+    long-lived thread so each step does not pay for creating an OS thread.
+    """
+
+    _executor: ThreadPoolExecutor | None = None
+
+    @classmethod
+    def _get_executor(cls) -> ThreadPoolExecutor:
+        if cls._executor is None:
+            cls._executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="dpsk_pp_recv"
+            )
+        return cls._executor
+
+    def __init__(self, device, all_gather_tensors, meta_key=None) -> None:
         IntermediateTensors.__init__(self, {})
         self._comm_handles = None
         self._comm_postprocess = None
         self._comm_waited = False
-        self._dpsk_res = None
-        self._dpsk_exc = None
         stream = torch.cuda.current_stream(device)
 
         def _run():
-            try:
-                torch.cuda.set_device(device)
-                with torch.cuda.stream(stream):
-                    self._dpsk_res = get_pp_group().irecv_tensor_dict(
-                        all_gather_group=None if _DPSK_PP_NO_AG else get_tp_group(),
-                        all_gather_tensors=all_gather_tensors,
-                    )
-            except BaseException as e:  # noqa: BLE001
-                self._dpsk_exc = e
+            torch.cuda.set_device(device)
+            with torch.inference_mode(), torch.cuda.stream(stream):
+                return get_pp_group().irecv_tensor_dict(
+                    all_gather_group=None if _DPSK_PP_NO_AG else get_tp_group(),
+                    all_gather_tensors=all_gather_tensors,
+                    meta_key=meta_key,
+                )
 
-        self._dpsk_thread = threading.Thread(target=_run, daemon=True)
-        self._dpsk_thread.start()
+        self._dpsk_future = self._get_executor().submit(_run)
 
     def wait_for_comm(self) -> None:
         if object.__getattribute__(self, "_comm_waited"):
             return
-        object.__getattribute__(self, "_dpsk_thread").join()
-        exc = object.__getattribute__(self, "_dpsk_exc")
-        if exc is not None:
-            raise exc
-        tensor_dict, handles, post = object.__getattribute__(self, "_dpsk_res")
+        future = object.__getattribute__(self, "_dpsk_future")
+        tensor_dict, handles, post = future.result()
         assert tensor_dict is not None
         object.__setattr__(self, "tensors", tensor_dict)
         for h in handles or []:
@@ -1326,10 +1345,13 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank and _DPSK_PREP_AHEAD:
-            # try61: run the CPU-blocking metadata recv + NCCL irecv in a helper
+            # Run the CPU-blocking metadata recv + NCCL irecv in a helper
             # thread so prepare_inputs/prepare_attn overlap the stage-0 wait.
             intermediate_tensors = _DpskThreadedRecvTensors(
-                self.device, all_gather_tensors)
+                self.device,
+                all_gather_tensors,
+                meta_key=_dpsk_meta_key(scheduler_output),
+            )
         elif forward_pass and not get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(

@@ -10,6 +10,9 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.sm120_paged_mqa_logits import (
+    sm120_deepgemm_supports_paged_logits,
+)
 from vllm.model_executor.warmup.jit_warmup import kernel_launcher, zip_inputs
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
@@ -1596,10 +1599,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 and has_deep_gemm()
                 and not (
                     current_platform.is_device_capability_family(120)
-                    and self.kv_cache_spec.num_states not in (32, 64)
+                    and not sm120_deepgemm_supports_paged_logits(
+                        self.kv_cache_spec.num_states
+                    )
                 )
             ):
-                # SM120: non-32/64 pages use the torch ref logits fallback.
+                # Skipped on SM120 for pages DeepGEMM logits cannot take.
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,

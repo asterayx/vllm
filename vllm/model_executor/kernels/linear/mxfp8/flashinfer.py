@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-import os
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import os
 
 import torch
 from torch.nn.parameter import Parameter
@@ -83,7 +84,9 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         if os.environ.get("DPSK_FP8_SKINNY_LINEAR", "0") == "1":  # try51
             layer._dpsk_scale_2d_u8 = (
                 weight_scale_2d.view(torch.uint8)
-                if weight_scale_2d.dtype != torch.uint8 else weight_scale_2d)
+                if weight_scale_2d.dtype != torch.uint8
+                else weight_scale_2d
+            )
 
         layer.weight = Parameter(weight.contiguous(), requires_grad=False)
         layer.weight_scale = Parameter(
@@ -100,6 +103,7 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
             from vllm.models.deepseek_v41.nvidia.ops.fp8_skinny_linear import (
                 fp8_skinny_apply,
             )
+
             y = fp8_skinny_apply(layer, x)
             if y is not None:
                 return y

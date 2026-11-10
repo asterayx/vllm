@@ -70,6 +70,10 @@ class GraphCaptureContext:
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
+# Upper bound on cached PP metadata entries per direction. Sender and receiver
+# apply the same rule in the same step order, so their caches stay identical.
+_DPSK_PP_META_CACHE_MAX = 512
+
 
 class Handle(Protocol):
     """Minimal async work handle used by P2P send/recv methods."""
@@ -462,6 +466,9 @@ class GroupCoordinator:
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
+        # DPSK_PP_META_CACHE: tensor-dict metadata keyed by scheduler shape.
+        self._dpsk_send_meta: dict[Any, list[Any]] = {}
+        self._dpsk_recv_meta: dict[Any, list[Any]] = {}
 
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
@@ -1195,15 +1202,20 @@ class GroupCoordinator:
         # Reap completed sends before posting new ones, bounding the
         # self-retention FIFO.
         self._reap_completed_isends()
-        # try63: metadata cache (both stages key on scheduler-derived meta_key)
-        _mc = self.__dict__.setdefault("_dpsk_send_meta", {})
-        if meta_key is not None and meta_key in _mc:
-            if _mc[meta_key] != metadata_list:
-                raise RuntimeError(f"DPSK_PP_META_CACHE mismatch key={meta_key}")
+        # DPSK_PP_META_CACHE: both stages derive meta_key from the scheduler
+        # output, so a hit on the sender is a hit on the receiver.
+        cache = self._dpsk_send_meta
+        if meta_key is not None and meta_key in cache:
+            if cache[meta_key] != metadata_list:
+                raise RuntimeError(
+                    f"DPSK_PP_META_CACHE key {meta_key} maps to different "
+                    "tensor metadata; the key does not capture the shape. "
+                    "Unset DPSK_PP_META_CACHE."
+                )
             handles: list[Handle] = [None]  # type: ignore[list-item]
         else:
-            if meta_key is not None:
-                _mc[meta_key] = metadata_list
+            if meta_key is not None and len(cache) < _DPSK_PP_META_CACHE_MAX:
+                cache[meta_key] = metadata_list
             handles = [self.isend_object(metadata_list, dst=dst)]
 
         sent_tensors: list[torch.Tensor] = []
@@ -1312,13 +1324,14 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
 
-        _mc = self.__dict__.setdefault("_dpsk_recv_meta", {})
-        if meta_key is not None and meta_key in _mc:
-            recv_metadata_list = _mc[meta_key]
+        cache = self._dpsk_recv_meta
+        if meta_key is not None and meta_key in cache:
+            recv_metadata_list = cache[meta_key]
         else:
             recv_metadata_list = self.recv_object(src=src)
-            if meta_key is not None:
-                _mc[meta_key] = recv_metadata_list
+            # Same insertion rule as the sender keeps both caches identical.
+            if meta_key is not None and len(cache) < _DPSK_PP_META_CACHE_MAX:
+                cache[meta_key] = recv_metadata_list
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
         postprocess: list[Callable[[], None]] = []

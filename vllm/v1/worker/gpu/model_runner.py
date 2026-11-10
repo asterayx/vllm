@@ -63,6 +63,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -181,13 +182,14 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
 
-import os as _os
-
-# try45: vocab-shard-local greedy target argmax (see sample()).
-_DPSK_VOCAB_LOCAL_ARGMAX = _os.environ.get("DPSK_VOCAB_LOCAL_ARGMAX", "0") == "1"
+# DPSK_VOCAB_LOCAL_ARGMAX=1: greedy target verify from a vocab-shard-local
+# argmax (see sample()). DPSK_VOCAB_LOCAL_ARGMAX_CHECK=N compares the first N
+# fast-path steps against the full-vocab argmax.
+_DPSK_VOCAB_LOCAL_ARGMAX = os.environ.get("DPSK_VOCAB_LOCAL_ARGMAX", "0") == "1"
 _DPSK_VOCAB_LOCAL_ARGMAX_CHECK = int(
-    _os.environ.get("DPSK_VOCAB_LOCAL_ARGMAX_CHECK", "0")
+    os.environ.get("DPSK_VOCAB_LOCAL_ARGMAX_CHECK", "0")
 )
+_DPSK_PP1_FULL_CG = os.environ.get("DPSK_PP1_FULL_CG", "0") == "1"
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -276,6 +278,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Speculative decoding.
         self.speculator = None
+        self._dpsk_local_argmax_checks_left = _DPSK_VOCAB_LOCAL_ARGMAX_CHECK
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
@@ -748,19 +751,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_profiling=is_profiling,
             piecewise_capture_available=piecewise_capture_available,
         )
-        # try62: DPSK_PP1_FULL_CG=1 -> last PP rank (no engram layers) uses FULL
-        # graphs for uniform decode, so per-layer eager breaks (indexer topk,
-        # sparse MLA decode) are captured inline; prefill/mixed stay PIECEWISE.
-        import os as _o
-        from vllm.distributed import get_pp_group as _gpp
+        # DPSK_PP1_FULL_CG=1: the last PP rank (no Engram layers) uses FULL
+        # graphs for uniform decode so its per-layer eager breaks (indexer
+        # top-k, sparse MLA decode) are captured inline; prefill and mixed
+        # batches stay PIECEWISE. Only promote when the attention backends
+        # declare uniform-batch support, i.e. the PIECEWISE choice came from
+        # configuration rather than from a backend that is unsafe under FULL.
         if (
-            _o.environ.get("DPSK_PP1_FULL_CG", "0") == "1"
-            and _gpp().world_size > 1
-            and _gpp().is_last_rank
+            _DPSK_PP1_FULL_CG
+            and self.is_last_pp_rank
+            and not self.is_first_pp_rank
             and cudagraph_mode == CUDAGraphMode.PIECEWISE
         ):
-            logger.warning("DPSK_PP1_FULL_CG=1: last PP rank PIECEWISE -> FULL_AND_PIECEWISE")
-            cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+            if attn_cg_support.min_cg_support.value >= (
+                AttentionCGSupport.UNIFORM_BATCH.value
+            ):
+                logger.warning(
+                    "DPSK_PP1_FULL_CG=1: last PP rank PIECEWISE -> FULL_AND_PIECEWISE"
+                )
+                cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+            else:
+                logger.warning(
+                    "DPSK_PP1_FULL_CG=1 ignored: attention backend %s only "
+                    "supports %s CUDA graphs",
+                    attn_cg_support.min_cg_attn_backend,
+                    attn_cg_support.min_cg_support.name,
+                )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
             self.device,
@@ -1613,23 +1629,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.rejection_sampler is not None
             and self.speculator is not None
             and self.rejection_sampler.can_greedy_from_top_tokens(
-                input_batch, self.speculator.draft_logits
+                input_batch, getattr(self.speculator, "draft_logits", None)
             )
         ):
-            # try45: greedy verification from vocab-shard-local argmax; only
+            # Greedy verification from a vocab-shard-local argmax: only
             # (max, idx) pairs are all-gathered instead of full-vocab logits.
             m = getattr(self.model, "language_model", self.model)
             sample_hidden_states = hidden_states[input_batch.logits_indices]
             top_tokens = m.logits_processor.get_top_tokens(
                 m.lm_head, sample_hidden_states
             )
-            if _DPSK_VOCAB_LOCAL_ARGMAX_CHECK > 0:
-                globals()["_DPSK_VOCAB_LOCAL_ARGMAX_CHECK"] -= 1
+            if self._dpsk_local_argmax_checks_left > 0:
+                self._dpsk_local_argmax_checks_left -= 1
                 ref = self.model.compute_logits(sample_hidden_states).argmax(-1)
                 nbad = int((ref != top_tokens).sum())
                 logger.warning(
                     "DPSK_VOCAB_LOCAL_ARGMAX check: rows=%d mismatches=%d",
-                    ref.numel(), nbad,
+                    ref.numel(),
+                    nbad,
                 )
             sampler_output = self.rejection_sampler.greedy_from_top_tokens(
                 top_tokens, input_batch

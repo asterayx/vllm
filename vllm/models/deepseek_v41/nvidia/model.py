@@ -66,8 +66,8 @@ from vllm.model_executor.models.utils import (
     extract_layer_index,
     is_pp_missing_parameter,
     make_layers,
-    spec_decode_needs_target_embed,
     maybe_prefix,
+    spec_decode_needs_target_embed,
 )
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -577,14 +577,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             if capture_previous_aux:
                 previous_aux = aux
 
-        if _NANDBG and getattr(self, "_dbg_l0", False):
-            _nan_probe("L0.pre_attn", x=x, residual=residual, post_mix=post_mix, res_mix=res_mix, attn_pre=attn_pre)
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
         x = self.attn(positions, x, None)
-        if _NANDBG and getattr(self, "_dbg_l0", False):
-            _nan_probe("L0.attn_out", x=x)
         # With GEMM-RS bound, the attention output is already this rank's
         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
         if self.use_sequence_parallel and self.attn.gemm_rs is None:
@@ -611,22 +607,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             stream=mhc_stream,
             reduce_results=self.fuse_mhc_all_reduce,
         )
-        if _NANDBG and getattr(self, "_dbg_l0", False):
-            _nan_probe("L0.pre_ffn", x=x, residual=residual, post_mix=post_mix, res_mix=res_mix, ffn_pre=ffn_pre)
         if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
             # The next layer's first boundary finalizes it with the all-reduce.
             x = self.ffn.forward_unfinalized(x, input_ids)
         else:
             x = self.ffn(x, input_ids, mega_gate_metadata)
-        if _NANDBG and getattr(self, "_dbg_l0", False):
-            _nan_probe("L0.ffn_out", x=x)
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
-    # try27: relay dspark aux hidden states across PP stages (EagleModelMixin)
+    # Relay DSpark aux hidden states across PP stages (EagleModelMixin).
     supports_aux_hidden_states_over_pp = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -686,10 +678,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.candidate_block_buffer = None
 
-        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(
-            vllm_config
-        ):
-            # try27: last PP rank also needs embed_tokens for the dspark drafter
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
+            # The last PP rank also needs embed_tokens for the DSpark drafter.
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -936,10 +926,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             pre_mix = intermediate_tensors["pre_mix"]
         # Every layer's post runs inside the next layer's fused pre, so aux
         # hidden states are read back from there instead of recomputed.
-        if _NANDBG:
-            _nan_probe(f"entry s{self.start_layer}", hidden=hidden_states, pre_mix=pre_mix)
-            self.layers[self.start_layer]._dbg_l0 = True
-            self.layers[self.start_layer].attn._dbg = True
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         _pp_first = get_pp_group().is_first_rank
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
@@ -962,8 +948,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 mega_gate_metadata=mega_gate_metadata,
             )
 
-            if _NANDBG:
-                _nan_probe(f"L{idx}", hidden=hidden_states, residual=residual, post_mix=post_mix, res_mix=res_mix, pre_mix=pre_mix)
             if previous_aux is not None:
                 # idx is the one-based id of the layer whose post this is.
                 if self.use_sequence_parallel:
@@ -1477,18 +1461,3 @@ class DeepseekV41LLMForCausalLM(
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
-
-import os as _os
-_NANDBG = _os.environ.get("DPSK_NAN_DBG") == "1"
-_nan_seen = set()
-def _nan_probe(tag, **ts):
-    import torch.distributed as _d
-    r = _d.get_rank() if _d.is_initialized() else -1
-    parts=[]
-    for k,v in ts.items():
-        if isinstance(v, torch.Tensor) and v.is_floating_point() and v.numel():
-            vf=v.float(); n=int(vf.isnan().sum()); i=int(vf.isinf().sum()); m=float(vf.abs().nan_to_num(0,0,0).max())
-            parts.append(f"{k}{tuple(v.shape)}:nan={n},inf={i},amax={m:.3g}")
-        elif v is not None and not isinstance(v, torch.Tensor):
-            parts.append(f"{k}:{type(v).__name__}")
-    print(f"[NANDBG r{r}] {tag} T={next((v.shape[0] for v in ts.values() if isinstance(v,torch.Tensor)),-1)} "+" ".join(parts), flush=True)

@@ -7,6 +7,7 @@ import mmap
 import os
 import shutil
 import tempfile
+import uuid
 import weakref
 from contextlib import ExitStack
 
@@ -32,13 +33,17 @@ from vllm.logger import init_logger
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v41.common.engram import (
     DEAD_ID,
-    Engram as BaseEngram,
     EngramLayout,
-    ParallelEngramEmbedding as BaseParallelEngramEmbedding,
     _engram_embed_quant_is_mxfp4,
     _engram_head_shard_weight_loader,
     _engram_lookup_kernel,
     _engram_select_rows,
+)
+from vllm.models.deepseek_v41.common.engram import (
+    Engram as BaseEngram,
+)
+from vllm.models.deepseek_v41.common.engram import (
+    ParallelEngramEmbedding as BaseParallelEngramEmbedding,
 )
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
@@ -323,8 +328,8 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             set_weight_attrs(self.weight_scale_inv, {"dummy_weight_value": 127})
             if self._file_mapping is not None:
                 logger.info(
-                    "Engram table file-backed (no pin) at %s: %d rows x %d%s, "
-                    "%.2f GiB, tp_rank=%d",
+                    "Engram table file-backed (no pin, unlinked) at %s: "
+                    "%d rows x %d%s, %.2f GiB, tp_rank=%d",
                     self._file_path,
                     self.part_num_embeddings,
                     self.row_bytes,
@@ -407,18 +412,35 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         weight_bytes = self.part_num_embeddings * self.row_bytes
         total = weight_bytes + self.part_num_embeddings * scale_dim
         fmt = "mxfp4" if self.packed_fp4 else "fp8"
+        # pid + random suffix: no two processes (or servers sharing `path`)
+        # ever map the same file.
         name = (
             f"engram_n{self.num_embeddings}_v{self.vocab_start_idx}-"
             f"{self.vocab_end_idx}_d{self.dim}_r{self.row_bytes}_{fmt}"
-            f"_b{self.block_size}_tp{get_tensor_model_parallel_rank()}.bin"
+            f"_b{self.block_size}_tp{get_tensor_model_parallel_rank()}"
+            f"_pid{os.getpid()}_{uuid.uuid4().hex[:8]}.bin"
         )
         self._file_path = os.path.join(path, name)
-        fd = os.open(self._file_path, os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(self._file_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            os.ftruncate(fd, total)
+            try:
+                # Reserve real blocks so a full disk fails here with a clear
+                # error instead of a SIGBUS while loading weights.
+                os.posix_fallocate(fd, 0, total)
+            except OSError as e:
+                raise RuntimeError(
+                    f"Engram storage_path {path!r} cannot hold {total / 1024**3:.1f}"
+                    f" GiB for {name}: {e}"
+                ) from e
             mapping = mmap.mmap(fd, total, flags=mmap.MAP_SHARED)
+        except BaseException:
+            os.unlink(self._file_path)
+            raise
         finally:
             os.close(fd)
+        # The mapping keeps the inode alive; unlinking now means the blocks
+        # are released when this process exits, even on a crash.
+        os.unlink(self._file_path)
         self._file_mapping = mapping
         packed = torch.from_numpy(np.frombuffer(mapping, dtype=np.uint8))
         weight_dtype = torch.uint8 if self.packed_fp4 else torch.float8_e4m3fn
