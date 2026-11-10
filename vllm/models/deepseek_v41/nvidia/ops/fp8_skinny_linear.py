@@ -5,8 +5,8 @@ On SM120 the MXFP8 linears (attn fused_wqa_wkv / wq_b / wo_b / indexer wq_b,
 shared experts, ...) go through EmulationMxfp8LinearKernel: dequant to bf16 at
 load + F.linear, which cuBLAS serves badly for decode M<=64 (~20-30us each).
 Same idea as wo_a_fp8_skinny: keep an exact (e4m3, E8M0) repack next to the
-bf16 weight and stream 1-byte weights through the Triton skinny kernel (reused
-with G=1) for small M, split-K (fp32 atomics) to fill the 110 SMs. Per shape a
+bf16 weight and stream 1-byte weights through a Triton skinny kernel for small
+M, split-K (reduced in-kernel) to fill the 110 SMs. Per shape a
 load-time timing check vs F.linear picks the largest M bucket where fp8 wins;
 larger M (prefill) keeps the bf16 path untouched.
 """
@@ -17,12 +17,10 @@ import re
 
 import torch
 import triton
+import triton.language as tl
 from torch import nn
 
-from vllm.models.deepseek_v41.nvidia.ops.wo_a_fp8_skinny import (
-    _wo_a_fp8_skinny_kernel,
-    repack_wo_a_fp8,
-)
+from vllm.models.deepseek_v41.nvidia.ops.wo_a_fp8_skinny import repack_wo_a_fp8
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = logging.getLogger(__name__)
@@ -53,34 +51,145 @@ def _cfg(M: int, N: int, K: int):
     )
 
 
+@triton.jit
+def _splitk_reduce_store(
+    acc,
+    ws_ptr,
+    cnt_ptr,
+    z_ptr,
+    offs_m,
+    offs_n,
+    m_mask,
+    M,
+    szm,
+    N: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    """Store this split's fp32 partial; the last split of the N tile to arrive
+    sums all partials in split order, writes bf16 and re-arms the counter."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(2)
+    tile = offs_m[:, None] * N + offs_n[None, :]
+    tl.store(ws_ptr + pid_k * M * N + tile, acc, mask=m_mask)
+    # All threads' partial stores must precede the release below.
+    tl.debug_barrier()
+    arrived = tl.atomic_add(cnt_ptr + pid_n, 1, sem="acq_rel")
+    if arrived == SPLIT_K - 1:
+        total = tl.load(ws_ptr + tile, mask=m_mask, other=0.0, cache_modifier=".cg")
+        for i in tl.static_range(1, SPLIT_K):
+            total += tl.load(
+                ws_ptr + i * M * N + tile,
+                mask=m_mask,
+                other=0.0,
+                cache_modifier=".cg",
+            )
+        z_ptrs = z_ptr + offs_m[:, None] * szm + offs_n[None, :]
+        tl.store(z_ptrs, total.to(z_ptr.dtype.element_ty), mask=m_mask)
+        tl.atomic_xchg(cnt_ptr + pid_n, 0)
+
+
+@triton.jit
+def _fp8_skinny_linear_kernel(
+    x_ptr,
+    w_ptr,
+    s_ptr,
+    z_ptr,
+    ws_ptr,
+    cnt_ptr,
+    M,
+    sxm,
+    sxk,
+    szm,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    """z[M, N] = x[M, K] @ dequant(w[N, K] e4m3, s[N, K//32] E8M0).T in bf16.
+
+    Split-K reduces in-kernel through ws/cnt instead of fp32 atomics into a
+    zeroed buffer plus a cast, which cost two extra kernels per call.
+    """
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(2)
+    SB: tl.constexpr = BLOCK_K // 32
+    KS: tl.constexpr = K // 32
+    K_PER: tl.constexpr = K // SPLIT_K
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rows = offs_n.to(tl.int64)
+    offs_kk = tl.arange(0, BLOCK_K)
+    offs_sb = tl.arange(0, SB)
+    m_mask = offs_m[:, None] < M
+
+    x_base = x_ptr + offs_m[:, None] * sxm
+    w_base = w_ptr + rows[:, None] * K
+    s_base = s_ptr + rows[:, None] * KS
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    k_start = pid_k * K_PER
+    for k0 in tl.range(k_start, k_start + K_PER, BLOCK_K):
+        offs_k = k0 + offs_kk
+        x = tl.load(x_base + offs_k[None, :] * sxk, mask=m_mask, other=0.0)
+        w = tl.load(w_base + offs_k[None, :])
+        s = tl.load(s_base + (k0 // 32 + offs_sb)[None, :])
+        sf = (s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        wf = tl.reshape(w.to(tl.float32), (BLOCK_N, SB, 32)) * sf[:, :, None]
+        wb = tl.reshape(wf, (BLOCK_N, BLOCK_K)).to(tl.bfloat16)
+        acc = tl.dot(x, tl.trans(wb), acc)
+
+    if SPLIT_K == 1:
+        z_ptrs = z_ptr + offs_m[:, None] * szm + offs_n[None, :]
+        tl.store(z_ptrs, acc.to(z_ptr.dtype.element_ty), mask=m_mask)
+    else:
+        _splitk_reduce_store(
+            acc, ws_ptr, cnt_ptr, z_ptr, offs_m, offs_n, m_mask, M, szm, N, SPLIT_K
+        )
+
+
+def new_splitk_counters(N: int, device: torch.device) -> torch.Tensor:
+    """Per-layer split-K tile counters; zero between calls (self re-arming)."""
+    return torch.zeros(N // 32, dtype=torch.int32, device=device)
+
+
 def fp8_skinny_linear(
-    x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, cfg: dict | None = None
+    x: torch.Tensor,
+    w8: torch.Tensor,
+    s8: torch.Tensor,
+    counters: torch.Tensor,
+    cfg: dict | None = None,
 ) -> torch.Tensor:
+    """Callers running concurrently on different streams need distinct
+    ``counters`` (one buffer per layer is enough)."""
     M, K = x.shape
     N = w8.shape[0]
     cfg = dict(cfg or _cfg(M, N, K))
     sk = cfg.pop("SPLIT_K")
-    if sk > 1:
-        out = torch.zeros((M, N), device=x.device, dtype=torch.float32)
-    else:
-        out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
-    _wo_a_fp8_skinny_kernel[(N // cfg["BLOCK_N"], 1, sk)](
+    out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+    ws = (
+        torch.empty((sk, M, N), device=x.device, dtype=torch.float32) if sk > 1 else out
+    )
+    assert counters.numel() >= N // cfg["BLOCK_N"]
+    _fp8_skinny_linear_kernel[(N // cfg["BLOCK_N"], 1, sk)](
         x,
         w8,
         s8,
         out,
+        ws,
+        counters,
         M,
         x.stride(0),
-        0,
         x.stride(1),
         out.stride(0),
-        0,
         N=N,
         K=K,
         SPLIT_K=sk,
         **cfg,
     )
-    return out if sk == 1 else out.to(torch.bfloat16)
+    return out
 
 
 def _fi_mxfp8_linear(x, w8, wsc):
@@ -102,6 +211,7 @@ def _dpsk_fp8_skinny_linear(
     w8: torch.Tensor,
     s8: torch.Tensor,
     wsc: torch.Tensor,
+    counters: torch.Tensor,
     kind: int,
 ) -> torch.Tensor:
     """Kind 0: Emulation layer (fallback bf16 F.linear);
@@ -120,13 +230,13 @@ def _dpsk_fp8_skinny_linear(
             hit,
         )
     if hit:
-        return fp8_skinny_linear(x, w8, s8)
+        return fp8_skinny_linear(x, w8, s8, counters)
     if kind == 1:
         return _fi_mxfp8_linear(x, w8, wsc)
     return torch.nn.functional.linear(x, w_bf16)
 
 
-def _dpsk_fp8_skinny_linear_fake(x, w_bf16, w8, s8, wsc, kind):
+def _dpsk_fp8_skinny_linear_fake(x, w_bf16, w8, s8, wsc, counters, kind):
     return x.new_empty((x.shape[0], w8.shape[0]))
 
 
@@ -150,11 +260,13 @@ def fp8_skinny_apply(layer: nn.Module, x: torch.Tensor):
         return None
     shp = x.shape
     x2 = x.reshape(-1, shp[-1])
-    w8, s8, kind = p
+    w8, s8, kind, cnt = p
     if kind == 1:
-        y = torch.ops.vllm.dpsk_fp8_skinny_linear(x2, w8, w8, s8, layer.weight_scale, 1)
+        y = torch.ops.vllm.dpsk_fp8_skinny_linear(
+            x2, w8, w8, s8, layer.weight_scale, cnt, 1
+        )
     else:
-        y = torch.ops.vllm.dpsk_fp8_skinny_linear(x2, layer.weight, w8, s8, s8, 0)
+        y = torch.ops.vllm.dpsk_fp8_skinny_linear(x2, layer.weight, w8, s8, s8, cnt, 0)
     return y.view(*shp[:-1], y.shape[-1])
 
 
@@ -179,7 +291,7 @@ def _time(fn, reps=20):
 
 def _calibrate(kind, N, K, layers):
     """Numeric check + timing on (up to 6, L2-rotated) real layers of shape."""
-    # layers: list of (ref_fn(x)->y, w8, s8)
+    # layers: list of (ref_fn(x)->y, w8, s8, counters)
     ws = layers[:6]
     dev = ws[0][1].device
     maxm = 0
@@ -187,8 +299,8 @@ def _calibrate(kind, N, K, layers):
         if M > MAX_M:
             break
         x = torch.randn(M, K, device=dev, dtype=torch.bfloat16)
-        for rf, w8, s8 in ws[:2]:
-            y = fp8_skinny_linear(x, w8, s8).float()
+        for rf, w8, s8, cnt in ws[:2]:
+            y = fp8_skinny_linear(x, w8, s8, cnt).float()
             wf = (
                 w8.float().view(N, K // 32, 32)
                 * torch.exp2(s8.float() - 127.0).unsqueeze(-1)
@@ -212,8 +324,8 @@ def _calibrate(kind, N, K, layers):
                 return 0
         if M in (1, 17, 33):
             continue
-        tf = _time(lambda x=x: [fp8_skinny_linear(x, w8, s8) for _, w8, s8 in ws])
-        tb = _time(lambda x=x: [rf(x) for rf, _, _ in ws])
+        tf = _time(lambda x=x: [fp8_skinny_linear(x, w8, s8, c) for _, w8, s8, c in ws])
+        tb = _time(lambda x=x: [rf(x) for rf, *_ in ws])
         logger.warning(
             "DPSK_FP8_SKINNY_LINEAR: kind%d (N=%d,K=%d) M=%d base %.1fus fp8 %.1fus",
             kind,
@@ -334,16 +446,17 @@ def enable_dpsk_fp8_skinny_linear(*roots: nn.Module | None) -> int:
                     xx, w8, wsc
                 )
             key = (kind, N, K)
-            by_shape.setdefault(key, []).append((rf, r[0], r[1]))
-            cands.append((name, m, r, key))
+            cnt = new_splitk_counters(N, w.device)
+            by_shape.setdefault(key, []).append((rf, r[0], r[1], cnt))
+            cands.append((name, m, r, key, cnt))
     for key, lst in by_shape.items():
         _SHAPE_MAXM[key] = _calibrate(key[0], key[1], key[2], lst)
     _agree_on_max_m_across_tp()
     n = 0
     extra = 0
-    for name, m, r, key in cands:
+    for name, m, r, key, cnt in cands:
         if _SHAPE_MAXM.get(key, 0) > 0:
-            m._fp8_skinny = (r[0], r[1], key[0])
+            m._fp8_skinny = (r[0], r[1], key[0], cnt)
             n += 1
             extra += (r[0].numel() if key[0] == 0 else 0) + r[1].numel()
         elif key[0] == 1:
