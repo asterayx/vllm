@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import triton.language as tl
 
 from vllm.models.deepseek_v41.nvidia import engram as nv_engram
 from vllm.models.deepseek_v41.nvidia.ops import fp8_skinny_linear
@@ -171,3 +172,64 @@ def test_engram_storage_path_sees_auto_enabled_breakable_graphs(
         _uses_breakable_cudagraph_for_batch_invariance=lambda: False,
     )
     assert VllmConfig._breakable_cudagraph_will_be_enabled(stub) is expected
+
+
+_splitk_reduce_store = None  # set to an interpreted copy of the real helper
+
+
+def _splitk_test_kernel(
+    x_ptr,
+    w_ptr,
+    z_ptr,
+    ws_ptr,
+    cnt_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(2)
+    k_per: tl.constexpr = K // SPLIT_K
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = pid_k * k_per + tl.arange(0, k_per)
+    m_mask = offs_m[:, None] < M
+    x = tl.load(x_ptr + offs_m[:, None] * K + offs_k[None, :], mask=m_mask, other=0.0)
+    w = tl.load(w_ptr + offs_n[:, None] * K + offs_k[None, :])
+    acc = tl.dot(x, tl.trans(w))
+    _splitk_reduce_store(
+        acc, ws_ptr, cnt_ptr, z_ptr, offs_m, offs_n, m_mask, M, N, N, SPLIT_K
+    )
+
+
+def test_fp8_skinny_splitk_reduces_in_kernel_and_rearms(monkeypatch):
+    """Split-K partials sum in split order to bf16 and leave counters at zero.
+
+    Runs under the Triton CPU interpreter, whose bf16 tl.dot is unreliable, so
+    a fp32 test kernel feeds the reduction helper the real kernel uses.
+    """
+    monkeypatch.setenv("TRITON_INTERPRET", "1")
+    import triton
+
+    helper = triton.jit(fp8_skinny_linear._splitk_reduce_store.fn)
+    monkeypatch.setitem(globals(), "_splitk_reduce_store", helper)
+    kernel = triton.jit(_splitk_test_kernel)
+    M, N, K, bn, sk = 3, 64, 128, 32, 4
+    x = torch.randn(M, K)
+    w = torch.randn(N, K)
+    kp = K // sk
+    ref = sum(
+        x[:, i * kp : (i + 1) * kp] @ w[:, i * kp : (i + 1) * kp].T for i in range(sk)
+    )
+    cnt = fp8_skinny_linear.new_splitk_counters(N, torch.device("cpu"))
+    for _ in range(2):
+        z = torch.empty(M, N, dtype=torch.bfloat16)
+        ws = torch.empty(sk, M, N)
+        kernel[(N // bn, 1, sk)](
+            x, w, z, ws, cnt, M, N=N, K=K, BLOCK_M=16, BLOCK_N=bn, SPLIT_K=sk
+        )
+        torch.testing.assert_close(z, ref.to(torch.bfloat16))
+        assert int(cnt.abs().sum()) == 0
