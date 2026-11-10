@@ -45,6 +45,7 @@ from vllm.models.deepseek_v41.common.engram import (
 from vllm.models.deepseek_v41.common.engram import (
     ParallelEngramEmbedding as BaseParallelEngramEmbedding,
 )
+from vllm.utils.dpsk_nvtx import dpsk_nvtx
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
@@ -621,7 +622,7 @@ class Engram(BaseEngram):
         stream.wait_stream(torch.cuda.current_stream())
         # Keep temporary hash storage alive until lookup finishes reading it.
         hash_ids.record_stream(stream)
-        with torch.cuda.stream(stream):
+        with torch.cuda.stream(stream), dpsk_nvtx("dpsk:engram_lookup"):
             self.embed_tokens.lookup(hash_ids, rows, background=True)
             assert self._prefetch_done is not None
             self._prefetch_done.record(stream)
@@ -629,7 +630,8 @@ class Engram(BaseEngram):
     @eager_break_during_capture
     def _finish_prefetch(self, event: torch.cuda.Event) -> None:
         # Wait for this layer's lookup only, not for later layers on the stream.
-        torch.cuda.current_stream().wait_event(event)
+        with dpsk_nvtx("dpsk:engram_wait"):
+            torch.cuda.current_stream().wait_event(event)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         if self._prefetch_done is not None:

@@ -57,6 +57,7 @@ from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v41.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.dpsk_nvtx import dpsk_nvtx_fn
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
@@ -959,6 +960,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         return qr_kv, kv_score, indexer_weights
 
     @eager_break_during_capture
+    @dpsk_nvtx_fn("dpsk:attn_eager_break")
     def _sparse_indexer_and_attn(
         self,
         hidden_states: torch.Tensor,

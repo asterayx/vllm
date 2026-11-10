@@ -69,6 +69,7 @@ from vllm.profiler.wrapper import (
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
+from vllm.utils.dpsk_nvtx import dpsk_nvtx, dpsk_nvtx_fn
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
 from vllm.utils.mem_constants import GiB_bytes
@@ -249,7 +250,8 @@ class _DpskThreadedRecvTensors(AsyncIntermediateTensors):
         if object.__getattribute__(self, "_comm_waited"):
             return
         future = object.__getattribute__(self, "_dpsk_future")
-        tensor_dict, handles, post = future.result()
+        with dpsk_nvtx("dpsk:pp_recv_wait"):
+            tensor_dict, handles, post = future.result()
         assert tensor_dict is not None
         object.__setattr__(self, "tensors", tensor_dict)
         for h in handles or []:
@@ -1291,6 +1293,7 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     @with_gpu_sync_check
+    @dpsk_nvtx_fn("dpsk:worker_sample_tokens")
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -1298,14 +1301,16 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     @with_gpu_sync_check
+    @dpsk_nvtx_fn("dpsk:worker_execute_model")
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # Wait for the previous step's sends so this forward pass cannot
         # overwrite buffers they are still reading.
         if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
+            with dpsk_nvtx("dpsk:pp_send_wait"):
+                for handle in self._pp_send_work:
+                    handle.wait()
             self._pp_send_work = []
 
         intermediate_tensors = None
@@ -1353,13 +1358,14 @@ class Worker(WorkerBase):
                 meta_key=_dpsk_meta_key(scheduler_output),
             )
         elif forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=None if _DPSK_PP_NO_AG else get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
-                    meta_key=_dpsk_meta_key(scheduler_output),
+            with dpsk_nvtx("dpsk:pp_recv"):
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=None if _DPSK_PP_NO_AG else get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                        meta_key=_dpsk_meta_key(scheduler_output),
+                    )
                 )
-            )
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
@@ -1392,12 +1398,13 @@ class Worker(WorkerBase):
         # Non-blocking send of the intermediate tensors. The metadata handle
         # is reaped lazily by the GroupCoordinator; the device handles are
         # waited at the top of the next step.
-        handles = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=None if _DPSK_PP_NO_AG else get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-            meta_key=_dpsk_meta_key(scheduler_output),
-        )
+        with dpsk_nvtx("dpsk:pp_send"):
+            handles = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=None if _DPSK_PP_NO_AG else get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+                meta_key=_dpsk_meta_key(scheduler_output),
+            )
         self._pp_send_work = handles[1:]
 
         if self.use_v2_model_runner and self.model_runner.is_pooling_model:
