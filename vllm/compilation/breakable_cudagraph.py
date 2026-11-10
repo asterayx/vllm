@@ -46,6 +46,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
+from vllm.utils.dpsk_nvtx import DPSK_NVTX, dpsk_nvtx
 from vllm.utils.torch_utils import weak_ref_tensor, weak_ref_tensors
 
 logger = init_logger(__name__)
@@ -213,8 +214,16 @@ class BreakableCUDAGraphCapture:
     # --- replay ----------------------------------------------------------
 
     def replay(self) -> None:
-        for r in self.segments:
-            r()
+        if not DPSK_NVTX:
+            for r in self.segments:
+                r()
+            return
+        with dpsk_nvtx(
+            f"dpsk:breakable_replay graphs={self._num_graphs} "
+            f"eager={self._num_eager_breaks}"
+        ):
+            for r in self.segments:
+                r()
 
     # --- introspection ---------------------------------------------------
 

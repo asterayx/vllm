@@ -39,6 +39,7 @@ from vllm.utils.deep_gemm import (
     fp8_fp4_paged_mqa_logits,
     has_deep_gemm,
 )
+from vllm.utils.dpsk_nvtx import dpsk_nvtx_fn
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -402,6 +403,7 @@ def _paged_mqa_logits_ref_fp8(
 
 
 @eager_break_during_capture
+@dpsk_nvtx_fn("dpsk:sparse_indexer")
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
