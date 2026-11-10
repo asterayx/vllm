@@ -233,3 +233,28 @@ def test_fp8_skinny_splitk_reduces_in_kernel_and_rearms(monkeypatch):
         )
         torch.testing.assert_close(z, ref.to(torch.bfloat16))
         assert int(cnt.abs().sum()) == 0
+
+
+@pytest.mark.parametrize(
+    ("threshold", "file_backed", "shared", "cpu_offload", "tokens", "expected"),
+    [
+        (0, False, False, True, 64, False),
+        (16, False, False, True, 4, False),
+        (16, False, False, True, 16, True),
+        (16, False, True, True, 64, False),
+        (16, False, False, False, 64, False),
+        (0, True, False, True, 1, True),
+    ],
+)
+def test_engram_host_gather_only_for_large_pinned_lookups(
+    monkeypatch, threshold, file_backed, shared, cpu_offload, tokens, expected
+):
+    """Pinned tables switch to the host gather only at or above the threshold."""
+    monkeypatch.setattr(nv_engram, "_DPSK_ENGRAM_HOST_GATHER_MIN_TOKENS", threshold)
+    stub = SimpleNamespace(
+        _file_mapping=object() if file_backed else None,
+        _shared_memory=object() if shared else None,
+        cpu_offload=cpu_offload,
+    )
+    use = nv_engram.ParallelEngramEmbedding._use_host_gather(stub, tokens)
+    assert use is expected

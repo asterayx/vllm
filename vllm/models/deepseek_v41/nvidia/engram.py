@@ -51,6 +51,13 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 logger = init_logger(__name__)
 
+# Pinned (cpu_offload, no storage_path) tables are read by the lookup kernel
+# through UVA. From this many tokens per lookup, gather the rows on the host
+# and copy them in one transfer instead, like the file-backed path. 0 = off.
+_DPSK_ENGRAM_HOST_GATHER_MIN_TOKENS = int(
+    os.environ.get("DPSK_ENGRAM_HOST_GATHER_MIN_TOKENS", "0")
+)
+
 
 def _allocate_huge_page_storage(num_bytes: int) -> torch.Tensor | None:
     """Register prefaulted huge pages, or return None for pinned-memory fallback."""
@@ -450,10 +457,19 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             packed[weight_bytes:].view(-1, scale_dim),
         )
 
+    def _use_host_gather(self, num_tokens: int) -> bool:
+        if self._file_mapping is not None:
+            return True
+        return (
+            self.cpu_offload
+            and self._shared_memory is None
+            and 0 < _DPSK_ENGRAM_HOST_GATHER_MIN_TOKENS <= num_tokens
+        )
+
     def lookup(
         self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
     ) -> None:
-        if self._file_mapping is None:
+        if not self._use_host_gather(indices.shape[0]):
             return super().lookup(indices, out, background)
         num_tokens = indices.shape[0]
         local_heads = self.part_n_hash_cols
