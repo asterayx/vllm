@@ -27,6 +27,13 @@ export LIBRARY_PATH=/home/roccen/cuda132_tk/lib64:${LIBRARY_PATH:-}
 export LD_LIBRARY_PATH=/home/roccen/cuda132_tk/lib64:${LD_LIBRARY_PATH:-}
 export NCCL_IB_DISABLE=1 PYTHONUNBUFFERED=1
 export NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT
+# 2026-11-11 #26 (Ricardo approved): TP rings over PCIe P2P instead of SHM. NCCL rates
+# GPU0-3 / GPU4-7 paths PHB, so the default keeps them on SHM. PHB also moves the
+# cross-socket PP send/recv from P2P to SHM (measured with that). L-C1 TTFT -6.9%,
+# XL-C1 TTFT -7.1%, decode neutral, all-reduce 4 tok 18.7->12.1 us.
+# Rollback: NCCL_P2P_LEVEL= (empty) restores NCCL's default transport selection.
+if [ -z "${NCCL_P2P_LEVEL+x}" ]; then export NCCL_P2P_LEVEL=PHB
+elif [ -z "$NCCL_P2P_LEVEL" ]; then unset NCCL_P2P_LEVEL; fi
 # 12:52 try41: DSpark draft FULL_DECODE_ONLY CUDA graph (+21% C1, +18% C16 vs eager draft) - permanent
 export DPSK_DRAFT_FULL_CG=1
 # 12:52 try42: FlashInfer PCIe IPC custom all-reduce for TP4 (vLLM CustomAllreduce refuses >2 PCIe-only GPUs)
