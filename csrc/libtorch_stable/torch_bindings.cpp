@@ -1108,11 +1108,17 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ar) {
   custom_ar.def("allocate_shared_buffer_and_handle(int size) -> (int, Tensor)");
   custom_ar.def("open_mem_handle(Tensor mem_handle) -> int");
   custom_ar.def("free_shared_buffer(int ptr) -> ()");
+  custom_ar.def(
+      "pcie_xor_all_reduce(int[] peer_ptrs, Tensor! state, Tensor! partial, "
+      "Tensor inp, Tensor! out, int rank, int world_size, int flag_base, "
+      "int payload_base, int slot_stride) -> ()");
+  custom_ar.def("pcie_xor_close_peer(int ptr) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CUDA, custom_ar) {
   custom_ar.impl("init_custom_ar", TORCH_BOX(&init_custom_ar));
   custom_ar.impl("all_reduce", TORCH_BOX(&all_reduce));
+  custom_ar.impl("pcie_xor_all_reduce", TORCH_BOX(&pcie_xor_all_reduce));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CPU, custom_ar) {
@@ -1129,6 +1135,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CompositeExplicitAutograd, custom_ar) {
   custom_ar.impl("allocate_shared_buffer_and_handle",
                  TORCH_BOX(&allocate_shared_buffer_and_handle));
   custom_ar.impl("free_shared_buffer", TORCH_BOX(&free_shared_buffer));
+  custom_ar.impl("pcie_xor_close_peer", TORCH_BOX(&pcie_xor_close_peer));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CPU, ops) {

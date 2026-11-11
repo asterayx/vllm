@@ -108,6 +108,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
+        self.xor_ar_comm = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
         self.use_aiter_ag_rs: bool = False
 
@@ -174,6 +175,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # On ROCm, 'use_custom_allreduce==True' means it must currently be
             # an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+
+        if self.world_size > 1:
+            from vllm.distributed.device_communicators.pcie_xor_all_reduce import (
+                try_create_pcie_xor_allreduce,
+            )
+
+            self.xor_ar_comm = try_create_pcie_xor_allreduce(
+                group=self.cpu_group,
+                device=self.device,
+                unique_name=unique_name,
+                ranks=self.ranks,
+            )
 
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
@@ -267,6 +280,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         depends on the input tensor.
         """
         all_potential_ar_backends = [
+            "PCIE_XOR",
             "FLASHINFER_PCIE_IPC",
             "FLASHINFER",
             "NCCL_SYMM_MEM",
@@ -277,6 +291,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "PYNCCL",
         ]
         enabled_ar_backends: list[str] = []
+        xor_ar_comm = getattr(self, "xor_ar_comm", None)
+        if xor_ar_comm is not None and not xor_ar_comm.disabled:
+            enabled_ar_backends.append("PCIE_XOR")
         if (
             self.fi_pcie_ipc_ar_comm is not None
             and not self.fi_pcie_ipc_ar_comm.disabled
@@ -333,6 +350,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        # Opt-in PCIe XOR butterfly. Shape and dtype decide the call, so a
+        # captured graph stays on one backend. Misses fall through to NCCL.
+        xor_ar_comm = getattr(self, "xor_ar_comm", None)
+        if xor_ar_comm is not None and xor_ar_comm.should_use(input_):
+            return xor_ar_comm.all_reduce(input_)
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None
@@ -673,6 +695,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.fi_pcie_ipc_ar_comm is not None:
             self.fi_pcie_ipc_ar_comm.destroy()
             self.fi_pcie_ipc_ar_comm = None
+        xor_ar_comm = getattr(self, "xor_ar_comm", None)
+        if xor_ar_comm is not None:
+            xor_ar_comm.close()
+            self.xor_ar_comm = None
         if self.all2all_manager is not None:
             self.all2all_manager.destroy()
             self.all2all_manager = None  # type: ignore[assignment]
