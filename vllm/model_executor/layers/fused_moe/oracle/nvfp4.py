@@ -446,6 +446,17 @@ def convert_to_nvfp4_moe_kernel_format(
     elif nvfp4_backend == NvFp4MoeBackend.MARLIN:
         a13_scale = None
         a2_scale = None
+        from vllm.model_executor.layers.fused_moe.triton_nvfp4_w4a16_decode import (
+            maybe_snapshot_nvfp4_w4a16_decode_weights,
+        )
+
+        # Keep Python refs to checkpoint-layout tensors, convert, *then*
+        # snapshot. Marlin permute/scale temps (e.g. ws_float[nonzero_mask])
+        # must not coexist with a cloned full expert pack — that peak OOMs
+        # 72GB / gpu_mem=0.91. Marlin allocates new shuffled tensors and
+        # does not mutate these; the pack holds them by view, not clone.
+        ckpt_w13, ckpt_w13_scale, ckpt_w13_scale_2 = w13, w13_scale, w13_scale_2
+        ckpt_w2, ckpt_w2_scale, ckpt_w2_scale_2 = w2, w2_scale, w2_scale_2
         (
             w13,
             w13_scale,
@@ -455,13 +466,22 @@ def convert_to_nvfp4_moe_kernel_format(
             w2_scale_2,
         ) = prepare_nvfp4_moe_layer_for_marlin(
             layer=layer,
-            w13=w13,
-            w13_scale=w13_scale,
-            w13_scale_2=w13_scale_2,
-            w2=w2,
-            w2_scale=w2_scale,
-            w2_scale_2=w2_scale_2,
+            w13=ckpt_w13,
+            w13_scale=ckpt_w13_scale,
+            w13_scale_2=ckpt_w13_scale_2,
+            w2=ckpt_w2,
+            w2_scale=ckpt_w2_scale,
+            w2_scale_2=ckpt_w2_scale_2,
             is_act_and_mul=is_act_and_mul,
+        )
+        maybe_snapshot_nvfp4_w4a16_decode_weights(
+            layer,
+            w13=ckpt_w13,
+            w13_scale=ckpt_w13_scale,
+            w13_scale_2=ckpt_w13_scale_2,
+            w2=ckpt_w2,
+            w2_scale=ckpt_w2_scale,
+            w2_scale_2=ckpt_w2_scale_2,
         )
     elif nvfp4_backend == NvFp4MoeBackend.EMULATION:
         # Move the E2M1 lookup table to the device now, because
