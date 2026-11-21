@@ -47,7 +47,7 @@ For each point record tok/s, TTFT p50/p99, TPOT p50/p99, acc_len and the major
 page-fault delta:
 
 | Point | Input | Output | Concurrency |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | S-C1 | 56 | 512 | 1 |
 | S-C16 | 56 | 512 | 16 |
 | L-C1 | 8K | 256 | 1 |
@@ -69,7 +69,7 @@ going to NVMe.
 worker, so nsys only records the window you choose.
 
 | NVTX range | Meaning |
-|---|---|
+| --- | --- |
 | `dpsk:worker_execute_model` / `dpsk:worker_sample_tokens` | Per-stage step time |
 | `dpsk:prepare_inputs` | CPU input and attention-metadata prep |
 | `dpsk:forward_piecewise` / `_full_graph` / `_eager` | Model forward |
@@ -126,7 +126,7 @@ grammar) and record the step-2 table.
 1. **Engram pinned with exact-size registration** (removes the per-step host
    sync on stage 0):
 
-   ```
+   ```text
    --engram-config '{"cpu_offload": true, "use_thp": true}'
    ```
 

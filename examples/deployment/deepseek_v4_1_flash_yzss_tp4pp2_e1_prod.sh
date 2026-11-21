@@ -44,7 +44,7 @@ export VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS=${VLLM_ALLREDUCE_FLASHINFER
 exec /home/roccen/vllm/.venv/bin/python -m vllm.entrypoints.cli.main serve /data/models/nvidia/DeepSeek-V4.1-Flash-1017-NVFP4 \
   --served-model-name dpsk-v4.1-flash \
   --tensor-parallel-size 4 --pipeline-parallel-size 2 \
-  --max-model-len 65536 --max-num-seqs ${DPSK_MAX_NUM_SEQS} --gpu-memory-utilization 0.91 \
+  --max-model-len 65536 --max-num-seqs "${DPSK_MAX_NUM_SEQS}" --gpu-memory-utilization 0.91 \
   --kv-cache-dtype fp8 \
   --tokenizer-mode deepseek_v41 --reasoning-parser deepseek_v41 \
   --enable-auto-tool-choice --tool-call-parser deepseek_v41 \

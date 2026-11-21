@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Iterable
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -8,8 +9,9 @@ import torch
 from vllm.config import LoadConfig, replace
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import DraftTokenIds
-from vllm.v1.worker.gpu.async_utils import async_copy_to_np
+from vllm.v1.worker.gpu.async_utils import async_copy_to_np, new_d2h_stream
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 logger = init_logger(__name__)
@@ -21,6 +23,32 @@ class DraftCopySnapshot(NamedTuple):
     req_ids: list[str]
     draft_tokens_np: np.ndarray
     copy_event: Any | None
+
+
+def max_num_tokens_after_draft_slots(
+    max_num_tokens: int, num_reqs: int, max_num_new_slots_per_req: int
+) -> int:
+    """Return the input-token budget after reserving each request's draft slots."""
+    return max_num_tokens - num_reqs * max_num_new_slots_per_req
+
+
+def get_drafter_hidden_states(
+    model: torch.nn.Module, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """Hidden states fed to the drafter.
+
+    Targets such as DeepSeek V4 expose the pre-hc_head residual through
+    get_mtp_target_hidden_states(). The buffer is sized at
+    max_num_batched_tokens and only allocated for drafters that consume
+    target hidden states, so None means "use the regular hidden states".
+    """
+    get_target_hidden_states = getattr(model, "get_mtp_target_hidden_states", None)
+    if get_target_hidden_states is None:
+        return hidden_states
+    target_hidden_states = get_target_hidden_states()
+    if target_hidden_states is None:
+        return hidden_states
+    return target_hidden_states[: hidden_states.shape[0]]
 
 
 def get_pp_safe_draft_load_config(load_config: LoadConfig) -> LoadConfig:
@@ -49,9 +77,20 @@ class DraftTokensHandler:
         # width when the scheduler does not need the token ids.
         self._draft_tokens_by_req: dict[str, np.ndarray | int] = {}
 
+        self._deferred_req_ids: Iterable[str] | None = None
+
+    def begin_step(self, scheduler_output: SchedulerOutput) -> None:
+        # get_draft_tokens is only called for the most recently executed
+        # scheduler output.
+        self._deferred_req_ids = (
+            scheduler_output.scheduled_spec_decode_tokens.keys()
+            if scheduler_output.pending_structured_output_tokens
+            else None
+        )
+
     def _ensure_copy_resources(self) -> None:
         if self.copy_stream is None:
-            self.copy_stream = torch.cuda.Stream(self.device)
+            self.copy_stream = new_d2h_stream(self.device)
 
     def set_draft_tokens(
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
@@ -69,7 +108,7 @@ class DraftTokensHandler:
         # draft tokens back to the scheduler for grammar validation.
         is_cpu = self.device is None or self.device.type == "cpu"
         if is_cpu:
-            draft_tokens_np = np.ascontiguousarray(draft_tokens.detach().cpu().numpy())
+            draft_tokens_np = draft_tokens.detach().cpu().numpy().copy()
             copy_event = None
         else:
             self._ensure_copy_resources()
@@ -98,26 +137,31 @@ class DraftTokensHandler:
         self._draft_tokens_by_req.pop(req_id, None)
 
     def get_draft_tokens(self) -> DraftTokenIds | None:
-        """Return the latest retained drafts for every live request.
-
-        Under pipeline parallelism the most recent microbatch may not include a
-        request whose drafts were produced earlier; those rows stay in the
-        per-request store until overwritten or discarded.
-        """
+        """Return the latest drafts needed for the current step's deferred
+        grammar bitmask, or for all live requests if sampling isn't deferred.
+        Requests without retained drafts are omitted."""
         if self._copy_pending:
             assert self.copy_event is not None
             self.copy_event.synchronize()
             self._copy_pending = False
 
-        out_req_ids = list(self._draft_tokens_by_req)
+        drafts_by_req = self._draft_tokens_by_req
+        req_ids = self._deferred_req_ids
+        if req_ids is None:
+            out_req_ids = list(drafts_by_req)
+        else:
+            out_req_ids = [req_id for req_id in req_ids if req_id in drafts_by_req]
         draft_token_ids: list[list[int]] = []
         for req_id in out_req_ids:
-            draft_tokens = self._draft_tokens_by_req[req_id]
+            draft_tokens = drafts_by_req[req_id]
             if isinstance(draft_tokens, int):
+                # Construct placeholders from draft token width
                 draft_tokens = [-1] * draft_tokens
             else:
+                # Convert numpy view to list
                 draft_tokens = draft_tokens.tolist()
             draft_token_ids.append(draft_tokens)
+
         return DraftTokenIds(out_req_ids, draft_token_ids)
 
 

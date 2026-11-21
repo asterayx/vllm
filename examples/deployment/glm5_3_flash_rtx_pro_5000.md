@@ -6,9 +6,9 @@
 
 - 机器：4x NVIDIA RTX PRO 5000 72GB Blackwell (sm_120)，双路 CPU，GPU 之间只有 PCIe
 - 模型：`nvidia/GLM-5.3-Flash-NVFP4`（`Glm5NextForConditionalGeneration`，约 191 GB）
-  - 45 层，hidden 4096，288 专家 top-8，`moe_intermediate_size` 2048（TP4 下每卡 512）
-  - 注意力：KDA 线性注意力 + 稀疏 MLA（Kpool indexer，DeepGEMM）
-  - MTP 草稿层为 BF16（未量化）
+    - 45 层，hidden 4096，288 专家 top-8，`moe_intermediate_size` 2048（TP4 下每卡 512）
+    - 注意力：KDA 线性注意力 + 稀疏 MLA（Kpool indexer，DeepGEMM）
+    - MTP 草稿层为 BF16（未量化）
 - 对外入口：`https://t.asteraix.com/v1`，模型名 `glm-5.3-flash`
 - Qwen 与 GLM 都占满 4 张卡，同一时间只能运行一个
 
@@ -50,7 +50,7 @@ MAX_LEN=262144 MAX_SEQS=32 NUMA=1 NCCL_LL=1 SPEC=3 TOOLS=1 MODEL=$G \
 ```
 
 | 设置 | 作用 |
-|---|---|
+| --- | --- |
 | `TP=4`（默认） | 4 卡张量并行 |
 | `--moe-backend b12x` | sm_120 NVFP4 MoE kernel；MTP 草稿层（BF16）自动用 FlashInfer CUTLASS |
 | `SPEC=3` | MTP 投机解码 3 个草稿 token；mt-bench 接受长度 2.85 |
@@ -105,7 +105,7 @@ reasoning_effort = "low"
 `medium` 和 `none`）都按 `max` 处理，且没有关闭思考的开关。
 
 | `reasoning_effort` | 实际档位 | 示例（写 300 行贪吃蛇） |
-|---|---|---|
+| --- | --- | --- |
 | `low` | Low | 15 s，几乎不思考 |
 | `high` | High | — |
 | `medium` / 不设 / `none` | Max | 126 s，其中思考约 114 s |
@@ -165,7 +165,7 @@ done
 参考结果（TP4，输出 tok/s，并发 1 / 8 / 16）：
 
 | 配置 | random 1024/512 | mt-bench |
-|---|---|---|
+| --- | --- | --- |
 | FlashInfer CUTLASS，无 MTP | 90 / 397 / 583 | — |
 | b12x + `NUMA=1 NCCL_LL=1` + MTP2 | 100 / 431 / 595 | 152 / 567 / 755 |
 | b12x + `NUMA=1 NCCL_LL=1` + MTP3（推荐） | — | 165 / 562 / 808 |
@@ -176,7 +176,7 @@ random 数据的接受长度只有 1.3–1.8，不能用来评估投机解码。
 ## 7. 已知问题与排障
 
 | 现象 | 原因 / 处理 |
-|---|---|
+| --- | --- |
 | `No valid attention backend found` | `has_flashinfer()` 为 False：装 `flashinfer-cubin`，或保证 `nvcc` 在 `PATH`（脚本已自动处理 `/usr/local/cuda/bin`） |
 | `FileNotFoundError: 'ninja'` | FlashInfer JIT 需要 ninja：`uv pip install ninja` |
 | 启动卡在 `Running FlashInfer autotune`，日志只剩 `No available shared memory broadcast block` | 旧版本中各卡 autotune 缓存不一致导致 all-reduce 死锁，本分支已修复。若仍出现：`rm -rf ~/.cache/vllm/flashinfer_autotune_cache` 后重启，或临时加 `--no-enable-flashinfer-autotune` |

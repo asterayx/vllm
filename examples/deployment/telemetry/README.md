@@ -3,7 +3,7 @@
 Prometheus + Grafana stack for `../qwen3_8_flash_next_rtx_pro_5000.sh`:
 
 | Source | Port (127.0.0.1) | What |
-|---|---|---|
+| --- | --- | --- |
 | vLLM `/metrics` | 8000 | throughput, TTFT/TPOT/ITL/E2E, queue, KV cache, prefix cache, MTP acceptance |
 | dcgm-exporter | 9400 | GPU util, tensor/DRAM activity, memory, power, clocks, PCIe |
 | node-exporter | 9100 | CPU, memory per NUMA node, RDMA port counters, mlx5 ethtool (PFC pause, `*_bytes_phy`) |

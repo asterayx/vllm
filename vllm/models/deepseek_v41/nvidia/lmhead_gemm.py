@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DPSK_LMHEAD_SKINNY: route the DPSK V4.1 bf16 LM head (TP4 shard 32320x5120)
 off cuBLAS' cutlass_80 wmma fallback onto the cuteDSL skinny GEMM on sm120.
 
 Measured (RTX PRO 5000 Blackwell, CUDA-graph replay, 3 L2-rotated weights):
 M=3..8 cuBLAS ~282us -> skinny ~256us (1.10x); M=12 1.08x; M>=16 no win (kept
 on cuBLAS)."""
+
 import logging
 
 import torch
@@ -102,7 +104,10 @@ def enable_dpsk_lmhead_skinny(*roots: nn.Module | None) -> int:
                 if not err <= 1e-2 * scale:
                     logger.warning(
                         "DPSK_LMHEAD_SKINNY: M=%d mismatch err=%g scale=%g; disabled",
-                        M, err, scale)
+                        M,
+                        err,
+                        scale,
+                    )
                     return n
             m.quant_method = DpskLmHeadSkinnyMethod()
             n += 1

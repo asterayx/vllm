@@ -8,10 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import triton.language as tl
 
-from vllm.models.deepseek_v41.nvidia import engram as nv_engram
+from vllm.models.deepseek_v41.common import engram as nv_engram
 from vllm.models.deepseek_v41.nvidia.ops import fp8_skinny_linear
+from vllm.triton_utils import tl
 from vllm.v1.worker import gpu_worker
 from vllm.v1.worker.gpu.spec_decode.dspark import utils as dspark_utils
 
@@ -174,7 +174,7 @@ def test_engram_storage_path_sees_auto_enabled_breakable_graphs(
     assert VllmConfig._breakable_cudagraph_will_be_enabled(stub) is expected
 
 
-_splitk_reduce_store = None  # set to an interpreted copy of the real helper
+_splitk_reduce_store = fp8_skinny_linear._splitk_reduce_store
 
 
 def _splitk_test_kernel(
@@ -212,7 +212,7 @@ def test_fp8_skinny_splitk_reduces_in_kernel_and_rearms(monkeypatch):
     a fp32 test kernel feeds the reduction helper the real kernel uses.
     """
     monkeypatch.setenv("TRITON_INTERPRET", "1")
-    import triton
+    from vllm.triton_utils import triton
 
     helper = triton.jit(fp8_skinny_linear._splitk_reduce_store.fn)
     monkeypatch.setitem(globals(), "_splitk_reduce_store", helper)

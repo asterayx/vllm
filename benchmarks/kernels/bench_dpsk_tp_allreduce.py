@@ -22,12 +22,12 @@ def _time_ms(fn, iters: int) -> float:
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     dist.barrier()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     start.record()
     for _ in range(iters):
         fn()
     end.record()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return start.elapsed_time(end) / iters
 
 
@@ -48,7 +48,7 @@ def main() -> None:
     args = parser.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
     world = dist.get_world_size()
     rank = dist.get_rank()

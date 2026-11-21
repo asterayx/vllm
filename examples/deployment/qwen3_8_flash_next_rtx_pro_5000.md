@@ -5,8 +5,8 @@ vLLM 启动、Cloudflare Tunnel 对外暴露、客户端（Codex / Grok Build / 
 Prometheus + Grafana 监控，以及基准测试与排障。
 
 - 机器：4x NVIDIA RTX PRO 5000 72GB Blackwell (sm_120)，双路 CPU，GPU 之间只有 PCIe
-  - GPU0/1 + CX7 (`rocep37s0f*`, `ens2f*`) 在 NUMA 0
-  - GPU2/3 + CX7 (`rocep241s0f*`, `ens16f*`) 在 NUMA 1
+    - GPU0/1 + CX7 (`rocep37s0f*`, `ens2f*`) 在 NUMA 0
+    - GPU2/3 + CX7 (`rocep241s0f*`, `ens16f*`) 在 NUMA 1
 - 模型：`nvidia/Qwen3.8-Flash-Next-NVFP4`（512 专家，NVFP4；MTP 层为 FP8）
 - 对外入口：`https://t.asteraix.com/v1`（OpenAI 兼容 API），`https://t.asteraix.com/telemetry/`（Grafana）
 
@@ -68,7 +68,7 @@ MAX_LEN=262144 MAX_SEQS=32 NUMA=1 NCCL_LL=1 MODEL=$M TP=4 SPEC=2 \
 ```
 
 | 设置 | 作用 |
-|---|---|
+| --- | --- |
 | `TP=4` | 4 卡张量并行（每卡 MoE intermediate 160，b12x 补齐到 192） |
 | `--moe-backend b12x` | sm_120 专用 NVFP4 MoE kernel，比默认 CUTLASS 快 12–15% |
 | `SPEC=2` | MTP 投机解码 2 个草稿 token；MTP 层的 FP8 MoE 自动选后端（`SPEC_MOE=auto`） |
@@ -278,7 +278,7 @@ done
 参考结果（TP4，random 1024/512，输出 tok/s，并发 1 / 8 / 16）：
 
 | 配置 | 吞吐 |
-|---|---|
+| --- | --- |
 | CUTLASS + MTP3 | 143 / 580 / 889 |
 | b12x + MTP2 | 145 / 721 / 1030 |
 | b12x + MTP2 + `NUMA=1 NCCL_LL=1`（当前） | ~193 / 770 / 1114 |
@@ -290,7 +290,7 @@ mt-bench 并发 1：186 tok/s，MTP 接受率 54.6%，接受长度 2.09。
 All-reduce 微基准（`~/ar.py`，TP4，µs）：
 
 | tokens | 默认 | `P2P_LEVEL=SYS` | SYS + LL 插件 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | 30.9 | 21.9 | 12.7 |
 | 24 | — | 25.8 | 16.6 |
 | 8192 | 2149 | 2112 | 2104 |
@@ -298,7 +298,7 @@ All-reduce 微基准（`~/ar.py`，TP4，µs）：
 ## 8. 已知问题与排障
 
 | 现象 | 原因 / 处理 |
-|---|---|
+| --- | --- |
 | `FLASHINFER_* requires FlashInfer's ... API` 但 FlashInfer 可以 import | 未装 `flashinfer-cubin` 且 `nvcc` 不在 PATH；按第 1 节安装 cubin |
 | `torchvision::nms does not exist` | `uv pip install -U` 升级了 torch；按第 1 节重新安装 |
 | b12x 在 TP4 下 NaN / illegal memory access | b12x < 1.5.0 不支持 intermediate 192；升级到 1.5.0 |

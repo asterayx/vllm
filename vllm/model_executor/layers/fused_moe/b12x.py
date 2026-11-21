@@ -25,9 +25,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
+    B12X_BLOCK_CODECS,
     B12xWarmupUnit,
     get_b12x_fused_moe,
     reuse_packed_weight_storage,
@@ -39,6 +40,7 @@ _B12X_MOE_MODES: dict[
     tuple[torch.dtype | str | None, torch.dtype | str | None],
     tuple[str, str, str],
 ] = {
+    **{(codec, None): ("w4a16", codec, "w31") for codec in B12X_BLOCK_CODECS},
     ("mxfp4", "mxfp8"): ("w4a8_mx", "fp4_e8m0_k32", "w31"),
     ("mxfp4", None): ("w4a16", "fp4_e8m0_k32", "w31"),
     ("nvfp4", "nvfp4"): ("nvfp4", "modelopt_nvfp4", "w31"),
@@ -174,9 +176,17 @@ def _replace_parameter_with_empty(
     parameter = getattr(layer, name, None)
     if not isinstance(parameter, torch.Tensor):
         return None
-    empty = torch.empty((0,), dtype=parameter.dtype, device=parameter.device)
-    replace_parameter(layer, name, empty)
-    return getattr(layer, name)
+    # The prepared experts may own this parameter object, so register a new
+    # empty one instead of emptying it in place.
+    empty = torch.nn.Parameter(
+        torch.empty((0,), dtype=parameter.dtype, device=parameter.device),
+        requires_grad=False,
+    )
+    weight_loader = getattr(parameter, "weight_loader", None)
+    if weight_loader is not None:
+        set_weight_attrs(empty, {"weight_loader": weight_loader})
+    setattr(layer, name, empty)
+    return empty
 
 
 def _normalize_expert_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -207,10 +217,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         quant_config: FusedMoEQuantConfig,
     ):
         super().__init__(moe_config, quant_config)
-        if quant_config.weight_quant_dtype not in ("mxfp4", "nvfp4"):
+        if quant_config.weight_quant_dtype not in (
+            "mxfp4",
+            "nvfp4",
+            *B12X_BLOCK_CODECS,
+        ):
             raise ValueError(
-                "b12x MoE requires MXFP4 or NVFP4 weights, got "
-                f"{quant_config.weight_quant_dtype}"
+                f"unsupported b12x MoE weight format: {quant_config.weight_quant_dtype}"
             )
         scheme = (
             quant_config.weight_quant_dtype,
@@ -229,7 +242,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._unit_scales: dict[torch.device, torch.Tensor] = {}
         self._plans: dict[tuple[int, int, MoEActivation, bool], Any] = {}
         self._apply_router_weight_on_input = False
-        # opt5 experiment: Triton NVFP4 decode MoE for M <= MAX_M. Default off -> b12x only.
+        # opt5 experiment: Triton NVFP4 decode MoE for M <= MAX_M. Default off -> b12x
+        # only.
         self._tri_enabled = os.environ.get("QWEN4_EXP_TRITON_MOE", "0") == "1"
         self._tri_max_m = int(os.environ.get("QWEN4_EXP_TRITON_MOE_MAX_M", "96"))
         self._tri: Any | None = None
@@ -299,6 +313,31 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             raise RuntimeError(
                 "b12x MoE weights must be prepared before CUDA graph capture"
             )
+        if self._source_format in B12X_BLOCK_CODECS:
+            fused_moe = _require_b12x_fused_moe()
+            block_size, _ = B12X_BLOCK_CODECS[self._source_format]
+            plan = fused_moe.plan_weights(
+                source=fused_moe.PackedSource(
+                    format=self._source_format, w13_layout=self._w13_layout
+                ),
+                activation=fused_moe.ActivationSpec(
+                    mode="a16",
+                    nonlinearity=_b12x_activation_name(activation),
+                    io_dtype=params_dtype,
+                ),
+                geometry=fused_moe.MoEGeometry(
+                    num_experts=w1.shape[0],
+                    hidden_size=w2.shape[1],
+                    intermediate_size=w2.shape[2] * block_size,
+                ),
+            )
+            prepared = fused_moe.prepare_weights(
+                plan=plan,
+                weights=fused_moe.BlockQuantWeights(
+                    w13=w1, w2=w2, codec=self._source_format
+                ),
+            )
+            return prepared._impl
         if self.w1_scale is None or self.w2_scale is None:
             raise ValueError("b12x MoE requires w1 and w2 block scales")
 
@@ -351,6 +390,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
 
     def _refresh_quant_config(self, layer: torch.nn.Module) -> None:
+        if self._source_format in B12X_BLOCK_CODECS:
+            return
         self.quant_config._w1.scale = layer.w13_weight_scale
         self.quant_config._w2.scale = layer.w2_weight_scale
         if self._source_format != "modelopt_nvfp4":
@@ -436,17 +477,23 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         if reason is not None:
             logger.warning("QWEN4_EXP_TRITON_MOE: disabled for this layer (%s)", reason)
         elif not B12xExperts._tri_logged:
+            assert self._tri is not None
             B12xExperts._tri_logged = True
             logger.info(
                 "QWEN4_EXP_TRITON_MOE=1: Triton NVFP4 decode MoE for M<=%d "
                 "(E=%d H=%d I=%d topk=%d), b12x above",
-                self._tri_max_m, self._tri.E, self._tri.H, self._tri.I, self._tri.topk,
+                self._tri_max_m,
+                self._tri.E,
+                self._tri.H,
+                self._tri.I,
+                self._tri.topk,
             )
 
-    def _tri_usable(self, M: int, topk: int, activation: MoEActivation,
-                    hidden_states: torch.Tensor) -> bool:
+    def _tri_usable(
+        self, M: int, topk: int, activation: MoEActivation, hidden_states: torch.Tensor
+    ) -> bool:
         tri = self._tri
-        if tri is None or M > self._tri_max_m or M <= 0:
+        if tri is None or self._tri_max_m < M or M <= 0:
             return False
         if topk != tri.topk or activation != MoEActivation.SILU:
             return False
@@ -457,8 +504,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         if not tri.has_scratch(M) and _is_current_stream_capturing():
             self._tri_capture_fallbacks += 1
             if self._tri_capture_fallbacks == 1:
-                logger.warning("QWEN4_EXP_TRITON_MOE: M=%d not warmed before capture; "
-                               "b12x used for it", M)
+                logger.warning(
+                    "QWEN4_EXP_TRITON_MOE: M=%d not warmed before capture; "
+                    "b12x used for it",
+                    M,
+                )
             return False
         return True
 
@@ -511,8 +561,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             ):
                 return (
                     False,
-                    "MXFP4 W4A8 requires hidden size divisible by 256 and "
-                    "per-rank intermediate size divisible by 32",
+                    (
+                        "MXFP4 W4A8 requires hidden size divisible by 256 and "
+                        "per-rank intermediate size divisible by 32"
+                    ),
                 )
         return mk.FusedMoEExperts.is_supported_config(
             cls, moe_config, weight_key, activation_key, activation_format
@@ -595,14 +647,15 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         w2: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> tuple[int, int, int, int, int]:
-        if w1.numel() and w2.numel():
+        if w1.numel() and w2.numel() and self._source_format not in B12X_BLOCK_CODECS:
             return super().moe_problem_size(a1, w1, w2, topk_ids)
         prepared = self._prepared()
         tokens = int(a1.shape[0] if a1.ndim == 2 else a1.shape[1])
         return (
             int(prepared.num_experts),
             tokens,
-            int(prepared.intermediate_size) * 2,
+            int(prepared.intermediate_size)
+            * (2 if self.moe_config.activation.is_gated else 1),
             int(a1.shape[-1]),
             int(topk_ids.shape[1]),
         )
@@ -760,7 +813,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             )
         if self._tri is not None:
             if not self._tri.flipped():
-                logger.warning("QWEN4_EXP_TRITON_MOE: w13 not flipped after b12x warmup")
+                logger.warning(
+                    "QWEN4_EXP_TRITON_MOE: w13 not flipped after b12x warmup"
+                )
             else:
                 warmed = self._tri.warmup(token_counts, dtype)
                 logger.info("QWEN4_EXP_TRITON_MOE: warmed Triton MoE for M=%s", warmed)
@@ -820,7 +875,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         topk_ids = _normalize_topk_ids(topk_ids)
         topk_weights = _normalize_topk_weights(topk_weights)
         if self._tri is not None and self._tri_usable(
-            int(hidden_states.shape[0]), int(topk_ids.shape[1]), activation, hidden_states
+            int(hidden_states.shape[0]),
+            int(topk_ids.shape[1]),
+            activation,
+            hidden_states,
         ):
             self._tri(hidden_states, topk_weights, topk_ids, output)
             return

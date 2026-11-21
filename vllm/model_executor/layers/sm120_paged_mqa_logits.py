@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SM120 Triton paged MQA logits for the fp8 indexer cache with block sizes
 DeepGEMM's sm120 kernel does not accept (DeepSeek-V4.1 ratio-1 layers: 128-row
 pages). Replaces the fp32 torch reference (dequant + einsum simt sgemm).

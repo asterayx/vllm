@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DPSK_FP8_SKINNY_LINEAR (try51): SM120 fp8 skinny GEMM for MXFP8 linears.
 
 On SM120 the MXFP8 linears (attn fused_wqa_wkv / wq_b / wo_b / indexer wq_b,
@@ -13,14 +14,14 @@ larger M (prefill) keeps the bf16 path untouched.
 
 import logging
 import os
-import re
+from functools import partial
 
+import regex as re
 import torch
-import triton
-import triton.language as tl
 from torch import nn
 
 from vllm.models.deepseek_v41.nvidia.ops.wo_a_fp8_skinny import repack_wo_a_fp8
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ EXCLUDE = os.environ.get("DPSK_FP8_SKINNY_LINEAR_EXCLUDE", r"(^|\.)wo_a$")
 # (N, K) -> max M where fp8 path is used (0 = never); filled at enable time.
 _DBG = os.environ.get("DPSK_FP8_SKINNY_LINEAR_DEBUG", "0") == "1"
 _DBG_SEEN: set = set()
-_SHAPE_MAXM: dict[tuple[int, int], int] = {}
+_SHAPE_MAXM: dict[tuple[int, int, int], int] = {}
 
 
 def _cfg(M: int, N: int, K: int):
@@ -275,17 +276,17 @@ def _time(fn, reps=20):
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
         fn()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         with torch.cuda.graph(g):
             fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     g.replay()
     e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
     e0.record()
     for _ in range(reps):
         g.replay()
     e1.record()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return e0.elapsed_time(e1) / reps
 
 
@@ -431,7 +432,7 @@ def enable_dpsk_fp8_skinny_linear(*roots: nn.Module | None) -> int:
                     )
                     continue
                 wb = w.data
-                rf = lambda xx, wb=wb: torch.nn.functional.linear(xx, wb)
+                rf = partial(torch.nn.functional.linear, weight=wb)
             else:
                 s2 = getattr(m, "_dpsk_scale_2d_u8", None)
                 if (
@@ -442,9 +443,7 @@ def enable_dpsk_fp8_skinny_linear(*roots: nn.Module | None) -> int:
                 ):
                     continue
                 r = (w.data, s2)
-                rf = lambda xx, w8=w.data, wsc=m.weight_scale.data: _fi_mxfp8_linear(
-                    xx, w8, wsc
-                )
+                rf = partial(_fi_mxfp8_linear, w8=w.data, wsc=m.weight_scale.data)
             key = (kind, N, K)
             cnt = new_splitk_counters(N, w.device)
             by_shape.setdefault(key, []).append((rf, r[0], r[1], cnt))
@@ -454,7 +453,7 @@ def enable_dpsk_fp8_skinny_linear(*roots: nn.Module | None) -> int:
     _agree_on_max_m_across_tp()
     n = 0
     extra = 0
-    for name, m, r, key, cnt in cands:
+    for _name, m, r, key, cnt in cands:
         if _SHAPE_MAXM.get(key, 0) > 0:
             m._fp8_skinny = (r[0], r[1], key[0], cnt)
             n += 1

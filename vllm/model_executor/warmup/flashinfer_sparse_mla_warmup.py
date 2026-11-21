@@ -2,23 +2,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Warmup and autotune helpers for FlashInfer sparse MLA backends."""
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
-    resolve_flashinfer_autotune_file,
-    save_flashinfer_autotune_cache_all_ranks,
+    resolve_flashinfer_autotune_v2_root,
+    resolve_rank_flashinfer_autotune_file,
+    use_flashinfer_autotune_v2,
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import autotune as flashinfer_autotune
 from vllm.utils.flashinfer import has_flashinfer
+from vllm.utils.math_utils import cdiv
+from vllm.v1.worker.extensible_kv_cache import ensure_kv_cache_blocks
 from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2GPUModelRunner
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
     from vllm.v1.worker.gpu_worker import Worker
 
 logger = init_logger(__name__)
@@ -30,6 +32,7 @@ _DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
         "ROCM_FLASHMLA_SPARSE_DSV4",
         "FLASHMLA_SPARSE_DSV41",
         "FLASHINFER_MLA_SPARSE_DSV41",
+        "ROCM_FLASHMLA_SPARSE_DSV41",
         "DEEPSEEK_SPARSE_SWA",
     }
 )
@@ -72,6 +75,9 @@ def autotune_hisparse_flashinfer_attention(runner: "GPUModelRunner") -> None:
         )
         if key in tuned:
             continue
+        hot_block_size = layer.hisparse_cache.runtime.hot.block_size
+        topk_tokens = impl.topk_indices_buffer.shape[1]
+        ensure_kv_cache_blocks(runner, cdiv(topk_tokens, hot_block_size))
         impl.autotune_hisparse_decode(layer)
         tuned.add(key)
 
@@ -111,11 +117,6 @@ def _clamp_warmup_tokens(num_tokens: int, max_tokens: int) -> int:
     return max(0, min(num_tokens, max_tokens))
 
 
-def _uses_v2_model_runner(runner: "GPUModelRunner") -> bool:
-    vllm_config = getattr(runner, "vllm_config", None)
-    return bool(getattr(vllm_config, "use_v2_model_runner", False))
-
-
 def _run_flashinfer_sparse_mla_decode_autotune(
     worker: "Worker",
     num_tokens: int,
@@ -144,15 +145,15 @@ def _run_flashinfer_sparse_mla_decode_autotune(
 
     world = get_world_group()
     is_leader = world.rank_in_group == 0
-    cache_path = resolve_flashinfer_autotune_file(runner)
 
-    dummy_run_kwargs = dict(
-        num_tokens=num_tokens,
-        skip_eplb=True,
-        is_profile=True,
-        force_attention=True,
-        create_mixed_batch=True,
-    )
+    dummy_run_kwargs = dict(num_tokens=num_tokens, skip_eplb=True, is_profile=True)
+
+    if use_flashinfer_autotune_v2(runner):
+        return _run_sparse_mla_decode_autotune_v2(
+            worker, num_tokens, log_label, dummy_run_kwargs
+        )
+
+    cache_path = resolve_rank_flashinfer_autotune_file(runner)
 
     if is_leader:
         logger.info(
@@ -161,18 +162,19 @@ def _run_flashinfer_sparse_mla_decode_autotune(
             cache_path,
         )
 
-    # Every rank tunes with per-tactic timings averaged over the CPU group,
-    # starting from an empty cache: a rank-local cache hit (some ops key
-    # entries by TP rank) would skip that profile's all-reduce and deadlock.
+    from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+
+    # All TP peers execute the same tuning collectives; PP stages tune separately.
+    tune_group = get_tp_group() if get_pp_group().world_size > 1 else world
     tuner = AutoTuner.get()
     tuner.clear_cache()
-    set_autotune_process_group(_pp_safe_autotune_group(world))
+    group = tune_group.cpu_group if tune_group.world_size > 1 else None
+    set_autotune_process_group(group)
     try:
         with torch.inference_mode():
-            if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:
-                v2_runner = cast("V2GPUModelRunner", runner)
+            if runner.max_num_reqs >= 2:
                 warmup_executed = run_mixed_prefill_decode_warmup(
-                    v2_runner,
+                    runner,
                     worker.execute_model,
                     worker.sample_tokens,
                     num_tokens,
@@ -185,19 +187,62 @@ def _run_flashinfer_sparse_mla_decode_autotune(
                 warmup_executed = True
     finally:
         set_autotune_process_group(None)
+    if not warmup_executed:
+        return False
+    # Rank-keyed tactics must survive independently for the next synchronized pass.
+    tuner.save_configs(str(cache_path))
+    world.barrier()
+    return True
+
+
+def _run_sparse_mla_decode_autotune_v2(
+    worker: "Worker",
+    num_tokens: int,
+    log_label: str,
+    dummy_run_kwargs: dict,
+) -> bool:
+    """Run every rank's sparse warmup in the managed autotune context.
+
+    FlashInfer owns persistence; some sparse kernels use a separate calibration
+    cache instead of managed winner entries.
+    """
+    from flashinfer import autotune_v2, autotune_v2_reload
+
+    from vllm.distributed.parallel_state import get_world_group
+
+    runner = worker.model_runner
+    world = get_world_group()
+    cache_root = resolve_flashinfer_autotune_v2_root()
+    if world.rank_in_group == 0:
+        logger.info(
+            "Autotuning FlashInfer SM120 sparse MLA %s decode with the managed "
+            "autotune context (root=%s)",
+            log_label,
+            cache_root if cache_root is not None else "flashinfer default",
+        )
+
+    with torch.inference_mode():
+        if runner.max_num_reqs >= 2:
+            warmup_executed = run_mixed_prefill_decode_warmup(
+                runner,
+                worker.execute_model,
+                worker.sample_tokens,
+                num_tokens,
+                mixed_step_context=autotune_v2(mode="tune", cache_root=cache_root),
+                req_id_prefix="_sparse_mla_v2_warmup",
+            )
+        else:
+            warmup_executed = True
+            with autotune_v2(mode="tune", cache_root=cache_root):
+                runner._dummy_run(**dummy_run_kwargs)
 
     if not warmup_executed:
         return False
 
-    save_flashinfer_autotune_cache_all_ranks(cache_path, world)
-    tuner.load_configs(str(cache_path))
-    logger.info(
-        "FlashInfer SM120 sparse MLA %s decode autotune cache loaded on rank %d "
-        "from %s.",
-        log_label,
-        world.rank_in_group,
-        cache_path,
-    )
+    if world.world_size > 1:
+        world.barrier()
+        autotune_v2_reload()
+        world.barrier()
     return True
 
 
@@ -249,35 +294,13 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     )
     mixed_warmup_done = _deepseek_v4_sparse_mla_decode_autotune(worker, mixed_tokens)
     if not mixed_warmup_done:
-        if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:
-            v2_runner = cast("V2GPUModelRunner", runner)
+        if runner.max_num_reqs >= 2:
             run_mixed_prefill_decode_warmup(
-                v2_runner,
+                runner,
                 worker.execute_model,
                 worker.sample_tokens,
                 mixed_tokens,
                 req_id_prefix="_sparse_mla_v2_warmup",
             )
         else:
-            runner._dummy_run(
-                num_tokens=mixed_tokens,
-                skip_eplb=True,
-                is_profile=True,
-                force_attention=True,
-                create_mixed_batch=True,
-            )
-
-
-def _pp_safe_autotune_group(world):
-    """Autotune all-reduce group that does not deadlock under PP.
-
-    With pipeline parallelism, stages run different layers (and PP1 blocks
-    on recv from PP0), so a world-group all-reduce deadlocks. Sync only
-    within the ranks of the same PP stage (TP group).
-    """
-    from vllm.distributed.parallel_state import get_pp_group, get_tp_group
-
-    if get_pp_group().world_size > 1:
-        tp = get_tp_group()
-        return tp.cpu_group if tp.world_size > 1 else None
-    return world.cpu_group if world.world_size > 1 else None
+            runner._dummy_run(num_tokens=mixed_tokens, skip_eplb=True, is_profile=True)
