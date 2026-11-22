@@ -78,6 +78,7 @@ class GateLinear(ReplicatedLinear):
     ):
         is_hopper = current_platform.is_device_capability((9, 0))
         is_blackwell = current_platform.is_device_capability_family(100)
+        is_sm120 = current_platform.is_device_capability_family(120)
         is_gfx950 = False
         if current_platform.is_rocm():
             from vllm.platforms.rocm import on_gfx950
@@ -116,6 +117,16 @@ class GateLinear(ReplicatedLinear):
         can_use_specialized_kernels &= self.is_unquantized
 
         self.allow_specialized_router_gemm = can_use_specialized_kernels
+        # The cuteDSL bf16 router GEMM needs only PDL and thread block clusters,
+        # which family 120 has. The other specialized tiers stay off there, so
+        # fp32 routers keep the fallback's fp32 weights.
+        self._allow_ll_bf16_arch = can_use_specialized_kernels or (
+            current_platform.is_cuda()
+            and is_sm120
+            and not bias
+            and not batch_invariant
+            and self.is_unquantized
+        )
 
         # fp32 specialized kernel eligibility (exact dims, fp32 weight)
         self.allow_fp32_router_gemm = (
@@ -196,27 +207,33 @@ class GateLinear(ReplicatedLinear):
         self.allow_ll_bf16_gemm = False
         self.allow_ll_fp32w_gemm = False
         if can_use_specialized_kernels:
-            from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
-                is_available as is_ll_bf16_gemm_available,
-            )
             from vllm.model_executor.kernels.linear.cute_dsl.ll_fp32w import (
                 is_available as is_ll_fp32w_gemm_available,
             )
 
-            self.allow_ll_bf16_gemm = (
-                is_ll_bf16_gemm_available()
-                and self.weight.dtype == torch.bfloat16
-                and self.out_dtype == torch.float32
-            )
             self.allow_ll_fp32w_gemm = (
                 is_ll_fp32w_gemm_available()
                 and self.weight.dtype == torch.float32
                 and self.out_dtype == torch.float32
             )
+        self._set_allow_ll_bf16_gemm(self.out_dtype)
 
         self._register_ll_fp32w_warmup()
         if self.allow_bf16x3_router_gemm and is_hopper:
             self._register_sm90_bf16x3_warmup()
+
+    def _set_allow_ll_bf16_gemm(self, out_dtype: torch.dtype | None) -> None:
+        if not self._allow_ll_bf16_arch:
+            return
+        from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+            is_available as is_ll_bf16_gemm_available,
+        )
+
+        self.allow_ll_bf16_gemm = (
+            is_ll_bf16_gemm_available()
+            and self.weight.dtype == torch.bfloat16
+            and out_dtype == torch.float32
+        )
 
     def _register_sm90_bf16x3_warmup(self) -> None:
         vllm_config = get_current_vllm_config_or_none()
@@ -274,24 +291,17 @@ class GateLinear(ReplicatedLinear):
         )
 
         if self.allow_specialized_router_gemm:
-            from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
-                is_available as is_ll_bf16_gemm_available,
-            )
             from vllm.model_executor.kernels.linear.cute_dsl.ll_fp32w import (
                 is_available as is_ll_fp32w_gemm_available,
             )
 
-            self.allow_ll_bf16_gemm = (
-                is_ll_bf16_gemm_available()
-                and self.weight.dtype == torch.bfloat16
-                and out_dtype == torch.float32
-            )
             self.allow_ll_fp32w_gemm = (
                 is_ll_fp32w_gemm_available()
                 and self.weight.dtype == torch.float32
                 and out_dtype == torch.float32
             )
             self._register_ll_fp32w_warmup()
+        self._set_allow_ll_bf16_gemm(out_dtype)
 
     def _return(
         self, output: torch.Tensor

@@ -381,7 +381,14 @@ def test_cudagraph_input_update():
 # =================================================================
 
 
-def _make_gate_linear(monkeypatch, *, params_dtype, out_dtype=torch.float32):
+def _make_gate_linear(
+    monkeypatch,
+    *,
+    params_dtype,
+    out_dtype=torch.float32,
+    input_size=2048,
+    output_size=64,
+):
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.get_tensor_model_parallel_rank",
         lambda: 0,
@@ -406,8 +413,8 @@ def _make_gate_linear(monkeypatch, *, params_dtype, out_dtype=torch.float32):
         lambda: True,
     )
     return GateLinear(
-        input_size=2048,
-        output_size=64,
+        input_size=input_size,
+        output_size=output_size,
         bias=False,
         out_dtype=out_dtype,
         params_dtype=params_dtype,
@@ -439,6 +446,22 @@ def test_gate_linear_uses_ll_bf16_for_bf16_fast_path(monkeypatch):
     assert len(calls) == 1
     assert calls[0][0] is x
     assert calls[0][1] is gate.weight
+
+
+@pytest.mark.parametrize("M", [1, 3, 16])
+def test_gate_linear_ll_bf16_matches_reference_for_qwen_router(monkeypatch, M):
+    """The fast path is taken on every SM90+ family and computes the router."""
+    gate = _make_gate_linear(
+        monkeypatch, params_dtype=torch.bfloat16, input_size=2560, output_size=512
+    )
+    assert gate.allow_ll_bf16_gemm
+    torch.manual_seed(M)
+    with torch.no_grad():
+        gate.weight.copy_(torch.randn_like(gate.weight))
+    x = torch.randn(M, 2560, dtype=torch.bfloat16, device="cuda")
+    out, _ = gate(x)
+    assert out.dtype == torch.float32
+    _assert_close(out, _ref(x, gate.weight), context=f"qwen router M={M}")
 
 
 def test_gate_linear_fp32_weight_falls_back(monkeypatch):
