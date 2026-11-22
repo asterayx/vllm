@@ -3,7 +3,6 @@
 """Custom Sparse Attention Indexer layers."""
 
 import math
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -538,7 +537,7 @@ def kv_cache_as_quant_view(
 # DPSK_INDEXER_SM120_FIX=1 uses the Triton kernel for SM120 pages DeepGEMM
 # cannot take. It stays opt-in until it has an on-box accuracy eval. The torch
 # reference used otherwise syncs the host and refuses CUDA graph capture.
-_DPSK_INDEXER_SM120_FIX = os.environ.get("DPSK_INDEXER_SM120_FIX", "0") == "1"
+_DPSK_INDEXER_SM120_FIX = envs.DPSK_INDEXER_SM120_FIX
 
 
 def _sm120_needs_ref_paged_logits(kv_cache: torch.Tensor, use_fp4_cache: bool) -> bool:

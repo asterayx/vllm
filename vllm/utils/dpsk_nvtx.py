@@ -9,14 +9,15 @@ a shared nullcontext and costs one flag check.
 """
 
 import functools
-import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any, TypeVar
 
 import torch
 
-DPSK_NVTX = os.environ.get("DPSK_NVTX", "0") == "1"
+import vllm.envs as envs
+
+DPSK_NVTX = envs.DPSK_NVTX
 _NULL = nullcontext()
 
 F = TypeVar("F", bound=Callable[..., Any])

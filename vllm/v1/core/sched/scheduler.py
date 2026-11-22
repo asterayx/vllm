@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -85,7 +85,7 @@ logger = init_logger(__name__)
 
 # DPSK_PP_MICROBATCH=1: cap decodes per step to ceil(n / pp_size) so each PP
 # stage gets a distinct request group in flight.
-_DPSK_PP_MICROBATCH = os.environ.get("DPSK_PP_MICROBATCH", "0") == "1"
+_DPSK_PP_MICROBATCH = envs.DPSK_PP_MICROBATCH
 
 
 class Scheduler(SchedulerInterface):

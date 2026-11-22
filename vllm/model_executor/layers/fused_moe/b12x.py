@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """b12x modular tensor-parallel fused MoE backend."""
 
-import os
 from collections.abc import Iterable
 from typing import Any
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -244,8 +244,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._apply_router_weight_on_input = False
         # opt5 experiment: Triton NVFP4 decode MoE for M <= MAX_M. Default off -> b12x
         # only.
-        self._tri_enabled = os.environ.get("QWEN4_EXP_TRITON_MOE", "0") == "1"
-        self._tri_max_m = int(os.environ.get("QWEN4_EXP_TRITON_MOE_MAX_M", "96"))
+        self._tri_enabled = envs.QWEN4_EXP_TRITON_MOE
+        self._tri_max_m = envs.QWEN4_EXP_TRITON_MOE_MAX_M
         self._tri: Any | None = None
         self._tri_capture_fallbacks = 0
 

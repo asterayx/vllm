@@ -569,11 +569,8 @@ def _qwen4_exp_triton_gemm(x: torch.Tensor, weight: torch.Tensor, cfg: tuple):
 
 
 def _triton_plans() -> dict[tuple[int, int], dict[int, tuple]]:
-    if _is_sm120() and not envs.VLLM_BATCH_INVARIANT:
-        import os
-
-        if os.environ.get("QWEN4_EXP_TRITON_GEMM", "1") == "1":
-            return QWEN4_EXP_SM120_TRITON_PLANS
+    if _is_sm120() and not envs.VLLM_BATCH_INVARIANT and envs.QWEN4_EXP_TRITON_GEMM:
+        return QWEN4_EXP_SM120_TRITON_PLANS
     return {}
 
 

@@ -18,11 +18,11 @@ Quantization numerics mirror b12x: QMODE 1 = micro kernel (M <= 8), QMODE 2 = dy
 kernel fast_math (M > 8).
 """
 
-import os
 from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 
@@ -401,8 +401,7 @@ class TritonNvfp4DecodeMoE:
                 f"unexpected swizzled scale sizes {tuple(self.s1.shape)} "
                 f"{tuple(self.s2.shape)}"
             )
-        env = os.environ.get("QWEN4_EXP_TRITON_MOE_DOWNBF16")
-        self.downbf16_override = None if env is None else int(env)
+        self.downbf16_override = envs.QWEN4_EXP_TRITON_MOE_DOWNBF16
         self.dev = self.w1.device
         self._flipped = False
 

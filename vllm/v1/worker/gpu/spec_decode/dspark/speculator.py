@@ -27,11 +27,11 @@ across TP ranks: each rank runs the Markov loop only for the requests it owns
 (the same owners as verification), see ``_sample_sequential_sharded``.
 """
 
-import os
 from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -52,7 +52,7 @@ logger = init_logger(__name__)
 
 # try45: vocab-shard-local greedy drafting (no full-vocab all-gather of draft
 # logits, Markov bias computed only on this rank's vocab shard).
-_DPSK_VOCAB_LOCAL_ARGMAX = os.environ.get("DPSK_VOCAB_LOCAL_ARGMAX", "0") == "1"
+_DPSK_VOCAB_LOCAL_ARGMAX = envs.DPSK_VOCAB_LOCAL_ARGMAX
 
 
 class DSparkSpeculator(DFlashSpeculator):

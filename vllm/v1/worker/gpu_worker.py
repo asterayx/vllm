@@ -138,7 +138,7 @@ logger = init_logger(__name__)
 
 # DPSK_PP_NO_AG=1: PP sends the full tensor per TP rank (no TP-sliced send +
 # all-gather).
-_DPSK_PP_NO_AG = os.environ.get("DPSK_PP_NO_AG", "0") == "1"
+_DPSK_PP_NO_AG = envs.DPSK_PP_NO_AG
 
 
 def _min_across_ranks(value: int) -> int:
@@ -219,8 +219,8 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
-_DPSK_PREP_AHEAD = os.environ.get("DPSK_PREP_AHEAD", "0") == "1"
-_DPSK_PP_META_CACHE = os.environ.get("DPSK_PP_META_CACHE", "0") == "1"
+_DPSK_PREP_AHEAD = envs.DPSK_PREP_AHEAD
+_DPSK_PP_META_CACHE = envs.DPSK_PP_META_CACHE
 
 
 def _dpsk_meta_key(so) -> tuple[int, ...] | None:

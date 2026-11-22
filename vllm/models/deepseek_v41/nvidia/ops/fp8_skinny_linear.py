@@ -13,25 +13,25 @@ larger M (prefill) keeps the bf16 path untouched.
 """
 
 import logging
-import os
 from functools import partial
 
 import regex as re
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.models.deepseek_v41.nvidia.ops.wo_a_fp8_skinny import repack_wo_a_fp8
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = logging.getLogger(__name__)
 
-MAX_M = int(os.environ.get("DPSK_FP8_SKINNY_LINEAR_MAX_M", "64"))
-INCLUDE = os.environ.get("DPSK_FP8_SKINNY_LINEAR_INCLUDE", "")
-EXCLUDE = os.environ.get("DPSK_FP8_SKINNY_LINEAR_EXCLUDE", r"(^|\.)wo_a$")
+MAX_M = envs.DPSK_FP8_SKINNY_LINEAR_MAX_M
+INCLUDE = envs.DPSK_FP8_SKINNY_LINEAR_INCLUDE
+EXCLUDE = envs.DPSK_FP8_SKINNY_LINEAR_EXCLUDE
 
 # (N, K) -> max M where fp8 path is used (0 = never); filled at enable time.
-_DBG = os.environ.get("DPSK_FP8_SKINNY_LINEAR_DEBUG", "0") == "1"
+_DBG = envs.DPSK_FP8_SKINNY_LINEAR_DEBUG
 _DBG_SEEN: set = set()
 _SHAPE_MAXM: dict[tuple[int, int, int], int] = {}
 
