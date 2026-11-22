@@ -82,7 +82,7 @@ PyTorch 2.14.0+cu130、FlashInfer 0.7.3、CUDA toolkit 13.5 下验证过；其�
 `qwen3_8_flash_next_rtx_pro_5000.sh` 默认不设这些，PCIe IPC 要用 `PCIE_IPC=1`。
 
 | 开关 | 状态 | 作用 |
-|---|---|---|
+| --- | --- | --- |
 | `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC` | 已测 | 小批量 all-reduce 走 FlashInfer PCIe IPC，不走 NCCL |
 | `VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS` | 已测（16） | 超过这个 token 数的 all-reduce 交给下一个后端 |
 | `QWEN4_EXP_TRITON_GEMM` | 默认开，已测 | SM120 上稠密投影用 Triton 解码 GEMM；`VLLM_BATCH_INVARIANT=1` 时不用 |
