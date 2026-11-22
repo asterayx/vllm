@@ -304,6 +304,14 @@ class _Scratch:
         self.sorted = torch.empty(self.max_pad, dtype=torch.int32, device=dev)
         self.eids = torch.empty(self.max_blocks, dtype=torch.int32, device=dev)
         self.npost = torch.empty(1, dtype=torch.int32, device=dev)
+        # Fixed layout with one pair per block: pair p in lane 0 of block p,
+        # the other lanes padded. With it the kernels take the expert of
+        # block p straight from topk_ids, and no alignment pass is needed.
+        self.direct_sorted = torch.full(
+            (npairs, BM), npairs, dtype=torch.int32, device=dev
+        )
+        self.direct_sorted[:, 0] = torch.arange(npairs, dtype=torch.int32, device=dev)
+        self.direct_npost = torch.full((1,), npairs * BM, dtype=torch.int32, device=dev)
         self.xq = torch.empty(M, H // 2, dtype=torch.uint8, device=dev)
         self.xs = torch.empty(M, H // 16, dtype=torch.float8_e4m3fn, device=dev)
         self.iq = torch.empty(
@@ -319,6 +327,8 @@ class _Scratch:
                 self.sorted,
                 self.eids,
                 self.npost,
+                self.direct_sorted,
+                self.direct_npost,
                 self.xq,
                 self.xs,
                 self.iq,
@@ -402,6 +412,7 @@ class TritonNvfp4DecodeMoE:
                 f"{tuple(self.s2.shape)}"
             )
         self.downbf16_override = envs.QWEN4_EXP_TRITON_MOE_DOWNBF16
+        self.direct_max_m = envs.QWEN4_EXP_TRITON_MOE_DIRECT_MAX_M
         self.dev = self.w1.device
         self._flipped = False
 
@@ -445,8 +456,23 @@ class TritonNvfp4DecodeMoE:
             else self.downbf16_override
         )
         npairs = M * self.topk
-        ops.moe_align_block_size(topk_ids, self.E, c["BM"], s.sorted, s.eids, s.npost)
-        nb = min(s.max_blocks, min(npairs, self.E) + npairs // c["BM"])
+        if self.direct_max_m >= M:
+            # Every block holds one pair, so each pair costs a full pass over
+            # its expert's weights. For one token that is what grouping gives
+            # too (top-k experts are distinct); for more tokens it reads an
+            # expert again for each token that picked it.
+            sorted_ids, eids, npost, nb = (
+                s.direct_sorted,
+                topk_ids,
+                s.direct_npost,
+                npairs,
+            )
+        else:
+            ops.moe_align_block_size(
+                topk_ids, self.E, c["BM"], s.sorted, s.eids, s.npost
+            )
+            sorted_ids, eids, npost = s.sorted, s.eids, s.npost
+            nb = min(s.max_blocks, min(npairs, self.E) + npairs // c["BM"])
         _xq_kernel[(M, self.H // c["XB"])](
             x, self.g1, s.xq, s.xs, self.H, BK=c["XB"], QMODE=qmode, num_warps=2
         )
@@ -457,9 +483,9 @@ class TritonNvfp4DecodeMoE:
             self.s1,
             self.a1,
             self.g2,
-            s.sorted,
-            s.eids,
-            s.npost,
+            sorted_ids,
+            eids,
+            npost,
             s.iq,
             s.isc,
             npairs,
@@ -482,9 +508,9 @@ class TritonNvfp4DecodeMoE:
             self.s2,
             self.a2,
             topk_w,
-            s.sorted,
-            s.eids,
-            s.npost,
+            sorted_ids,
+            eids,
+            npost,
             s.acc,
             npairs,
             self.topk,

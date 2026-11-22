@@ -88,6 +88,7 @@ PyTorch 2.14.0+cu130、FlashInfer 0.7.3、CUDA toolkit 13.5 下验证过；其�
 | `QWEN4_EXP_TRITON_GEMM` | 默认开，已测 | SM120 上稠密投影用 Triton 解码 GEMM；`VLLM_BATCH_INVARIANT=1` 时不用 |
 | `QWEN4_EXP_TRITON_MOE` | 已测 | 小 token 数的 NVFP4 专家用 Triton 实现，替代 b12x |
 | `QWEN4_EXP_TRITON_MOE_MAX_M` | 已测（96） | 上一项生效的最大 token 数 |
+| `QWEN4_EXP_TRITON_MOE_DIRECT_MAX_M` | 实验（1），待 GPU 验证 | 不超过这个 token 数时，每个（token，专家）对独占一个块，省掉按专家分组的那一趟；0 为始终分组 |
 | `QWEN4_EXP_TRITON_MOE_DOWNBF16` | 实验 | 强制开或关 bf16 下投影变体 |
 | `DPSK_NVTX` | 调试 | 主机侧 NVTX 区间，配合 nsys 使用 |
 

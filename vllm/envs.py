@@ -311,6 +311,7 @@ if TYPE_CHECKING:
     QWEN4_EXP_TRITON_GEMM: bool = True
     QWEN4_EXP_TRITON_MOE: bool = False
     QWEN4_EXP_TRITON_MOE_MAX_M: int = 96
+    QWEN4_EXP_TRITON_MOE_DIRECT_MAX_M: int = 1
     DPSK_FP8_SKINNY_LINEAR_INCLUDE: str = ""
     DPSK_FP8_SKINNY_LINEAR_EXCLUDE: str = r"(^|\.)wo_a$"
     QWEN4_EXP_TRITON_MOE_DOWNBF16: int | None = None
@@ -2176,6 +2177,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Largest token count routed to the Triton NVFP4 decode MoE.
     "QWEN4_EXP_TRITON_MOE_MAX_M": lambda: int(
         os.getenv("QWEN4_EXP_TRITON_MOE_MAX_M", "96")
+    ),
+    # Largest token count for which the Triton NVFP4 decode MoE gives each
+    # (token, expert) pair its own block instead of grouping pairs by expert.
+    # 0 always groups.
+    "QWEN4_EXP_TRITON_MOE_DIRECT_MAX_M": lambda: int(
+        os.getenv("QWEN4_EXP_TRITON_MOE_DIRECT_MAX_M", "1")
     ),
     # Regexes over module names selecting layers for the FP8 skinny linear
     # kernel. An empty include matches every layer.

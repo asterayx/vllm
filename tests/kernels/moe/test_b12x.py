@@ -1322,6 +1322,66 @@ def test_triton_nvfp4_moe_matches_b12x(
 
 
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
+@pytest.mark.parametrize("tokens", [1, 3, 4])
+@torch.inference_mode()
+def test_triton_nvfp4_moe_direct_layout_matches_grouped(
+    tokens: int, workspace_init, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    align_calls = 0
+    align = ops.moe_align_block_size
+
+    def counting_align(*args, **kwargs):
+        nonlocal align_calls
+        align_calls += 1
+        return align(*args, **kwargs)
+
+    monkeypatch.setattr(ops, "moe_align_block_size", counting_align)
+    monkeypatch.setenv("QWEN4_EXP_TRITON_MOE", "1")
+    monkeypatch.setenv("QWEN4_EXP_TRITON_MOE_MAX_M", "96")
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        outputs = []
+        calls = []
+        for direct_max_m in (0, tokens):
+            monkeypatch.setenv("QWEN4_EXP_TRITON_MOE_DIRECT_MAX_M", str(direct_max_m))
+            align_calls = 0
+            # 64 experts and top-10 make tokens share experts, the case where
+            # the two layouts put a pair in different blocks.
+            case = _make_b12x_moe_case(
+                "nvfp4",
+                "nvfp4",
+                tokens=tokens,
+                num_experts=64,
+                hidden_size=2560,
+                intermediate_size=160,
+                topk=10,
+            )
+            outputs.append(
+                _run_b12x_moe(
+                    case.hidden_states,
+                    case.w1,
+                    case.w2,
+                    case.score,
+                    case.topk,
+                    case.activation,
+                    case.quant_config,
+                    warmup=True,
+                ).float()
+            )
+            calls.append(align_calls)
+
+    grouped, direct = outputs
+    assert calls[0] > 0
+    assert calls[1] == 0
+    rel_l2 = (direct - grouped).norm(dim=1) / grouped.norm(dim=1)
+    # Each pair goes through the same arithmetic in both layouts. What can
+    # differ is the order of the FP32 atomic adds over a token's experts,
+    # then rounding to bf16.
+    assert rel_l2.max().item() < 1e-3
+
+
+@pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
 @pytest.mark.parametrize(
     "weight_dtype,activation_dtype",
     [
