@@ -14,15 +14,15 @@ w: [G*N, K] e4m3, s: [G*N, K//32] uint8 (E8M0)  ->  z: [M, G, N] bf16
 """
 
 import logging
-import os
 
 import torch
 
+import vllm.envs as envs
 from vllm.triton_utils import tl, triton
 
 logger = logging.getLogger(__name__)
 
-WO_A_FP8_MAX_M = int(os.environ.get("DPSK_WO_A_FP8_MAX_M", "64"))
+WO_A_FP8_MAX_M = envs.DPSK_WO_A_FP8_MAX_M
 
 
 @triton.jit

@@ -18,7 +18,6 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
-import os
 import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
@@ -205,14 +204,8 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
 
-# DPSK_VOCAB_LOCAL_ARGMAX=1: greedy target verify from a vocab-shard-local
-# argmax (see sample()). DPSK_VOCAB_LOCAL_ARGMAX_CHECK=N compares the first N
-# fast-path steps against the full-vocab argmax.
-_DPSK_VOCAB_LOCAL_ARGMAX = os.environ.get("DPSK_VOCAB_LOCAL_ARGMAX", "0") == "1"
-_DPSK_VOCAB_LOCAL_ARGMAX_CHECK = int(
-    os.environ.get("DPSK_VOCAB_LOCAL_ARGMAX_CHECK", "0")
-)
-_DPSK_PP1_FULL_CG = os.environ.get("DPSK_PP1_FULL_CG", "0") == "1"
+_DPSK_VOCAB_LOCAL_ARGMAX = envs.DPSK_VOCAB_LOCAL_ARGMAX
+_DPSK_PP1_FULL_CG = envs.DPSK_PP1_FULL_CG
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -298,7 +291,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.encoder_cache = EncoderCache()
         self.ec_connector = get_ec_connector(vllm_config, self.encoder_cache)
 
-        self._dpsk_local_argmax_checks_left = _DPSK_VOCAB_LOCAL_ARGMAX_CHECK
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
         use_dense_all_token_ids = (
@@ -448,28 +440,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     eplb_models_added = self.eplb.maybe_register_speculator(
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
-        if os.environ.get("DPSK_LMHEAD_SKINNY", "0") == "1":
-            from vllm.models.deepseek_v41.nvidia.lmhead_gemm import (
-                enable_dpsk_lmhead_skinny,
-            )
-
-            enable_dpsk_lmhead_skinny(
-                self.model, getattr(self.speculator, "model", None)
-            )
-        if os.environ.get("DPSK_WO_A_FP8_SKINNY", "0") == "1":
-            from vllm.models.deepseek_v41.nvidia.ops.wo_a_fp8_skinny import (
-                enable_dpsk_wo_a_fp8,
-            )
-
-            enable_dpsk_wo_a_fp8(self.model, getattr(self.speculator, "model", None))
-        if os.environ.get("DPSK_FP8_SKINNY_LINEAR", "0") == "1":
-            from vllm.models.deepseek_v41.nvidia.ops.fp8_skinny_linear import (
-                enable_dpsk_fp8_skinny_linear,
-            )
-
-            enable_dpsk_fp8_skinny_linear(
-                self.model, getattr(self.speculator, "model", None)
-            )
+        apply_decode_kernel_overrides = getattr(
+            self.model, "apply_decode_kernel_overrides", None
+        )
+        if apply_decode_kernel_overrides is not None:
+            apply_decode_kernel_overrides(getattr(self.speculator, "model", None))
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -1772,38 +1747,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             _DPSK_VOCAB_LOCAL_ARGMAX
             and self.batch_sharder is None
             and grammar_output is None
-            and input_batch.num_reqs > 0
-            and input_batch.num_draft_tokens > 0
             and self.rejection_sampler is not None
             and self.speculator is not None
-            and self.rejection_sampler.can_greedy_from_top_tokens(
-                input_batch, getattr(self.speculator, "draft_logits", None)
-            )
         ):
-            # Greedy verification from a vocab-shard-local argmax: only
-            # (max, idx) pairs are all-gathered instead of full-vocab logits.
-            m = getattr(self.model, "language_model", self.model)
-            sample_hidden_states = hidden_states[input_batch.logits_indices]
-            top_tokens = m.logits_processor.get_top_tokens(
-                m.lm_head, sample_hidden_states
+            sampler_output = self.rejection_sampler.greedy_from_local_argmax(
+                self.model,
+                hidden_states,
+                input_batch,
+                getattr(self.speculator, "draft_logits", None),
             )
-            if self._dpsk_local_argmax_checks_left > 0:
-                self._dpsk_local_argmax_checks_left -= 1
-                ref = self.model.compute_logits(sample_hidden_states).argmax(-1)
-                nbad = int((ref != top_tokens).sum())
-                logger.warning(
-                    "DPSK_VOCAB_LOCAL_ARGMAX check: rows=%d mismatches=%d",
-                    ref.numel(),
-                    nbad,
+            if sampler_output is not None:
+                return (
+                    sampler_output,
+                    sampler_output.num_sampled,
+                    sampler_output.num_rejected,
                 )
-            sampler_output = self.rejection_sampler.greedy_from_top_tokens(
-                top_tokens, input_batch
-            )
-            return (
-                sampler_output,
-                sampler_output.num_sampled,
-                sampler_output.num_rejected,
-            )
 
         shard_metadata = None
         global_input_batch = input_batch

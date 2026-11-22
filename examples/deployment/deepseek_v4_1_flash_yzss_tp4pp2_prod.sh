@@ -1,5 +1,12 @@
 #!/bin/bash
-# PRODUCTION (Ricardo approved 2026-11-11): Engram file-backed on NVMe by default.
+# Paths come from the environment so the script carries no host layout:
+#   VLLM_ROOT     vLLM checkout with its .venv   (default: $HOME/vllm)
+#   DPSK_CUDA_TK  CUDA toolkit with nvcc          (default: $HOME/cuda132_tk)
+#   DPSK_MODEL    checkpoint directory
+VLLM_ROOT=${VLLM_ROOT:-$HOME/vllm}
+DPSK_CUDA_TK=${DPSK_CUDA_TK:-$HOME/cuda132_tk}
+DPSK_MODEL=${DPSK_MODEL:-/data/models/nvidia/DeepSeek-V4.1-Flash-1017-NVFP4}
+# PRODUCTION (owner approved 2026-11-11): Engram file-backed on NVMe by default.
 # Identical to deepseek_v4_1_flash_yzss_tp4pp2_e1_prod.sh except this header and
 # --engram-config, which now comes from DPSK_ENGRAM_CONFIG:
 #   default (file-backed, NVMe): '{"cpu_offload": true, "storage_path": "/data/engram"}'
@@ -16,18 +23,18 @@ unset DSV41_EXP_CED_PREFILL DSV41_EXP_CED_PREFILL_ROWS
 # DeepSeek-V4.1-Flash-1017-NVFP4 on yzss, TP=4 x PP=2 (PP stage0=GPU0-3/NUMA0, stage1=GPU4-7/NUMA1)
 # Based on ~/vllm/examples/deployment/deepseek_v4_1_flash_rtx_pro_5000.sh (FP8 KV required on sm_120; Engram cpu_offload default)
 # no --numa-bind: both Engram layers (1,14) live on PP stage0 => ~200GB host tables > NUMA0 128GB
-cd /home/roccen/vllm
-export PYTHONPATH=/home/roccen/vllm${PYTHONPATH:+:$PYTHONPATH}
-export PATH=/home/roccen/vllm/.venv/bin:$PATH
+cd "$VLLM_ROOT" || exit 1
+export PYTHONPATH=$VLLM_ROOT${PYTHONPATH:+:$PYTHONPATH}
+export PATH=$VLLM_ROOT/.venv/bin:$PATH
 # RoCE ports (ens2f0np0/ens2f1np1) are link-down; single node -> keep NCCL off the IB/RoCE net plugin
 # iommu=pt set 2026-11-03: PCIe P2P verified (cudaMemcpyPeer PASS) -> P2P re-enabled
 # 23:52 DeepGEMM JIT needs nvcc; system /usr/local/cuda has no nvcc; venv nvcc 13.4 mismatches runtime headers 13.2 -> merged toolkit ~/cuda132_tk (venv cu13 symlinks + nvcc/crt/nvvm 13.2.86)
-export CUDA_HOME=/home/roccen/cuda132_tk PATH=/home/roccen/cuda132_tk/bin:$PATH
-export LIBRARY_PATH=/home/roccen/cuda132_tk/lib64:${LIBRARY_PATH:-}
-export LD_LIBRARY_PATH=/home/roccen/cuda132_tk/lib64:${LD_LIBRARY_PATH:-}
+export CUDA_HOME=$DPSK_CUDA_TK PATH=$DPSK_CUDA_TK/bin:$PATH
+export LIBRARY_PATH=$DPSK_CUDA_TK/lib64:${LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=$DPSK_CUDA_TK/lib64:${LD_LIBRARY_PATH:-}
 export NCCL_IB_DISABLE=1 PYTHONUNBUFFERED=1
 export NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT
-# 2026-11-11 #26 (Ricardo approved): TP rings over PCIe P2P instead of SHM. NCCL rates
+# 2026-11-11 #26 (owner approved): TP rings over PCIe P2P instead of SHM. NCCL rates
 # GPU0-3 / GPU4-7 paths PHB, so the default keeps them on SHM. PHB also moves the
 # cross-socket PP send/recv from P2P to SHM (measured with that). L-C1 TTFT -6.9%,
 # XL-C1 TTFT -7.1%, decode neutral, all-reduce 4 tok 18.7->12.1 us.
@@ -55,7 +62,7 @@ export DPSK_PP_MICROBATCH=${DPSK_PP_MICROBATCH:-1}
 export DPSK_MAX_NUM_SEQS=${DPSK_MAX_NUM_SEQS:-64}
 export VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS=${VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS:-128}
 # 2026-11-03 23:33: host Engram cpu_offload (2 tables x 94.4 GiB fp8 = ~189 GiB pinned on PP0) OOM-killed on this 247 GiB host ; GPU-resident tables OOM on TP4xPP2 (23:34) -> file-backed Engram tables on NVMe /data/engram (patched vLLM storage_path, no pin)
-exec /home/roccen/vllm/.venv/bin/python -m vllm.entrypoints.cli.main serve /data/models/nvidia/DeepSeek-V4.1-Flash-1017-NVFP4 \
+exec "$VLLM_ROOT/.venv/bin/python" -m vllm.entrypoints.cli.main serve "$DPSK_MODEL" \
   --served-model-name dpsk-v4.1-flash \
   --tensor-parallel-size 4 --pipeline-parallel-size 2 \
   --max-model-len 65536 --max-num-seqs "${DPSK_MAX_NUM_SEQS}" --gpu-memory-utilization 0.91 \

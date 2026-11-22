@@ -3,7 +3,6 @@
 """DeepseekV4 MLA Attention Layer"""
 
 import math
-import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from functools import cached_property
@@ -96,8 +95,8 @@ from vllm.v1.kv_cache_interface import (
 
 logger = init_logger(__name__)
 
-_DPSK_FP8_SKINNY_LINEAR = os.environ.get("DPSK_FP8_SKINNY_LINEAR", "0") == "1"
-_DPSK_FP8_SKINNY_QQ_UNFUSE = os.environ.get("DPSK_FP8_SKINNY_QQ_UNFUSE", "1") == "1"
+_DPSK_FP8_SKINNY_LINEAR = envs.DPSK_FP8_SKINNY_LINEAR
+_DPSK_FP8_SKINNY_QQ_UNFUSE = envs.DPSK_FP8_SKINNY_QQ_UNFUSE
 # From this many tokens, a layer with shard_fused_wqa_wkv set projects one token
 # shard per TP rank and all-gathers the result.
 _SHARD_FUSED_WQA_WKV_MIN_TOKENS = 2048

@@ -5,9 +5,12 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch import nn
 
+import vllm.envs as envs
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
@@ -31,6 +34,9 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
 # its traffic entirely.
 MAX_CHUNK_BYTES = 2**30  # 1GB
 _FP32_BYTES = 4
+
+
+logger = init_logger(__name__)
 
 
 def unconditional_to_conditional_rates(rates: list[float]) -> list[float]:
@@ -196,6 +202,7 @@ class RejectionSampler:
     ):
         self.sampler = sampler
         self.watermark_key = watermark_key
+        self._local_argmax_checks_left = envs.DPSK_VOCAB_LOCAL_ARGMAX_CHECK
         if watermark_key is not None:
             assert isinstance(sampler, GPUWatermarkSampler)
         self.num_speculative_steps = spec_config.num_speculative_tokens
@@ -482,6 +489,40 @@ class RejectionSampler:
         if self.sampler.get_logprobs_dims(idx_np) is not None:
             return False
         return bool(np.all(states.temperature.np[idx_np] == 0.0))
+
+    def greedy_from_local_argmax(
+        self,
+        model: nn.Module,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        draft_logits: torch.Tensor | None,
+    ) -> SamplerOutput | None:
+        """Greedy verification from a vocab-shard-local argmax.
+
+        Each TP rank takes the argmax of its own vocabulary shard and only the
+        `(max, idx)` pairs are gathered, instead of full-vocab logits. Returns
+        None when the batch needs the full distribution.
+        """
+        if (
+            input_batch.num_reqs == 0
+            or input_batch.num_draft_tokens == 0
+            or not self.can_greedy_from_top_tokens(input_batch, draft_logits)
+        ):
+            return None
+        language_model = getattr(model, "language_model", model)
+        sample_hidden_states = hidden_states[input_batch.logits_indices]
+        top_tokens = language_model.logits_processor.get_top_tokens(
+            language_model.lm_head, sample_hidden_states
+        )
+        if self._local_argmax_checks_left > 0:
+            self._local_argmax_checks_left -= 1
+            ref = model.compute_logits(sample_hidden_states).argmax(-1)
+            logger.warning(
+                "DPSK_VOCAB_LOCAL_ARGMAX check: rows=%d mismatches=%d",
+                ref.numel(),
+                int((ref != top_tokens).sum()),
+            )
+        return self.greedy_from_top_tokens(top_tokens, input_batch)
 
     def greedy_from_top_tokens(
         self, top_tokens: torch.Tensor, input_batch: InputBatch

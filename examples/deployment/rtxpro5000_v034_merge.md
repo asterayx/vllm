@@ -42,8 +42,8 @@ The GLM parser still ignores thinking switches absent from the actual template.
 ## Validation on xzss
 
 The source and environment are isolated in
-`/home/roccen/vllm-integration-v0.34.0`.
-The existing `/home/roccen/vllm` checkout and serving environment were not updated.
+`~/vllm-integration-v0.34.0`.
+The existing `~/vllm` checkout and serving environment were not updated.
 
 Python 3.12, the official v0.34.0 precompiled extensions, PyTorch 2.14.0 and
 FlashInfer 0.7.3 were installed in the integration checkout's own `.venv`.
@@ -80,7 +80,7 @@ environment sets `CUDA_HOME=/usr/local/cuda-13.5` and
 `FLASHINFER_NVCC=/usr/local/cuda-13.5/bin/nvcc`.
 
 The exact commands, logs and the small-model comparison script/results are
-retained on xzss under `/home/roccen/vllm-v034-validation`.
+retained on xzss under `~/vllm-v034-validation`.
 Large-model serving, multi-GPU throughput, and all opt-in optimization
 combinations still require dedicated acceptance testing before deployment.
 

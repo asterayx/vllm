@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     as_quantized_activation,
@@ -81,7 +81,7 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         scale_k = K // MXFP8_BLOCK_SIZE
         weight_scale_2d = layer.weight_scale.data[:N, :scale_k].contiguous()
         weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
-        if os.environ.get("DPSK_FP8_SKINNY_LINEAR", "0") == "1":  # try51
+        if envs.DPSK_FP8_SKINNY_LINEAR:  # try51
             layer._dpsk_scale_2d_u8 = (
                 weight_scale_2d.view(torch.uint8)
                 if weight_scale_2d.dtype != torch.uint8

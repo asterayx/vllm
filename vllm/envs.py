@@ -291,6 +291,29 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC: bool = False
     VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS: int = 0
     VLLM_EMIT_REASONING_CONTENT: bool = False
+    DPSK_NVTX: bool = False
+    DPSK_PP_MICROBATCH: bool = False
+    DPSK_PP_NO_AG: bool = False
+    DPSK_PREP_AHEAD: bool = False
+    DPSK_PP_META_CACHE: bool = False
+    DPSK_PP1_FULL_CG: bool = False
+    DPSK_DRAFT_FULL_CG: bool = False
+    DPSK_VOCAB_LOCAL_ARGMAX: bool = False
+    DPSK_VOCAB_LOCAL_ARGMAX_CHECK: int = 0
+    DPSK_LMHEAD_SKINNY: bool = False
+    DPSK_WO_A_FP8_SKINNY: bool = False
+    DPSK_WO_A_FP8_MAX_M: int = 64
+    DPSK_FP8_SKINNY_LINEAR: bool = False
+    DPSK_FP8_SKINNY_LINEAR_MAX_M: int = 64
+    DPSK_FP8_SKINNY_QQ_UNFUSE: bool = True
+    DPSK_FP8_SKINNY_LINEAR_DEBUG: bool = False
+    DPSK_INDEXER_SM120_FIX: bool = False
+    QWEN4_EXP_TRITON_GEMM: bool = True
+    QWEN4_EXP_TRITON_MOE: bool = False
+    QWEN4_EXP_TRITON_MOE_MAX_M: int = 96
+    DPSK_FP8_SKINNY_LINEAR_INCLUDE: str = ""
+    DPSK_FP8_SKINNY_LINEAR_EXCLUDE: str = r"(^|\.)wo_a$"
+    QWEN4_EXP_TRITON_MOE_DOWNBF16: int | None = None
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -2089,6 +2112,84 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EMIT_REASONING_CONTENT": lambda: bool(
         int(os.getenv("VLLM_EMIT_REASONING_CONTENT", "0"))
     ),
+    # Opt-in switches of the RTX PRO 5000 (SM120, PCIe-only) serve paths.
+    # A switch is on only when set to exactly 1.
+    # Emit host-side NVTX ranges around input prep, PP send/recv, eager
+    # CUDA-graph breaks, sampling and drafting, for nsys attribution.
+    "DPSK_NVTX": lambda: os.getenv("DPSK_NVTX", "0") == "1",
+    # Pipeline parallel: cap decodes per step to ceil(n / pp_size) so each
+    # stage has a distinct request group in flight.
+    "DPSK_PP_MICROBATCH": lambda: os.getenv("DPSK_PP_MICROBATCH", "0") == "1",
+    # Pipeline parallel: send the full tensor per TP rank instead of a
+    # TP-sliced send plus all-gather.
+    "DPSK_PP_NO_AG": lambda: os.getenv("DPSK_PP_NO_AG", "0") == "1",
+    # Pipeline parallel: receive intermediate tensors on a helper thread
+    # so input preparation overlaps the wait for the previous stage.
+    "DPSK_PREP_AHEAD": lambda: os.getenv("DPSK_PREP_AHEAD", "0") == "1",
+    # Pipeline parallel: cache tensor-dict metadata by scheduler shape
+    # instead of sending it every step.
+    "DPSK_PP_META_CACHE": lambda: os.getenv("DPSK_PP_META_CACHE", "0") == "1",
+    # Pipeline parallel: let the last stage use FULL CUDA graphs for
+    # uniform decode when its attention backends support them.
+    "DPSK_PP1_FULL_CG": lambda: os.getenv("DPSK_PP1_FULL_CG", "0") == "1",
+    # Force FULL_DECODE_ONLY CUDA graphs for the draft model while the
+    # target stays PIECEWISE.
+    "DPSK_DRAFT_FULL_CG": lambda: os.getenv("DPSK_DRAFT_FULL_CG", "0") == "1",
+    # Greedy speculative verification and drafting from a vocab-shard
+    # local argmax, gathering (max, idx) pairs instead of full logits.
+    "DPSK_VOCAB_LOCAL_ARGMAX": lambda: os.getenv("DPSK_VOCAB_LOCAL_ARGMAX", "0") == "1",
+    # Compare the first N local-argmax verification steps against the
+    # full-vocab argmax and log mismatches. Debug only: it syncs.
+    "DPSK_VOCAB_LOCAL_ARGMAX_CHECK": lambda: int(
+        os.getenv("DPSK_VOCAB_LOCAL_ARGMAX_CHECK", "0")
+    ),
+    # DeepSeek-V4.1: skinny-GEMM LM head for small decode batches.
+    "DPSK_LMHEAD_SKINNY": lambda: os.getenv("DPSK_LMHEAD_SKINNY", "0") == "1",
+    # DeepSeek-V4.1: FP8 skinny kernel for the grouped wo_a projection.
+    "DPSK_WO_A_FP8_SKINNY": lambda: os.getenv("DPSK_WO_A_FP8_SKINNY", "0") == "1",
+    # Largest token count routed to the wo_a FP8 skinny kernel.
+    "DPSK_WO_A_FP8_MAX_M": lambda: int(os.getenv("DPSK_WO_A_FP8_MAX_M", "64")),
+    # DeepSeek-V4.1: FP8 skinny kernel for MXFP8 linear layers at small
+    # decode batches.
+    "DPSK_FP8_SKINNY_LINEAR": lambda: os.getenv("DPSK_FP8_SKINNY_LINEAR", "0") == "1",
+    # Largest token count routed to the FP8 skinny linear kernel.
+    "DPSK_FP8_SKINNY_LINEAR_MAX_M": lambda: int(
+        os.getenv("DPSK_FP8_SKINNY_LINEAR_MAX_M", "64")
+    ),
+    # DeepSeek-V4.1: keep the query projections unfused when the FP8
+    # skinny linear kernel is on.
+    "DPSK_FP8_SKINNY_QQ_UNFUSE": lambda: (
+        os.getenv("DPSK_FP8_SKINNY_QQ_UNFUSE", "1") == "1"
+    ),
+    # Log per-layer selection of the FP8 skinny linear kernel.
+    "DPSK_FP8_SKINNY_LINEAR_DEBUG": lambda: (
+        os.getenv("DPSK_FP8_SKINNY_LINEAR_DEBUG", "0") == "1"
+    ),
+    # Sparse attention indexer: SM120 paged MQA logits path.
+    "DPSK_INDEXER_SM120_FIX": lambda: os.getenv("DPSK_INDEXER_SM120_FIX", "0") == "1",
+    # Qwen4Exp on SM120: Triton decode GEMM plans for the dense
+    # projections.
+    "QWEN4_EXP_TRITON_GEMM": lambda: os.getenv("QWEN4_EXP_TRITON_GEMM", "1") == "1",
+    # Qwen4Exp: Triton NVFP4 decode MoE for small token counts instead
+    # of the b12x path.
+    "QWEN4_EXP_TRITON_MOE": lambda: os.getenv("QWEN4_EXP_TRITON_MOE", "0") == "1",
+    # Largest token count routed to the Triton NVFP4 decode MoE.
+    "QWEN4_EXP_TRITON_MOE_MAX_M": lambda: int(
+        os.getenv("QWEN4_EXP_TRITON_MOE_MAX_M", "96")
+    ),
+    # Regexes over module names selecting layers for the FP8 skinny linear
+    # kernel. An empty include matches every layer.
+    "DPSK_FP8_SKINNY_LINEAR_INCLUDE": lambda: os.getenv(
+        "DPSK_FP8_SKINNY_LINEAR_INCLUDE", ""
+    ),
+    "DPSK_FP8_SKINNY_LINEAR_EXCLUDE": lambda: os.getenv(
+        "DPSK_FP8_SKINNY_LINEAR_EXCLUDE", r"(^|\.)wo_a$"
+    ),
+    # Qwen4Exp Triton MoE: force the bf16 down-projection variant on (1) or
+    # off (0). Unset selects it by token count.
+    "QWEN4_EXP_TRITON_MOE_DOWNBF16": lambda: maybe_convert_int(
+        os.getenv("QWEN4_EXP_TRITON_MOE_DOWNBF16")
+    ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
@@ -2597,6 +2698,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SKIP_VERSION_SUFFIX",
         "FORCE_COLOR",
         "VLLM_REQUEST_BODY_LOG_LEVEL",
+        "DPSK_NVTX",
+        "DPSK_VOCAB_LOCAL_ARGMAX_CHECK",
+        "DPSK_FP8_SKINNY_LINEAR_DEBUG",
     }
 
     from vllm.config.utils import normalize_value

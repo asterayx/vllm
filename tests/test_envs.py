@@ -48,6 +48,24 @@ def test_api_key_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
     assert "VLLM_API_KEY" not in envs.compile_factors()
 
 
+def test_rtxpro5000_switches_are_compile_factors(monkeypatch: pytest.MonkeyPatch):
+    """Kernel-selecting switches must change the cache key; debug ones must not."""
+    monkeypatch.delenv("QWEN4_EXP_TRITON_MOE", raising=False)
+    monkeypatch.setenv("DPSK_NVTX", "1")
+    monkeypatch.setenv("DPSK_VOCAB_LOCAL_ARGMAX_CHECK", "3")
+    off = envs.compile_factors()
+    assert off["QWEN4_EXP_TRITON_MOE"] is False
+    assert off["QWEN4_EXP_TRITON_GEMM"] is True
+    assert "DPSK_NVTX" not in off
+    assert "DPSK_VOCAB_LOCAL_ARGMAX_CHECK" not in off
+
+    # A switch is on only for exactly "1", as before it was registered.
+    monkeypatch.setenv("QWEN4_EXP_TRITON_MOE", "true")
+    assert envs.compile_factors()["QWEN4_EXP_TRITON_MOE"] is False
+    monkeypatch.setenv("QWEN4_EXP_TRITON_MOE", "1")
+    assert envs.compile_factors()["QWEN4_EXP_TRITON_MOE"] is True
+
+
 def test_ray_bundle_indices_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
     # Engines sharing a placement group get different bundle indices but
     # compile the same graphs, so they must share a cache key.

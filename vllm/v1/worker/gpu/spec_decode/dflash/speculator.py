@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
-import os
 from typing import Any
 
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -142,7 +142,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         # DPSK opt 2026-11-04: allow FULL_DECODE_ONLY draft graphs while the
         # target stays PIECEWISE (draft was launch-bound, ~193 eager kernels).
-        if os.environ.get("DPSK_DRAFT_FULL_CG") == "1":
+        if envs.DPSK_DRAFT_FULL_CG:
             logger.info("DPSK_DRAFT_FULL_CG=1: forcing FULL_DECODE_ONLY draft graphs")
             wants_full = True
         supports_full = (

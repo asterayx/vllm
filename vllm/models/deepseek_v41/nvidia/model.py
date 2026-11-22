@@ -1707,6 +1707,26 @@ class DeepseekV41LLMForCausalLM(
     ) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
+    def apply_decode_kernel_overrides(self, draft_model: nn.Module | None) -> None:
+        """Swap in the opt-in small-batch decode kernels after weights load.
+
+        Called by the model runner once the target and draft models are
+        loaded, so each override can compile and check itself before CUDA
+        graph capture.
+        """
+        if envs.DPSK_LMHEAD_SKINNY:
+            from .lmhead_gemm import enable_dpsk_lmhead_skinny
+
+            enable_dpsk_lmhead_skinny(self, draft_model)
+        if envs.DPSK_WO_A_FP8_SKINNY:
+            from .ops.wo_a_fp8_skinny import enable_dpsk_wo_a_fp8
+
+            enable_dpsk_wo_a_fp8(self, draft_model)
+        if envs.DPSK_FP8_SKINNY_LINEAR:
+            from .ops.fp8_skinny_linear import enable_dpsk_fp8_skinny_linear
+
+            enable_dpsk_fp8_skinny_linear(self, draft_model)
+
     def build_specialized_decode(self) -> "SpecializedDecode":
         from .specialized_decode.logits.logits import SpecializedDecodeLogitsProcessor
         from .specialized_decode.runtime.decode import SpecializedDecode
