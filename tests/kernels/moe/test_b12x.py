@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.b12x as b12x
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 import vllm.model_executor.layers.fused_moe.oracle.mxfp4 as mxfp4_oracle
@@ -173,6 +174,8 @@ def _make_b12x_moe_kernel(
     topk: int,
     activation: MoEActivation,
     quant_config: FusedMoEQuantConfig,
+    *,
+    warmup: bool = False,
 ) -> mk.FusedMoEKernel:
     num_experts = w1.shape[0]
     moe_config = make_dummy_moe_config(
@@ -191,14 +194,13 @@ def _make_b12x_moe_kernel(
         activation=activation,
     )
     experts = B12xExperts(moe_config, quant_config)
-    layer = SimpleNamespace(
-        activation=activation,
-        apply_router_weight_on_input=False,
-        w13_weight=w1,
-        w2_weight=w2,
-        w13_weight_scale=quant_config.w1_scale,
-        w2_weight_scale=quant_config.w2_scale,
-    )
+    layer = torch.nn.Module()
+    layer.activation = activation
+    layer.apply_router_weight_on_input = False
+    layer.w13_weight = w1
+    layer.w2_weight = w2
+    layer.w13_weight_scale = quant_config.w1_scale
+    layer.w2_weight_scale = quant_config.w2_scale
     if quant_config.weight_quant_dtype == "nvfp4":
         layer.w13_weight_scale_2 = quant_config.g1_alphas
         layer.w2_weight_scale_2 = quant_config.g2_alphas
@@ -208,6 +210,8 @@ def _make_b12x_moe_kernel(
             layer.w13_input_scale = 1.0 / quant_config.a1_gscale
             layer.w2_input_scale = 1.0 / quant_config.a2_gscale
     experts.process_weights_after_loading(layer)
+    if warmup:
+        experts.warmup_launches(layer, token_counts=[hidden_states.shape[0]])
     return mk.FusedMoEKernel(
         maybe_make_prepare_finalize(
             moe=moe_config,
@@ -227,6 +231,8 @@ def _run_b12x_moe(
     topk: int,
     activation: MoEActivation,
     quant_config: FusedMoEQuantConfig,
+    *,
+    warmup: bool = False,
 ) -> torch.Tensor:
     num_experts = w1.shape[0]
     kernel = _make_b12x_moe_kernel(
@@ -236,6 +242,7 @@ def _run_b12x_moe(
         topk,
         activation,
         quant_config,
+        warmup=warmup,
     )
     topk_weights, topk_ids, _ = fused_topk(
         hidden_states, score, topk, renormalize=False
@@ -1258,6 +1265,7 @@ def test_b12x_nvfp4_moe_small_batch_unaligned_intermediate(
             case.topk,
             case.activation,
             case.quant_config,
+            warmup=envs.QWEN4_EXP_TRITON_MOE,
         )
         torch.accelerator.synchronize()
 
@@ -1265,6 +1273,52 @@ def test_b12x_nvfp4_moe_small_batch_unaligned_intermediate(
         output.flatten().float(), reference.flatten().float(), dim=0
     )
     assert cosine > 0.99
+
+
+@pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
+@pytest.mark.parametrize("tokens", [3, 9, 16])
+@pytest.mark.parametrize("downbf16", [0, 1])
+@torch.inference_mode()
+def test_triton_nvfp4_moe_matches_b12x(
+    tokens: int, downbf16: int, workspace_init, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        outputs = []
+        for use_triton in (False, True):
+            monkeypatch.setenv("QWEN4_EXP_TRITON_MOE", str(int(use_triton)))
+            monkeypatch.setenv("QWEN4_EXP_TRITON_MOE_MAX_M", "96")
+            monkeypatch.setenv("QWEN4_EXP_TRITON_MOE_DOWNBF16", str(downbf16))
+            # Preparation can rewrite packed storage. Recreate the same seeded
+            # inputs and weights for each backend.
+            case = _make_b12x_moe_case(
+                "nvfp4",
+                "nvfp4",
+                tokens=tokens,
+                num_experts=64,
+                hidden_size=2560,
+                intermediate_size=160,
+                topk=10,
+            )
+            outputs.append(
+                _run_b12x_moe(
+                    case.hidden_states,
+                    case.w1,
+                    case.w2,
+                    case.score,
+                    case.topk,
+                    case.activation,
+                    case.quant_config,
+                    warmup=use_triton,
+                ).float()
+            )
+
+    reference, triton = outputs
+    rel_l2 = (triton - reference).norm(dim=1) / reference.norm(dim=1)
+    # On SM120 the six cases peaked at 0.00715 per token. Allow 0.008 for
+    # different FP4 quantization and FP32 accumulation/rounding in the two paths.
+    assert rel_l2.max().item() < 0.008
 
 
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
