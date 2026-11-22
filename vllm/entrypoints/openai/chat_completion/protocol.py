@@ -18,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+import vllm.envs as envs
 from vllm.config import ModelConfig
 from vllm.entrypoints.generate.base.protocol import (
     AnyResponseFormat,
@@ -92,6 +93,8 @@ class ChatMessage(OpenAIBaseModel):
         data = handler(self)
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
+        if envs.VLLM_EMIT_REASONING_CONTENT and data.get("reasoning") is not None:
+            data["reasoning_content"] = data["reasoning"]
         return data
 
 

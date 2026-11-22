@@ -261,6 +261,14 @@ class ECConnectorOutput:
         )
 
 
+@dataclass
+class DraftTokenIds:
+    # [num_reqs]
+    req_ids: list[str]
+    # num_reqs x num_draft_tokens
+    draft_token_ids: list[list[int]]
+
+
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
@@ -307,6 +315,11 @@ class ModelRunnerOutput:
 
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
+
+    # Speculative drafts copied to CPU for this step. The scheduler persists
+    # them in ``update_from_output`` so grammar bitmasks can overlay real
+    # drafts onto -1 placeholders without a blocking take_draft_token_ids RPC.
+    draft_token_ids: DraftTokenIds | None = None
 
     @staticmethod
     def with_kv_conn_output_only(
@@ -368,14 +381,6 @@ class AsyncModelRunnerOutput(ABC):
         output instead of losing it with the failure.
         """
         pass
-
-
-@dataclass
-class DraftTokenIds:
-    # [num_reqs]
-    req_ids: list[str]
-    # num_reqs x num_draft_tokens
-    draft_token_ids: list[list[int]]
 
 
 def make_empty_encoder_model_runner_output(

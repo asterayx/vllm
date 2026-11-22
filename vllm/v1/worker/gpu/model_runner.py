@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
@@ -70,9 +71,11 @@ from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
+from vllm.utils.dpsk_nvtx import dpsk_nvtx
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.conf_compute_utils import install as install_conf_compute_copy_patches
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -202,6 +205,15 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
 
+# DPSK_VOCAB_LOCAL_ARGMAX=1: greedy target verify from a vocab-shard-local
+# argmax (see sample()). DPSK_VOCAB_LOCAL_ARGMAX_CHECK=N compares the first N
+# fast-path steps against the full-vocab argmax.
+_DPSK_VOCAB_LOCAL_ARGMAX = os.environ.get("DPSK_VOCAB_LOCAL_ARGMAX", "0") == "1"
+_DPSK_VOCAB_LOCAL_ARGMAX_CHECK = int(
+    os.environ.get("DPSK_VOCAB_LOCAL_ARGMAX_CHECK", "0")
+)
+_DPSK_PP1_FULL_CG = os.environ.get("DPSK_PP1_FULL_CG", "0") == "1"
+
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -286,6 +298,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.encoder_cache = EncoderCache()
         self.ec_connector = get_ec_connector(vllm_config, self.encoder_cache)
 
+        self._dpsk_local_argmax_checks_left = _DPSK_VOCAB_LOCAL_ARGMAX_CHECK
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
         use_dense_all_token_ids = (
@@ -435,6 +448,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     eplb_models_added = self.eplb.maybe_register_speculator(
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
+        if os.environ.get("DPSK_LMHEAD_SKINNY", "0") == "1":
+            from vllm.models.deepseek_v41.nvidia.lmhead_gemm import (
+                enable_dpsk_lmhead_skinny,
+            )
+
+            enable_dpsk_lmhead_skinny(
+                self.model, getattr(self.speculator, "model", None)
+            )
+        if os.environ.get("DPSK_WO_A_FP8_SKINNY", "0") == "1":
+            from vllm.models.deepseek_v41.nvidia.ops.wo_a_fp8_skinny import (
+                enable_dpsk_wo_a_fp8,
+            )
+
+            enable_dpsk_wo_a_fp8(self.model, getattr(self.speculator, "model", None))
+        if os.environ.get("DPSK_FP8_SKINNY_LINEAR", "0") == "1":
+            from vllm.models.deepseek_v41.nvidia.ops.fp8_skinny_linear import (
+                enable_dpsk_fp8_skinny_linear,
+            )
+
+            enable_dpsk_fp8_skinny_linear(
+                self.model, getattr(self.speculator, "model", None)
+            )
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -798,6 +833,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_profiling=is_profiling,
             piecewise_capture_available=piecewise_capture_available,
         )
+        # DPSK_PP1_FULL_CG=1: the last PP rank (no Engram layers) uses FULL
+        # graphs for uniform decode so its per-layer eager breaks (indexer
+        # top-k, sparse MLA decode) are captured inline; prefill and mixed
+        # batches stay PIECEWISE. Only promote when the attention backends
+        # declare uniform-batch support, i.e. the PIECEWISE choice came from
+        # configuration rather than from a backend that is unsafe under FULL.
+        if (
+            _DPSK_PP1_FULL_CG
+            and self.is_last_pp_rank
+            and not self.is_first_pp_rank
+            and cudagraph_mode == CUDAGraphMode.PIECEWISE
+        ):
+            if attn_cg_support.min_cg_support.value >= (
+                AttentionCGSupport.UNIFORM_BATCH.value
+            ):
+                logger.warning(
+                    "DPSK_PP1_FULL_CG=1: last PP rank PIECEWISE -> FULL_AND_PIECEWISE"
+                )
+                cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+            else:
+                logger.warning(
+                    "DPSK_PP1_FULL_CG=1 ignored: attention backend %s only "
+                    "supports %s CUDA graphs",
+                    attn_cg_support.min_cg_attn_backend,
+                    attn_cg_support.min_cg_support.name,
+                )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
             self.device,
@@ -1706,6 +1767,44 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        sampler_output: SamplerOutput | None
+        if (
+            _DPSK_VOCAB_LOCAL_ARGMAX
+            and self.batch_sharder is None
+            and grammar_output is None
+            and input_batch.num_reqs > 0
+            and input_batch.num_draft_tokens > 0
+            and self.rejection_sampler is not None
+            and self.speculator is not None
+            and self.rejection_sampler.can_greedy_from_top_tokens(
+                input_batch, getattr(self.speculator, "draft_logits", None)
+            )
+        ):
+            # Greedy verification from a vocab-shard-local argmax: only
+            # (max, idx) pairs are all-gathered instead of full-vocab logits.
+            m = getattr(self.model, "language_model", self.model)
+            sample_hidden_states = hidden_states[input_batch.logits_indices]
+            top_tokens = m.logits_processor.get_top_tokens(
+                m.lm_head, sample_hidden_states
+            )
+            if self._dpsk_local_argmax_checks_left > 0:
+                self._dpsk_local_argmax_checks_left -= 1
+                ref = self.model.compute_logits(sample_hidden_states).argmax(-1)
+                nbad = int((ref != top_tokens).sum())
+                logger.warning(
+                    "DPSK_VOCAB_LOCAL_ARGMAX check: rows=%d mismatches=%d",
+                    ref.numel(),
+                    nbad,
+                )
+            sampler_output = self.rejection_sampler.greedy_from_top_tokens(
+                top_tokens, input_batch
+            )
+            return (
+                sampler_output,
+                sampler_output.num_sampled,
+                sampler_output.num_rejected,
+            )
+
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
@@ -1741,7 +1840,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 grammar_output.grammar_bitmask,
             )
 
-        sampler_output: SamplerOutput | None
         if input_batch.num_reqs == 0:
             # This rank owns no requests this step. It contributes an
             # all-padding block to the gather below.
@@ -1921,10 +2019,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.observability_config.cudagraph_metrics:
                 cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
             assert batch_req_state is not None
-            input_batch = self.prepare_inputs(
-                scheduler_output, batch_req_state, batch_desc, num_active_loras
-            )
-            block_tables, slot_mappings = self.prepare_attn(input_batch)
+            with dpsk_nvtx("dpsk:prepare_inputs"):
+                input_batch = self.prepare_inputs(
+                    scheduler_output, batch_req_state, batch_desc, num_active_loras
+                )
+                block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba prefix-cache pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -2087,6 +2186,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
+            # DeepSeek V4/V4.1 hash/vision MoE routing needs raw token ids
+            # on every PP stage, so keep them for requires_raw_input_tokens.
             if not requires_raw_input_tokens(self.model):
                 model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
@@ -2124,7 +2225,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.pre_forward(
                 scheduler_output, input_batch, attn_metadata=attn_metadata
             )
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            with dpsk_nvtx("dpsk:forward_full_graph"):
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -2156,12 +2258,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
                     # PIECEWISE after the cudagraph manager exists.
                     assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
-                    )
+                    with dpsk_nvtx("dpsk:forward_piecewise"):
+                        model_output = self.cudagraph_manager.run_pw_graph(
+                            self.model, model_inputs
+                        )
                 else:
                     # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+                    with dpsk_nvtx("dpsk:forward_eager"):
+                        model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
 
@@ -2264,9 +2368,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pcp_manager.restore_for_sampling(hidden_states, aux_hidden_states)
             )
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+        with dpsk_nvtx("dpsk:sample"):
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2364,7 +2469,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = get_drafter_hidden_states(
                 self.model, draft_hidden_states
             )
-            with use_workspace_lane(self._draft_workspace_lane):
+            with (
+                use_workspace_lane(self._draft_workspace_lane),
+                dpsk_nvtx("dpsk:draft_propose"),
+            ):
                 draft_tokens = self.speculator.propose(
                     input_batch,
                     attn_metadata,
@@ -2397,10 +2505,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             draft_tokens = self.req_states.draft_tokens[input_batch.idx_mapping]
-            self.draft_tokens_handler.set_draft_tokens(
+            draft_snapshot = self.draft_tokens_handler.set_draft_tokens(
                 input_batch, draft_tokens[:, :num_spec_tokens]
             )
-            # Drafts aren't used when none were proposed this step (e.g. skip_drafts).
+            if draft_snapshot is not None:
+                async_output.attach_drafts(draft_snapshot)
             if self.pp_handler is not None and num_spec_tokens > 0:
                 self.pp_handler.broadcast_drafts(draft_tokens)
 

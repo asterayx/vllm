@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -14,6 +15,14 @@ from vllm.v1.worker.gpu.async_utils import async_copy_to_np, new_d2h_stream
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 logger = init_logger(__name__)
+
+
+class DraftCopySnapshot(NamedTuple):
+    """Per-step CPU draft copy. Owned by that step's AsyncOutput."""
+
+    req_ids: list[str]
+    draft_tokens_np: np.ndarray
+    copy_event: Any | None
 
 
 def max_num_tokens_after_draft_slots(
@@ -58,17 +67,16 @@ def get_pp_safe_draft_load_config(load_config: LoadConfig) -> LoadConfig:
 class DraftTokensHandler:
     def __init__(self, device: torch.device | None = None):
         self.device = device
-        self.copy_stream = new_d2h_stream(device)
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.cuda.Event(blocking=True)
+        # Lazily created so CPU unit tests can exercise the per-request store.
+        self.copy_stream: torch.cuda.Stream | None = None
+        self.copy_event: torch.cuda.Event | None = None
         self._copy_pending = False
 
-        # Latest drafts per live request: a row view into an async-copied
-        # pinned array (synced in get_draft_tokens), or just the draft width
-        # when the scheduler doesn't need the token ids.
+        # Latest drafts per live request. A numpy row is a view into an
+        # async-copied array (synced in get_draft_tokens). An int is the draft
+        # width when the scheduler does not need the token ids.
         self._draft_tokens_by_req: dict[str, np.ndarray | int] = {}
-        # Requests whose drafts the scheduler will fetch for the latest step's
-        # deferred grammar bitmask; None means all requests.
+
         self._deferred_req_ids: Iterable[str] | None = None
 
     def begin_step(self, scheduler_output: SchedulerOutput) -> None:
@@ -80,32 +88,50 @@ class DraftTokensHandler:
             else None
         )
 
+    def _ensure_copy_resources(self) -> None:
+        if self.copy_stream is None:
+            self.copy_stream = new_d2h_stream(self.device)
+
     def set_draft_tokens(
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
-    ) -> None:
+    ) -> DraftCopySnapshot | None:
         if not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by
-            # the scheduler for this batch. Record draft token widths only.
-            num_draft_tokens = draft_tokens.shape[1]
+            # the scheduler for this batch. Record widths only so a later
+            # structured microbatch cannot drop these request ids.
+            num_draft_tokens = int(draft_tokens.shape[1])
             for req_id in input_batch.req_ids:
                 self._draft_tokens_by_req[req_id] = num_draft_tokens
-            return
+            return None
 
         # For spec decoding + structured outputs, we must transfer the
         # draft tokens back to the scheduler for grammar validation.
-        current_stream = torch.cuda.current_stream(self.device)
-        self.copy_stream.wait_stream(current_stream)
-        with torch.cuda.stream(self.copy_stream):
-            draft_tokens_np = async_copy_to_np(draft_tokens)
-            # draft_tokens is a temporary allocation on the main stream and read here on
-            # copy_stream; without record_stream, the caching allocator may reuse its
-            # memory before the async copy executes.
-            draft_tokens.record_stream(self.copy_stream)
-            self.copy_event.record()
+        is_cpu = self.device is None or self.device.type == "cpu"
+        if is_cpu:
+            draft_tokens_np = draft_tokens.detach().cpu().numpy().copy()
+            copy_event = None
+        else:
+            self._ensure_copy_resources()
+            assert self.copy_stream is not None
+            current_stream = torch.cuda.current_stream(self.device)
+            self.copy_stream.wait_stream(current_stream)
+            # Per-step event so the output thread never waits on a later
+            # sample_tokens recording of the shared copy_event.
+            copy_event = torch.cuda.Event(blocking=True)
+            with torch.cuda.stream(self.copy_stream):
+                draft_tokens_np = async_copy_to_np(draft_tokens)
+                # draft_tokens is a temporary allocation on the main stream
+                # and read here on copy_stream; without record_stream, the
+                # caching allocator may reuse its memory before the async
+                # copy executes.
+                draft_tokens.record_stream(self.copy_stream)
+                copy_event.record()
+            self.copy_event = copy_event
             self._copy_pending = True
 
-        for req_id, row in zip(input_batch.req_ids, draft_tokens_np):
+        for req_id, row in zip(input_batch.req_ids, draft_tokens_np, strict=True):
             self._draft_tokens_by_req[req_id] = row
+        return DraftCopySnapshot(list(input_batch.req_ids), draft_tokens_np, copy_event)
 
     def discard(self, req_id: str) -> None:
         self._draft_tokens_by_req.pop(req_id, None)
@@ -115,6 +141,7 @@ class DraftTokensHandler:
         grammar bitmask, or for all live requests if sampling isn't deferred.
         Requests without retained drafts are omitted."""
         if self._copy_pending:
+            assert self.copy_event is not None
             self.copy_event.synchronize()
             self._copy_pending = False
 

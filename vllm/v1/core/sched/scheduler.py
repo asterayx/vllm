@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -81,6 +82,10 @@ from vllm.v1.token_buffer import extend_from_slice
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# DPSK_PP_MICROBATCH=1: cap decodes per step to ceil(n / pp_size) so each PP
+# stage gets a distinct request group in flight.
+_DPSK_PP_MICROBATCH = os.environ.get("DPSK_PP_MICROBATCH", "0") == "1"
 
 
 class Scheduler(SchedulerInterface):
@@ -249,6 +254,12 @@ class Scheduler(SchedulerInterface):
 
         # IDs of requests preempted since the last call to schedule().
         self.reset_preempted_req_ids: set[str] = set()
+
+        # Real speculative draft token ids keyed by request id. Under PP the
+        # latest ModelRunnerOutput/take_draft_token_ids() microbatch may omit
+        # a request, so grammar bitmasks look up this store instead of leftover
+        # -1 placeholders from AsyncScheduler.
+        self._draft_token_ids_by_req: dict[str, list[int]] = {}
 
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
@@ -808,6 +819,16 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        # DPSK_PP_MICROBATCH: cap decodes per step to ceil(n / pp_size). The
+        # count advances only when a decode is actually scheduled, so a request
+        # skipped later in the loop does not take a slot from the rest.
+        _dpsk_mb_cap = None
+        if _DPSK_PP_MICROBATCH and self.use_pp and len(self.running) >= 2:
+            _pp = self.parallel_config.pipeline_parallel_size
+            _n = sum(1 for r in self.running if not r.is_prefill_chunk)
+            if _n >= 2:
+                _dpsk_mb_cap = -(-_n // _pp)
+        _dpsk_mb_count = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if input_budget <= draft_slots:
@@ -826,6 +847,15 @@ class Scheduler(SchedulerInterface):
                 # Async scheduling: Avoid scheduling an extra step when we are sure that
                 # the previous step has reached request.max_tokens. We don't schedule
                 # partial draft tokens since this prevents uniform decode optimizations.
+                req_index += 1
+                continue
+
+            if (
+                _dpsk_mb_cap is not None
+                and not request.is_prefill_chunk
+                and self.current_step >= request.next_decode_eligible_step
+                and _dpsk_mb_count >= _dpsk_mb_cap
+            ):
                 req_index += 1
                 continue
 
@@ -1012,6 +1042,8 @@ class Scheduler(SchedulerInterface):
             # Schedule the request.
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
+            if _dpsk_mb_cap is not None and not request.is_prefill_chunk:
+                _dpsk_mb_count += 1
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -1876,6 +1908,7 @@ class Scheduler(SchedulerInterface):
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
+        self._draft_token_ids_by_req.pop(request.request_id, None)
         # Async scheduling: mark all in-flight output as stale. Its tokens are
         # still delivered on return (dropping them would perturb spec-decode
         # acceptance) but must not mutate the reset counters; each step drains
@@ -2291,10 +2324,12 @@ class Scheduler(SchedulerInterface):
         if not structured_output_request_ids:
             return None
 
+        self._apply_persisted_draft_token_ids(scheduler_output)
         bitmask = self.structured_output_manager.grammar_bitmask(
             self.requests,
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
+            num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
@@ -2616,6 +2651,12 @@ class Scheduler(SchedulerInterface):
         for request in continuing_reqs:
             self._enqueue_waiting_request(request)
 
+        # Persist this step's CPU-copied drafts after sampled tokens have
+        # advanced the grammar. Store them raw; validate_tokens runs later in
+        # _apply_persisted_draft_token_ids when the FSM is current.
+        if model_runner_output.draft_token_ids is not None:
+            self._persist_raw_draft_token_ids(model_runner_output.draft_token_ids)
+
         request_errors = self.grammar_compile_error_reqs
         self.grammar_compile_error_reqs = {}
         error_req_ids = set(request_errors)
@@ -2860,6 +2901,7 @@ class Scheduler(SchedulerInterface):
         assert safe_frontier >= 0
         request.num_computed_tokens = safe_frontier
         request.spec_token_ids = []
+        self._draft_token_ids_by_req.pop(request.request_id, None)
         request.drop_stale_output = True
         request.num_stale_output_tokens = request.num_in_flight_tokens
         request.num_output_placeholders = 0
@@ -2992,20 +3034,82 @@ class Scheduler(SchedulerInterface):
         if self.ec_connector is not None:
             self.ec_connector.update_state_after_free(request, input_id)
 
+    def _persist_raw_draft_token_ids_for_req(
+        self, req_id: str, spec_token_ids: list[int]
+    ) -> Request | None:
+        """Cache raw worker drafts. Does not validate or write spec_token_ids."""
+        request = self.requests.get(req_id)
+        if request is None or request.is_finished():
+            self._draft_token_ids_by_req.pop(req_id, None)
+            return None
+
+        if request.is_prefill_chunk:
+            if request.spec_token_ids:
+                request.spec_token_ids = []
+            self._draft_token_ids_by_req.pop(req_id, None)
+            return None
+
+        self._draft_token_ids_by_req[req_id] = list(spec_token_ids)
+        return request
+
+    def _persist_raw_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+        for req_id, spec_token_ids in zip(
+            draft_token_ids.req_ids,
+            draft_token_ids.draft_token_ids,
+        ):
+            self._persist_raw_draft_token_ids_for_req(req_id, spec_token_ids)
+
+    def _trimmed_draft_token_ids(
+        self, request: Request, spec_token_ids: list[int]
+    ) -> list[int]:
+        return self.structured_output_manager.trim_spec_tokens(request, spec_token_ids)
+
+    def _apply_persisted_draft_token_ids(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Replace placeholder -1 spec tokens with this request's stored drafts.
+
+        Trim with the current grammar, retaining the first invalid token for
+        upstream rejection sampling. Missing drafts leave placeholders in place.
+        If trimming yields a shorter prefix, pad with -1 and record
+        ``num_invalid_spec_tokens`` so grammar_bitmask can tell that padding
+        apart from a persist miss. Neither case copies row 0 onto later rows.
+        """
+        sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        num_invalid_spec_tokens = scheduler_output.num_invalid_spec_tokens
+        if num_invalid_spec_tokens is None:
+            num_invalid_spec_tokens = {}
+            scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
+
+        for req_id, spec_tokens in list(sched_spec_tokens.items()):
+            if spec_tokens and any(token >= 0 for token in spec_tokens):
+                continue
+            stored = self._draft_token_ids_by_req.get(req_id)
+            if not stored:
+                continue
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            trimmed = self._trimmed_draft_token_ids(request, stored)
+            orig_num_spec_tokens = len(spec_tokens) if spec_tokens else len(stored)
+            applied = list(trimmed[:orig_num_spec_tokens])
+            num_invalid_tokens = orig_num_spec_tokens - len(applied)
+            if num_invalid_tokens:
+                applied.extend([-1] * num_invalid_tokens)
+                num_invalid_spec_tokens[req_id] = num_invalid_tokens
+            sched_spec_tokens[req_id] = applied
+
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
         ):
-            request = self.requests.get(req_id)
-            if request is None or request.is_finished():
-                # The request may have been finished. Skip.
+            request = self._persist_raw_draft_token_ids_for_req(req_id, spec_token_ids)
+            if request is None:
                 continue
-
-            if request.is_prefill_chunk:
-                # Ignore draft tokens for prefill chunks.
-                if request.spec_token_ids:
-                    request.spec_token_ids = []
+            # AsyncScheduler._update_after_schedule already installed the next
+            # step's placeholders; do not clobber them with this step's drafts.
+            if request.spec_token_ids:
                 continue
 
             # Add newly generated spec token ids to the request.
@@ -3023,20 +3127,20 @@ class Scheduler(SchedulerInterface):
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
         ):
-            request = self.requests.get(req_id)
-            if request is None or request.is_finished():
-                # The request may have been finished. Skip.
-                continue
-
             placeholder_spec_tokens = sched_spec_tokens.get(req_id)
-            if not placeholder_spec_tokens:
+            to_store = spec_token_ids
+            if placeholder_spec_tokens:
+                # Trim drafts to scheduled number of spec tokens
+                # (needed for chunked prefill case for example).
+                to_store = spec_token_ids[: len(placeholder_spec_tokens)]
+            request = self._persist_raw_draft_token_ids_for_req(req_id, to_store)
+            if request is None or not placeholder_spec_tokens:
                 continue
 
+            # The output is already scheduled; keep request.spec_token_ids
+            # (async placeholders) and write validated drafts onto it.
             orig_num_spec_tokens = len(placeholder_spec_tokens)
-            # Trim drafts to scheduled number of spec tokens
-            # (needed for chunked prefill case for example).
-            del spec_token_ids[orig_num_spec_tokens:]
-            # Preserve draft slots; rejection sampling handles grammar violations.
+            spec_token_ids = list(self._trimmed_draft_token_ids(request, to_store))
             # Pad to original number of spec tokens.
             num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
             if num_invalid_tokens:
@@ -3046,6 +3150,8 @@ class Scheduler(SchedulerInterface):
             sched_spec_tokens[req_id] = spec_token_ids
 
         scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
+        # Requests omitted from this take still get their stored drafts.
+        self._apply_persisted_draft_token_ids(scheduler_output)
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
@@ -3191,6 +3297,7 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         self._pending_encoder_input_ids.pop(request.request_id, None)
         request_id = request.request_id
+        self._draft_token_ids_by_req.pop(request_id, None)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -3430,6 +3537,12 @@ class Scheduler(SchedulerInterface):
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
             spec_decoding_stats=spec_stats,
+            num_missing_draft_bitmask_fills=(
+                self.structured_output_manager.num_missing_draft_bitmask_fills
+            ),
+            num_all_invalid_draft_bitmask_fills=(
+                self.structured_output_manager.num_all_invalid_draft_bitmask_fills
+            ),
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
