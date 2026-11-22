@@ -62,6 +62,9 @@ class GateLinear(ReplicatedLinear):
     # Largest batch for which tier 1 beats the cuBLAS epilogue. Subclasses
     # whose router shape stays ahead further up the range may raise it.
     LL_BF16_MAX_TOKENS = 16
+    # On family 120 the dot-product backend (M <= 4) beats cuBLAS for a
+    # 512x2560 router; the untuned split-K default it uses above that loses.
+    LL_BF16_MAX_TOKENS_SM120 = 4
 
     def __init__(
         self,
@@ -120,13 +123,20 @@ class GateLinear(ReplicatedLinear):
         # The cuteDSL bf16 router GEMM needs only PDL and thread block clusters,
         # which family 120 has. The other specialized tiers stay off there, so
         # fp32 routers keep the fallback's fp32 weights.
-        self._allow_ll_bf16_arch = can_use_specialized_kernels or (
+        self._ll_bf16_sm120 = not can_use_specialized_kernels and (
             current_platform.is_cuda()
             and is_sm120
             and not bias
             and not batch_invariant
             and self.is_unquantized
         )
+        self._allow_ll_bf16_arch = can_use_specialized_kernels or self._ll_bf16_sm120
+        self._ll_bf16_max_tokens = (
+            self.LL_BF16_MAX_TOKENS_SM120
+            if self._ll_bf16_sm120
+            else self.LL_BF16_MAX_TOKENS
+        )
+        self._ll_bf16_out_dtype = torch.float32
 
         # fp32 specialized kernel eligibility (exact dims, fp32 weight)
         self.allow_fp32_router_gemm = (
@@ -229,11 +239,22 @@ class GateLinear(ReplicatedLinear):
             is_available as is_ll_bf16_gemm_available,
         )
 
+        # A router without an out_dtype returns logits in the weight dtype.
+        # Family 120 takes the kernel's bf16-output variant for those; the
+        # other families keep their fp32-only condition.
+        if out_dtype is None and self._ll_bf16_sm120:
+            out_dtype = self.weight.dtype
+            allowed_out = out_dtype == torch.bfloat16
+        else:
+            allowed_out = out_dtype == torch.float32
         self.allow_ll_bf16_gemm = (
             is_ll_bf16_gemm_available()
             and self.weight.dtype == torch.bfloat16
-            and out_dtype == torch.float32
+            and allowed_out
         )
+        if self.allow_ll_bf16_gemm:
+            assert out_dtype is not None
+            self._ll_bf16_out_dtype = out_dtype
 
     def _register_sm90_bf16x3_warmup(self) -> None:
         vllm_config = get_current_vllm_config_or_none()
@@ -315,14 +336,17 @@ class GateLinear(ReplicatedLinear):
         # any dims w/ K divisible by 8)
         if (
             self.allow_ll_bf16_gemm
-            and x.shape[0] <= self.LL_BF16_MAX_TOKENS
+            and x.shape[0] <= self._ll_bf16_max_tokens
             and x.dtype == torch.bfloat16
         ):
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
                 ll_bf16_gemm,
             )
 
-            output = ll_bf16_gemm(x, self.weight)
+            if self._ll_bf16_out_dtype == torch.float32:
+                output = ll_bf16_gemm(x, self.weight)
+            else:
+                output = ll_bf16_gemm(x, self.weight, self._ll_bf16_out_dtype)
             return self._return(output)
 
         # Tier 5: ROCm bf16x3 router GEMM. Checked before tier 2 because both
