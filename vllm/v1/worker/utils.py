@@ -606,13 +606,21 @@ def layer_spec_for_tensor(
     """Cache group index and per-layer spec of the layers tensor places."""
     layer_name = tensor.layers[0]
     group_id, group = next(
-        (group_id, group)
-        for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
-        if layer_name in group.layer_names
+        (
+            (group_id, group)
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if layer_name in group.layer_names
+        ),
+        (None, None),
     )
+    if group is None:
+        raise RuntimeError(
+            f"KV cache tensor layer {layer_name!r} is not in any KV cache group"
+        )
     spec = group.kv_cache_spec
     if isinstance(spec, UniformTypeKVCacheSpecs):
         spec = spec.kv_cache_specs[layer_name]
+    assert group_id is not None
     return group_id, spec
 
 

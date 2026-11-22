@@ -70,9 +70,11 @@ from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
+from vllm.utils.dpsk_nvtx import dpsk_nvtx
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.conf_compute_utils import install as install_conf_compute_copy_patches
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -201,6 +203,9 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
+
+_DPSK_VOCAB_LOCAL_ARGMAX = envs.DPSK_VOCAB_LOCAL_ARGMAX
+_DPSK_PP1_FULL_CG = envs.DPSK_PP1_FULL_CG
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -435,6 +440,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     eplb_models_added = self.eplb.maybe_register_speculator(
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
+        apply_decode_kernel_overrides = getattr(
+            self.model, "apply_decode_kernel_overrides", None
+        )
+        if apply_decode_kernel_overrides is not None:
+            apply_decode_kernel_overrides(getattr(self.speculator, "model", None))
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -798,6 +808,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_profiling=is_profiling,
             piecewise_capture_available=piecewise_capture_available,
         )
+        # DPSK_PP1_FULL_CG=1: the last PP rank (no Engram layers) uses FULL
+        # graphs for uniform decode so its per-layer eager breaks (indexer
+        # top-k, sparse MLA decode) are captured inline; prefill and mixed
+        # batches stay PIECEWISE. Only promote when the attention backends
+        # declare uniform-batch support, i.e. the PIECEWISE choice came from
+        # configuration rather than from a backend that is unsafe under FULL.
+        if (
+            _DPSK_PP1_FULL_CG
+            and self.is_last_pp_rank
+            and not self.is_first_pp_rank
+            and cudagraph_mode == CUDAGraphMode.PIECEWISE
+        ):
+            if attn_cg_support.min_cg_support.value >= (
+                AttentionCGSupport.UNIFORM_BATCH.value
+            ):
+                logger.warning(
+                    "DPSK_PP1_FULL_CG=1: last PP rank PIECEWISE -> FULL_AND_PIECEWISE"
+                )
+                cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+            else:
+                logger.warning(
+                    "DPSK_PP1_FULL_CG=1 ignored: attention backend %s only "
+                    "supports %s CUDA graphs",
+                    attn_cg_support.min_cg_attn_backend,
+                    attn_cg_support.min_cg_support.name,
+                )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
             self.device,
@@ -1706,6 +1742,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        sampler_output: SamplerOutput | None
+        if (
+            _DPSK_VOCAB_LOCAL_ARGMAX
+            and self.batch_sharder is None
+            and grammar_output is None
+            and self.rejection_sampler is not None
+            and self.speculator is not None
+        ):
+            sampler_output = self.rejection_sampler.greedy_from_local_argmax(
+                self.model,
+                hidden_states,
+                input_batch,
+                getattr(self.speculator, "draft_logits", None),
+            )
+            if sampler_output is not None:
+                return (
+                    sampler_output,
+                    sampler_output.num_sampled,
+                    sampler_output.num_rejected,
+                )
+
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
@@ -1741,7 +1798,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 grammar_output.grammar_bitmask,
             )
 
-        sampler_output: SamplerOutput | None
         if input_batch.num_reqs == 0:
             # This rank owns no requests this step. It contributes an
             # all-padding block to the gather below.
@@ -1921,10 +1977,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.observability_config.cudagraph_metrics:
                 cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
             assert batch_req_state is not None
-            input_batch = self.prepare_inputs(
-                scheduler_output, batch_req_state, batch_desc, num_active_loras
-            )
-            block_tables, slot_mappings = self.prepare_attn(input_batch)
+            with dpsk_nvtx("dpsk:prepare_inputs"):
+                input_batch = self.prepare_inputs(
+                    scheduler_output, batch_req_state, batch_desc, num_active_loras
+                )
+                block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba prefix-cache pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -2087,6 +2144,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
+            # DeepSeek V4/V4.1 hash/vision MoE routing needs raw token ids
+            # on every PP stage, so keep them for requires_raw_input_tokens.
             if not requires_raw_input_tokens(self.model):
                 model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
@@ -2124,7 +2183,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.pre_forward(
                 scheduler_output, input_batch, attn_metadata=attn_metadata
             )
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            with dpsk_nvtx("dpsk:forward_full_graph"):
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -2156,12 +2216,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
                     # PIECEWISE after the cudagraph manager exists.
                     assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
-                    )
+                    with dpsk_nvtx("dpsk:forward_piecewise"):
+                        model_output = self.cudagraph_manager.run_pw_graph(
+                            self.model, model_inputs
+                        )
                 else:
                     # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+                    with dpsk_nvtx("dpsk:forward_eager"):
+                        model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
 
@@ -2264,9 +2326,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pcp_manager.restore_for_sampling(hidden_states, aux_hidden_states)
             )
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+        with dpsk_nvtx("dpsk:sample"):
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2364,7 +2427,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = get_drafter_hidden_states(
                 self.model, draft_hidden_states
             )
-            with use_workspace_lane(self._draft_workspace_lane):
+            with (
+                use_workspace_lane(self._draft_workspace_lane),
+                dpsk_nvtx("dpsk:draft_propose"),
+            ):
                 draft_tokens = self.speculator.propose(
                     input_batch,
                     attn_metadata,
@@ -2397,10 +2463,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             draft_tokens = self.req_states.draft_tokens[input_batch.idx_mapping]
-            self.draft_tokens_handler.set_draft_tokens(
+            draft_snapshot = self.draft_tokens_handler.set_draft_tokens(
                 input_batch, draft_tokens[:, :num_spec_tokens]
             )
-            # Drafts aren't used when none were proposed this step (e.g. skip_drafts).
+            if draft_snapshot is not None:
+                async_output.attach_drafts(draft_snapshot)
             if self.pp_handler is not None and num_spec_tokens > 0:
                 self.pp_handler.broadcast_drafts(draft_tokens)
 

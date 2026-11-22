@@ -59,6 +59,14 @@ class EmulationMxfp8LinearKernel(Mxfp8LinearKernel):
         # Load-time dequant path: weights are already BF16/FP16 (>= 2-byte), so
         # run a plain linear -- no per-step dequant. (MXFP8 weights are 1-byte.)
         if weight.element_size() >= 2:
+            if getattr(layer, "_fp8_skinny", None) is not None and bias is None:
+                from vllm.models.deepseek_v41.nvidia.ops.fp8_skinny_linear import (
+                    fp8_skinny_apply,
+                )
+
+                y = fp8_skinny_apply(layer, x)
+                if y is not None:
+                    return y
             # F.linear requires x and weight share a dtype; .to() is a no-op when
             # they already match (e.g. both BF16).
             output = torch.nn.functional.linear(x, weight.to(x.dtype), bias)

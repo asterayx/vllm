@@ -249,7 +249,9 @@ class DeepseekV4FP8Config(Fp8Config):
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.expert_dtype == "fp4":
-                if self._is_nvfp4_expert_layer(prefix):
+                if self._is_nvfp4_expert_layer(prefix) and not getattr(
+                    self, "dspark_draft_moe_mxfp4", False
+                ):
                     from vllm.model_executor.layers.quantization.modelopt import (
                         ModelOptNvFp4FusedMoE,
                     )

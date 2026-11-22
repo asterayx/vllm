@@ -148,3 +148,21 @@ def test_multiple_tool_calls_materialised(num_tool_calls: int):
     # Verify after model_dump_json too
     _ = req.model_dump_json()
     assert len(assistant_msg.get("tool_calls", [])) == num_tool_calls
+
+
+@pytest.mark.parametrize("emit", [False, True])
+def test_reasoning_content_alias_follows_env(monkeypatch, emit):
+    """Clients that only read `reasoning_content` see reasoning when enabled."""
+    from vllm.entrypoints.generate.base.protocol import DeltaMessage
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatMessage
+
+    monkeypatch.setenv("VLLM_EMIT_REASONING_CONTENT", "1" if emit else "0")
+    delta = DeltaMessage(reasoning="think").model_dump(exclude_unset=True)
+    message = ChatMessage(role="assistant", reasoning="think").model_dump()
+
+    for data in (delta, message):
+        assert data["reasoning"] == "think"
+        assert data.get("reasoning_content") == ("think" if emit else None)
+    assert "reasoning_content" not in DeltaMessage(content="x").model_dump(
+        exclude_unset=True
+    )
