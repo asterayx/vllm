@@ -552,9 +552,11 @@ def test_gate_linear_non_bf16_activation_falls_back(monkeypatch):
 
 def test_gate_linear_set_out_dtype_enables_ll_bf16(monkeypatch):
     gate = _make_gate_linear(monkeypatch, params_dtype=torch.bfloat16, out_dtype=None)
-    assert not gate.allow_ll_bf16_gemm
+    # Family 120 already serves bf16 logits through the kernel.
+    assert gate.allow_ll_bf16_gemm == _is_sm120()
     gate.set_out_dtype(torch.float32)
     assert gate.allow_ll_bf16_gemm
+    assert gate._ll_bf16_out_dtype == torch.float32
 
 
 def test_gate_linear_non_fp32_out_dtype_disables_ll_bf16(monkeypatch):
