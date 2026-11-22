@@ -39,6 +39,61 @@ uv pip show torch torchvision b12x nvidia-cutlass-dsl | grep -E "^(Name|Version)
 
 不要对 vLLM 环境里的包使用 `uv pip install -U`。
 
+### v0.34.0 集成版（分支 `rtxpro5000-v0.34.0`）
+
+上面的分支名和版本号是 v0.31 时期的。v0.34.0 集成版在 Python 3.12、
+PyTorch 2.14.0+cu130、FlashInfer 0.7.3、CUDA toolkit 13.5 下验证过；其余依赖的
+版本以该分支的 `examples/deployment/rtxpro5000_v034_merge.md` 为准。
+
+启动前确认两件事，否则 FlashInfer PCIe IPC 的自动调优会把全部候选跳过并存下一份
+空缓存，表现为启动要 40 分钟以上、日志里反复出现
+`Skipped 151 unsupported tactic(s)` 和 `Saved 0 configs`：
+
+1. **CUDA 根目录要显式给出。** `nvcc` 是转发脚本的机器上，自动识别会得到错误的
+   根目录，调优计时用的辅助模块编译时找不到 `cuda_runtime_api.h`。
+
+    ```bash
+    export CUDA_HOME=/usr/local/cuda-13.5          # 含 include/ 和 bin/nvcc 的目录
+    export FLASHINFER_NVCC=$CUDA_HOME/bin/nvcc
+    ```
+
+2. **调优器要读到 venv 自带的 cuBLAS。** 它按不带版本号的 `libcublas.so` /
+   `libcublasLt.so` 查找，venv 里只有带版本号的文件，于是会读到系统那份的版本号，
+   与缓存里记录的不一致，已有缓存被判为不匹配。在 venv 之外建一个只放软链接的
+   目录：
+
+    ```bash
+    CUDA_LIB=$PWD/.venv/lib/python3.12/site-packages/nvidia/cu13/lib
+    mkdir -p ~/vllm-libshim
+    for n in libcublas libcublasLt libcudart; do
+      ln -sf "$CUDA_LIB/$n.so.13" ~/vllm-libshim/$n.so
+    done
+    export LD_LIBRARY_PATH=$HOME/vllm-libshim:$CUDA_LIB
+    export LIBRARY_PATH=$HOME/vllm-libshim:$CUDA_LIB
+    ```
+
+调优结果按配置哈希分目录存放（开不开草稿是两个目录），同一配置第二次启动直接
+复用。正常的冷启动约 6–9 分钟，其中调优只占几秒。
+
+### 可选开关
+
+下面的开关都登记在 `vllm/envs.py`，设为 `1` 才生效，并且会进入编译缓存的键。
+"已测"指 xzss 四卡 C1 测试（PR #28 正文的结果）打开了它；
+`qwen3_8_flash_next_rtx_pro_5000.sh` 默认不设这些，PCIe IPC 要用 `PCIE_IPC=1`。
+
+| 开关 | 状态 | 作用 |
+|---|---|---|
+| `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC` | 已测 | 小批量 all-reduce 走 FlashInfer PCIe IPC，不走 NCCL |
+| `VLLM_ALLREDUCE_FLASHINFER_PCIE_IPC_MAX_TOKENS` | 已测（16） | 超过这个 token 数的 all-reduce 交给下一个后端 |
+| `QWEN4_EXP_TRITON_GEMM` | 默认开，已测 | SM120 上稠密投影用 Triton 解码 GEMM；`VLLM_BATCH_INVARIANT=1` 时不用 |
+| `QWEN4_EXP_TRITON_MOE` | 已测 | 小 token 数的 NVFP4 专家用 Triton 实现，替代 b12x |
+| `QWEN4_EXP_TRITON_MOE_MAX_M` | 已测（96） | 上一项生效的最大 token 数 |
+| `QWEN4_EXP_TRITON_MOE_DOWNBF16` | 实验 | 强制开或关 bf16 下投影变体 |
+| `DPSK_NVTX` | 调试 | 主机侧 NVTX 区间，配合 nsys 使用 |
+
+`DPSK_*` 的其余开关属于 DeepSeek-V4.1 和 PP 路径，见
+`rtxpro5000_perf_probe.md` 和 `vllm/envs.py` 里的说明。
+
 可选：跑 sm_120 相关单测（需要 `uv pip install -r requirements/test/cuda.in`）：
 
 ```bash
