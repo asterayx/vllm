@@ -468,7 +468,8 @@ class TritonNvfp4DecodeMoE:
             # Every block holds one pair, so each pair costs a full pass over
             # its expert's weights. For one token that is what grouping gives
             # too (top-k experts are distinct); for more tokens it reads an
-            # expert again for each token that picked it.
+            # expert again for each token that picked it, which up to four
+            # tokens costs less than the alignment pass it replaces.
             sorted_ids, eids, npost, nb = (
                 s.direct_sorted,
                 topk_ids,
