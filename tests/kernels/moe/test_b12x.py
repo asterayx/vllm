@@ -1376,9 +1376,9 @@ def test_triton_nvfp4_moe_direct_layout_matches_grouped(
     assert calls[1] == 0
     rel_l2 = (direct - grouped).norm(dim=1) / grouped.norm(dim=1)
     # Each pair goes through the same arithmetic in both layouts. What can
-    # differ is the order of the FP32 atomic adds over a token's experts,
-    # then rounding to bf16.
-    assert rel_l2.max().item() < 1e-3
+    # differ is the order of the FP32 atomic adds over a token's experts.
+    # On SM120 the three cases measured 0, 1.1e-9 and 5.0e-8.
+    assert rel_l2.max().item() < 1e-6
 
 
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
