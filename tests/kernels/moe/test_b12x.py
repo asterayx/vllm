@@ -233,6 +233,7 @@ def _run_b12x_moe(
     quant_config: FusedMoEQuantConfig,
     *,
     warmup: bool = False,
+    out_of_range_ids: bool = False,
 ) -> torch.Tensor:
     num_experts = w1.shape[0]
     kernel = _make_b12x_moe_kernel(
@@ -247,6 +248,9 @@ def _run_b12x_moe(
     topk_weights, topk_ids, _ = fused_topk(
         hidden_states, score, topk, renormalize=False
     )
+    if out_of_range_ids:
+        topk_ids[0, 0] = -1
+        topk_ids[-1, -1] = num_experts
     return kernel.apply(
         hidden_states=hidden_states,
         w1=w1,
@@ -1323,10 +1327,17 @@ def test_triton_nvfp4_moe_matches_b12x(
 
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
 @pytest.mark.parametrize("tokens", [1, 3, 4])
+@pytest.mark.parametrize("out_of_range_ids", [False, True])
 @torch.inference_mode()
 def test_triton_nvfp4_moe_direct_layout_matches_grouped(
-    tokens: int, workspace_init, monkeypatch: pytest.MonkeyPatch
+    tokens: int,
+    out_of_range_ids: bool,
+    workspace_init,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # out_of_range_ids: the router can hand over ids outside [0, E), as it
+    # did while CUDA graphs were warmed up on dummy inputs. Grouping skips
+    # those pairs, so the direct layout must skip them too.
     align_calls = 0
     align = ops.moe_align_block_size
 
@@ -1367,6 +1378,7 @@ def test_triton_nvfp4_moe_direct_layout_matches_grouped(
                     case.activation,
                     case.quant_config,
                     warmup=True,
+                    out_of_range_ids=out_of_range_ids,
                 ).float()
             )
             calls.append(align_calls)
@@ -1377,7 +1389,7 @@ def test_triton_nvfp4_moe_direct_layout_matches_grouped(
     rel_l2 = (direct - grouped).norm(dim=1) / grouped.norm(dim=1)
     # Each pair goes through the same arithmetic in both layouts. What can
     # differ is the order of the FP32 atomic adds over a token's experts.
-    # On SM120 the three cases measured 0, 1.1e-9 and 5.0e-8.
+    # On SM120 the three in-range cases measured 0, 1.1e-9 and 5.0e-8.
     assert rel_l2.max().item() < 1e-6
 
 

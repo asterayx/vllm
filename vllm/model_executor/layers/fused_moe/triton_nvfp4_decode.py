@@ -158,14 +158,19 @@ def _fc1_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     QMODE: tl.constexpr,
+    E: tl.constexpr,
 ):
     pm = tl.program_id(0)
     pn = tl.program_id(1)
     if pm * BM >= tl.load(npost_ptr):
         return
+    # eid_ptr can be the router's topk_ids. A pair whose expert id is out of
+    # range is skipped, as moe_align_block_size skips it.
     e = tl.load(eid_ptr + pm).to(tl.int64)
+    in_range = (e >= 0) & (e < E)
+    e = tl.where(in_range, e, 0)
     rows = tl.load(sorted_ptr + pm * BM + tl.arange(0, BM))
-    valid = rows < num_pairs
+    valid = (rows < num_pairs) & in_range
     tok = tl.where(valid, rows // TOPK, 0)
     al1 = tl.load(a1_ptr + e)
     gs2 = tl.load(g2_ptr + e)
@@ -234,14 +239,17 @@ def _fc2_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     DOWNBF16: tl.constexpr,
+    E: tl.constexpr,
 ):
     pm = tl.program_id(0)
     pn = tl.program_id(1)
     if pm * BM >= tl.load(npost_ptr):
         return
     e = tl.load(eid_ptr + pm).to(tl.int64)
+    in_range = (e >= 0) & (e < E)
+    e = tl.where(in_range, e, 0)
     rows = tl.load(sorted_ptr + pm * BM + tl.arange(0, BM))
-    valid = rows < num_pairs
+    valid = (rows < num_pairs) & in_range
     al2 = tl.load(a2_ptr + e)
     h = pn * BN + tl.arange(0, BN)
     wbase = w2_ptr + e * (H * (INTERMEDIATE_SIZE // 2))
@@ -498,6 +506,7 @@ class TritonNvfp4DecodeMoE:
             BN=c["BN1"],
             BK=c["BK1"],
             QMODE=qmode,
+            E=self.E,
             num_warps=c["W1"],
             num_stages=c["S1"],
         )
@@ -522,6 +531,7 @@ class TritonNvfp4DecodeMoE:
             BN=c["BN2"],
             BK=c["BK2"],
             DOWNBF16=downbf16,
+            E=self.E,
             num_warps=c["W2"],
             num_stages=c["S2"],
         )
