@@ -158,14 +158,19 @@ def _fc1_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     QMODE: tl.constexpr,
+    E: tl.constexpr,
 ):
     pm = tl.program_id(0)
     pn = tl.program_id(1)
     if pm * BM >= tl.load(npost_ptr):
         return
+    # eid_ptr can be the router's topk_ids. A pair whose expert id is out of
+    # range is skipped, as moe_align_block_size skips it.
     e = tl.load(eid_ptr + pm).to(tl.int64)
+    in_range = (e >= 0) & (e < E)
+    e = tl.where(in_range, e, 0)
     rows = tl.load(sorted_ptr + pm * BM + tl.arange(0, BM))
-    valid = rows < num_pairs
+    valid = (rows < num_pairs) & in_range
     tok = tl.where(valid, rows // TOPK, 0)
     al1 = tl.load(a1_ptr + e)
     gs2 = tl.load(g2_ptr + e)
@@ -234,14 +239,17 @@ def _fc2_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     DOWNBF16: tl.constexpr,
+    E: tl.constexpr,
 ):
     pm = tl.program_id(0)
     pn = tl.program_id(1)
     if pm * BM >= tl.load(npost_ptr):
         return
     e = tl.load(eid_ptr + pm).to(tl.int64)
+    in_range = (e >= 0) & (e < E)
+    e = tl.where(in_range, e, 0)
     rows = tl.load(sorted_ptr + pm * BM + tl.arange(0, BM))
-    valid = rows < num_pairs
+    valid = (rows < num_pairs) & in_range
     al2 = tl.load(a2_ptr + e)
     h = pn * BN + tl.arange(0, BN)
     wbase = w2_ptr + e * (H * (INTERMEDIATE_SIZE // 2))
@@ -304,6 +312,14 @@ class _Scratch:
         self.sorted = torch.empty(self.max_pad, dtype=torch.int32, device=dev)
         self.eids = torch.empty(self.max_blocks, dtype=torch.int32, device=dev)
         self.npost = torch.empty(1, dtype=torch.int32, device=dev)
+        # Fixed layout with one pair per block: pair p in lane 0 of block p,
+        # the other lanes padded. With it the kernels take the expert of
+        # block p straight from topk_ids, and no alignment pass is needed.
+        self.direct_sorted = torch.full(
+            (npairs, BM), npairs, dtype=torch.int32, device=dev
+        )
+        self.direct_sorted[:, 0] = torch.arange(npairs, dtype=torch.int32, device=dev)
+        self.direct_npost = torch.full((1,), npairs * BM, dtype=torch.int32, device=dev)
         self.xq = torch.empty(M, H // 2, dtype=torch.uint8, device=dev)
         self.xs = torch.empty(M, H // 16, dtype=torch.float8_e4m3fn, device=dev)
         self.iq = torch.empty(
@@ -319,6 +335,8 @@ class _Scratch:
                 self.sorted,
                 self.eids,
                 self.npost,
+                self.direct_sorted,
+                self.direct_npost,
                 self.xq,
                 self.xs,
                 self.iq,
@@ -402,6 +420,7 @@ class TritonNvfp4DecodeMoE:
                 f"{tuple(self.s2.shape)}"
             )
         self.downbf16_override = envs.QWEN4_EXP_TRITON_MOE_DOWNBF16
+        self.direct_max_m = envs.QWEN4_EXP_TRITON_MOE_DIRECT_MAX_M
         self.dev = self.w1.device
         self._flipped = False
 
@@ -445,8 +464,24 @@ class TritonNvfp4DecodeMoE:
             else self.downbf16_override
         )
         npairs = M * self.topk
-        ops.moe_align_block_size(topk_ids, self.E, c["BM"], s.sorted, s.eids, s.npost)
-        nb = min(s.max_blocks, min(npairs, self.E) + npairs // c["BM"])
+        if self.direct_max_m >= M:
+            # Every block holds one pair, so each pair costs a full pass over
+            # its expert's weights. For one token that is what grouping gives
+            # too (top-k experts are distinct); for more tokens it reads an
+            # expert again for each token that picked it, which up to four
+            # tokens costs less than the alignment pass it replaces.
+            sorted_ids, eids, npost, nb = (
+                s.direct_sorted,
+                topk_ids,
+                s.direct_npost,
+                npairs,
+            )
+        else:
+            ops.moe_align_block_size(
+                topk_ids, self.E, c["BM"], s.sorted, s.eids, s.npost
+            )
+            sorted_ids, eids, npost = s.sorted, s.eids, s.npost
+            nb = min(s.max_blocks, min(npairs, self.E) + npairs // c["BM"])
         _xq_kernel[(M, self.H // c["XB"])](
             x, self.g1, s.xq, s.xs, self.H, BK=c["XB"], QMODE=qmode, num_warps=2
         )
@@ -457,9 +492,9 @@ class TritonNvfp4DecodeMoE:
             self.s1,
             self.a1,
             self.g2,
-            s.sorted,
-            s.eids,
-            s.npost,
+            sorted_ids,
+            eids,
+            npost,
             s.iq,
             s.isc,
             npairs,
@@ -472,6 +507,7 @@ class TritonNvfp4DecodeMoE:
             BN=c["BN1"],
             BK=c["BK1"],
             QMODE=qmode,
+            E=self.E,
             num_warps=c["W1"],
             num_stages=c["S1"],
         )
@@ -482,9 +518,9 @@ class TritonNvfp4DecodeMoE:
             self.s2,
             self.a2,
             topk_w,
-            s.sorted,
-            s.eids,
-            s.npost,
+            sorted_ids,
+            eids,
+            npost,
             s.acc,
             npairs,
             self.topk,
@@ -496,6 +532,7 @@ class TritonNvfp4DecodeMoE:
             BN=c["BN2"],
             BK=c["BK2"],
             DOWNBF16=downbf16,
+            E=self.E,
             num_warps=c["W2"],
             num_stages=c["S2"],
         )

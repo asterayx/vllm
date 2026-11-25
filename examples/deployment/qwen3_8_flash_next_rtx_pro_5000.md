@@ -88,6 +88,7 @@ PyTorch 2.14.0+cu130、FlashInfer 0.7.3、CUDA toolkit 13.5 下验证过；其�
 | `QWEN4_EXP_TRITON_GEMM` | 默认开，已测 | SM120 上稠密投影用 Triton 解码 GEMM；`VLLM_BATCH_INVARIANT=1` 时不用 |
 | `QWEN4_EXP_TRITON_MOE` | 已测 | 小 token 数的 NVFP4 专家用 Triton 实现，替代 b12x |
 | `QWEN4_EXP_TRITON_MOE_MAX_M` | 已测（96） | 上一项生效的最大 token 数 |
+| `QWEN4_EXP_TRITON_MOE_DIRECT_MAX_M` | 已测（4） | 不超过这个 token 数时，每个（token，专家）对独占一个块，省掉按专家分组的那一趟；0 为始终分组 |
 | `QWEN4_EXP_TRITON_MOE_DOWNBF16` | 实验 | 强制开或关 bf16 下投影变体 |
 | `DPSK_NVTX` | 调试 | 主机侧 NVTX 区间，配合 nsys 使用 |
 
@@ -110,12 +111,12 @@ PyTorch 2.14.0+cu130、FlashInfer 0.7.3、CUDA toolkit 13.5 下验证过；其�
 openssl rand -hex 32 > ~/.asteraux_vllm_key && chmod 600 ~/.asteraux_vllm_key
 ```
 
-当前生产启动命令：
+推荐的生产启动命令：
 
 ```bash
 cd ~/vllm
 VLLM_EMIT_REASONING_CONTENT=1 VLLM_API_KEY=$(cat ~/.asteraux_vllm_key) \
-MAX_LEN=262144 MAX_SEQS=32 NUMA=1 NCCL_LL=1 MODEL=$M TP=4 SPEC=2 \
+MAX_LEN=262144 MAX_SEQS=32 NUMA=1 NCCL_LL=1 MODEL=$M TP=4 SPEC=3 \
   ./examples/deployment/qwen3_8_flash_next_rtx_pro_5000.sh \
   --moe-backend b12x --kv-cache-dtype fp8 --host 127.0.0.1 \
   --served-model-name qwen3.8-flash-next \
@@ -126,7 +127,7 @@ MAX_LEN=262144 MAX_SEQS=32 NUMA=1 NCCL_LL=1 MODEL=$M TP=4 SPEC=2 \
 | --- | --- |
 | `TP=4` | 4 卡张量并行（每卡 MoE intermediate 160，b12x 补齐到 192） |
 | `--moe-backend b12x` | sm_120 专用 NVFP4 MoE kernel，比默认 CUTLASS 快 12–15% |
-| `SPEC=2` | MTP 投机解码 2 个草稿 token；MTP 层的 FP8 MoE 自动选后端（`SPEC_MOE=auto`） |
+| `SPEC=3` | MTP 投机解码 3 个草稿 token（取舍见下文"草稿 token 数的取舍"）；MTP 层的 FP8 MoE 自动选后端（`SPEC_MOE=auto`） |
 | `--kv-cache-dtype fp8` | FP8 KV cache，约 455 万 token |
 | `NUMA=1` | `--numa-bind`：worker 与其 PLE 表分片绑定到 GPU 所在 NUMA 节点 |
 | `NCCL_LL=1` | `NCCL_P2P_LEVEL=SYS` + `nccl_ll_tuner.c`：≤320 KB 的 TP all-reduce 用 LL 协议（~31 µs → 12–17 µs） |
@@ -341,6 +342,26 @@ done
 | 同上，`SPEC=3` | 189 / 731 / 1081 |
 
 mt-bench 并发 1：186 tok/s，MTP 接受率 54.6%，接受长度 2.09。
+
+草稿 token 数的取舍（v0.34.0 集成版，TP4，真实文本，每用户 tok/s = 1000 / TPOT 中位数；
+2 测了两次）：
+
+| `SPEC` | 并发 1，10K→4000 | 并发 1，3K→1000 | 并发 8，3K→1000 总吞吐 | 接受长度 | 每步耗时 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 241 | 240 | 906 | 1.77 | 7.3 ms |
+| 2 | 273–275 | 272–274 | 971–979 | 2.31 | 8.4 ms |
+| 3 | 291 | 283 | 956 | 2.69 | 9.3 ms |
+| 4 | 250 | 250 | 902 | 2.91 | 11.6 ms |
+
+每多起草一个 token 约多花 0.9–1.1 ms，各位置在前一位被接受的条件下接受率都在
+70–75%。真实文本上 `SPEC=3` 在并发 1 时比 2 高 3–6%，并发 8 时低约 2%；上表
+random 输入的旧结果里 3 在各并发下都更低，因为随机输入的接受率低。
+
+同一批 50 条请求逐条配对（并发 1），`SPEC=3` 的 TPOT 比 `SPEC=2` 低 3.1–4.4%，
+10K→4000 上的 95% 区间为 2.2–7.8% 和 1.9–6.2%（对两次 `SPEC=2` 各一）；两次
+`SPEC=2` 之间只差 0.4–0.7%。并发 8 的那约 2% 没有做配对分析。
+
+默认用 3，取单用户延迟；以并发总吞吐为先时用 2。
 
 All-reduce 微基准（`~/ar.py`，TP4，µs）：
 
