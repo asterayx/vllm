@@ -15,6 +15,9 @@ from vllm.model_executor.kernels.attention.dsa.fused_mqa_topk import (
     FUSED_MQA_TOPK_MAX_ROWS,
     use_fused_mqa_topk,
 )
+from vllm.model_executor.layers.sm120_paged_mqa_logits import (
+    sm120_deepgemm_supports_paged_logits,
+)
 from vllm.model_executor.warmup.jit_warmup import kernel_launcher, zip_inputs
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
@@ -1878,7 +1881,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if (
+                current_platform.is_cuda()
+                and has_deep_gemm()
+                and not (
+                    current_platform.is_device_capability_family(120)
+                    and not sm120_deepgemm_supports_paged_logits(
+                        self.kv_cache_spec.num_states
+                    )
+                )
+            ):
+                # Skipped on SM120 for pages DeepGEMM logits cannot take.
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,

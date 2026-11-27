@@ -5,9 +5,12 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch import nn
 
+import vllm.envs as envs
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
@@ -31,6 +34,9 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
 # its traffic entirely.
 MAX_CHUNK_BYTES = 2**30  # 1GB
 _FP32_BYTES = 4
+
+
+logger = init_logger(__name__)
 
 
 def unconditional_to_conditional_rates(rates: list[float]) -> list[float]:
@@ -149,6 +155,42 @@ def gather_draft_sampled(
     return draft_sampled, pos
 
 
+@triton.jit
+def _greedy_top_tokens_verify_kernel(
+    sampled_ptr,
+    sampled_stride,
+    num_sampled_ptr,
+    top_tokens_ptr,
+    draft_sampled_ptr,
+    cu_num_logits_ptr,
+):
+    # try45 (DPSK_VOCAB_LOCAL_ARGMAX): greedy verification from precomputed
+    # global target argmax per logit row (vocab-shard local argmax + tiny
+    # (max, idx) all-gather), identical semantics to the greedy branch of
+    # _rejection_kernel + _insert_resampled_kernel.
+    req_idx = tl.program_id(0)
+    start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
+    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1).to(tl.int64)
+    num_draft_tokens = end_idx - start_idx - 1
+    accepted_length = tl.zeros((), tl.int32)
+    verifying = True
+    for i in range(num_draft_tokens):
+        if verifying:
+            draft = tl.load(draft_sampled_ptr + start_idx + i + 1).to(tl.int64)
+            target = tl.load(top_tokens_ptr + start_idx + i).to(tl.int64)
+            accepted = (target == draft) & (draft >= 0)
+            verifying = accepted
+            accepted_length += accepted.to(tl.int32)
+            tl.store(
+                sampled_ptr + req_idx * sampled_stride + i,
+                tl.where(accepted, draft, target),
+            )
+    if accepted_length == num_draft_tokens:
+        bonus = tl.load(top_tokens_ptr + end_idx - 1).to(tl.int64)
+        tl.store(sampled_ptr + req_idx * sampled_stride + num_draft_tokens, bonus)
+    tl.store(num_sampled_ptr + req_idx, accepted_length + 1)
+
+
 class RejectionSampler:
     def __init__(
         self,
@@ -160,6 +202,7 @@ class RejectionSampler:
     ):
         self.sampler = sampler
         self.watermark_key = watermark_key
+        self._local_argmax_checks_left = envs.DPSK_VOCAB_LOCAL_ARGMAX_CHECK
         if watermark_key is not None:
             assert isinstance(sampler, GPUWatermarkSampler)
         self.num_speculative_steps = spec_config.num_speculative_tokens
@@ -428,6 +471,101 @@ class RejectionSampler:
             else None
         )
         return sampled, num_sampled, logprobs_tensors, sampling_mask_tensors
+
+    def can_greedy_from_top_tokens(
+        self, input_batch: InputBatch, draft_logits: torch.Tensor | None
+    ) -> bool:
+        if (
+            draft_logits is not None
+            or self.watermark_key is not None
+            or self.synthetic_conditional_rates is not None
+            or self.use_block_verification
+            or self.enable_adaptive_verification
+            or self.sampler.compute_nans
+            or getattr(self.sampler, "trace_replay_state", None) is not None
+        ):
+            return False
+        idx_np = input_batch.idx_mapping_np
+        if np.any(self.sampler.needs_logits_processing[idx_np]):
+            return False
+        states = self.sampler.sampling_states
+        if self.sampler.get_logprobs_dims(idx_np) is not None:
+            return False
+        return bool(np.all(states.temperature.np[idx_np] == 0.0))
+
+    def greedy_from_local_argmax(
+        self,
+        model: nn.Module,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        draft_logits: torch.Tensor | None,
+    ) -> SamplerOutput | None:
+        """Greedy verification from a vocab-shard-local argmax.
+
+        Each TP rank takes the argmax of its own vocabulary shard and only the
+        `(max, idx)` pairs are gathered, instead of full-vocab logits. Returns
+        None when the batch needs the full distribution.
+        """
+        if (
+            input_batch.num_reqs == 0
+            or input_batch.num_draft_tokens == 0
+            or not self.can_greedy_from_top_tokens(input_batch, draft_logits)
+        ):
+            return None
+        language_model = getattr(model, "language_model", model)
+        sample_hidden_states = hidden_states[input_batch.logits_indices]
+        top_tokens = language_model.logits_processor.get_top_tokens(
+            language_model.lm_head, sample_hidden_states
+        )
+        if self._local_argmax_checks_left > 0:
+            self._local_argmax_checks_left -= 1
+            ref = model.compute_logits(sample_hidden_states).argmax(-1)
+            logger.warning(
+                "DPSK_VOCAB_LOCAL_ARGMAX check: rows=%d mismatches=%d",
+                ref.numel(),
+                int((ref != top_tokens).sum()),
+            )
+        return self.greedy_from_top_tokens(top_tokens, input_batch)
+
+    def greedy_from_top_tokens(
+        self, top_tokens: torch.Tensor, input_batch: InputBatch
+    ) -> SamplerOutput:
+        draft_sampled, _pos = gather_draft_sampled(
+            input_batch.input_ids,
+            input_batch.positions,
+            input_batch.logits_indices,
+            input_batch.expanded_idx_mapping,
+            input_batch.expanded_local_pos,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        num_reqs = input_batch.num_reqs
+        sampled = draft_sampled.new_empty(
+            num_reqs, self.num_speculative_steps + 1, dtype=torch.int64
+        )
+        num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
+        _greedy_top_tokens_verify_kernel[(num_reqs,)](
+            sampled,
+            sampled.stride(0),
+            num_sampled,
+            top_tokens,
+            draft_sampled,
+            input_batch.cu_num_logits,
+            num_warps=1,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
 
     def __call__(
         self,

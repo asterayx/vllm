@@ -1,5 +1,8 @@
 # Contributing to vLLM
 
+For maintenance of the `asterayx/vllm` fork, see the
+[version and branch strategy](fork_version_strategy.md).
+
 Thank you for your interest in contributing to vLLM! Our community is open to everyone and welcomes all kinds of contributions, no matter how small or large. There are several ways you can contribute to the project:
 
 - Identify and report any issues or bugs.

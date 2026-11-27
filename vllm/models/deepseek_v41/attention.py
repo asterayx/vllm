@@ -75,6 +75,7 @@ from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v41.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.dpsk_nvtx import dpsk_nvtx_fn
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
@@ -98,6 +99,8 @@ from vllm.v1.kv_cache_interface import (
 
 logger = init_logger(__name__)
 
+_DPSK_FP8_SKINNY_LINEAR = envs.DPSK_FP8_SKINNY_LINEAR
+_DPSK_FP8_SKINNY_QQ_UNFUSE = envs.DPSK_FP8_SKINNY_QQ_UNFUSE
 # From this many tokens, a layer with shard_fused_wqa_wkv set projects one token
 # shard per TP rank and all-gathers the result.
 _SHARD_FUSED_WQA_WKV_MIN_TOKENS = 2048
@@ -653,7 +656,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
             backend_cls=self.swa_backend_cls,
-            block_size=32,
+            # SM120 FlashInfer sparse-MLA (flashinfer 0.7.0.post1) only has
+            # dsv4 kernels for page_block_size=64; 32 fails at profile time.
+            block_size=64 if current_platform.is_device_capability_family(120) else 32,
             packed_bytes_per_token=self.swa_bytes_per_token,
             packed_page_alignment=self.kv_page_alignment,
             # FlashMLA reads the interleaved V4.1 records as rows of the whole
@@ -899,6 +904,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         linears = [self.wq_b]
         if self.indexer is not None:
             linears.append(self.indexer.wq_b)
+        # With DPSK_FP8_SKINNY_LINEAR, wq_b / indexer.wq_b take bf16 so the fp8
+        # skinny path can run; DPSK_FP8_SKINNY_QQ_UNFUSE=0 keeps the fusion.
+        if (
+            _DPSK_FP8_SKINNY_LINEAR
+            and _DPSK_FP8_SKINNY_QQ_UNFUSE
+            and any(getattr(m, "_fp8_skinny", None) is not None for m in linears)
+        ):
+            return False
         return can_fuse_query_quant(linears)
 
     def _split_qkv_and_norm(
@@ -1104,6 +1117,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         return qr_kv, kv_score, indexer_weights
 
     @eager_break_during_capture
+    @dpsk_nvtx_fn("dpsk:attn_eager_break")
     def _sparse_indexer_and_attn(
         self,
         hidden_states: torch.Tensor,

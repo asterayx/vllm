@@ -16,6 +16,9 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
+from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+    _greedy_top_tokens_verify_kernel,
+)
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
 
 VOCAB_SIZE = 155264
@@ -147,3 +150,49 @@ def test_block_verification_i64_indexing(
     assert num_sampled.item() == num_sampled_ref.item()
     n = num_sampled_ref.item()
     assert torch.equal(sampled[:n], sampled_ref[:n])
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="Requires CUDA or ROCm"
+)
+def test_greedy_top_tokens_matches_rejection_sample():
+    # Full acceptance, rejection at step zero, rejection after one acceptance,
+    # and a placeholder whose clamped value would otherwise match target zero.
+    device = "cuda"
+    target = torch.tensor([1, 2, 3, 4, 5, 6, 1, 2, 3, 0, 7], device=device)
+    draft = torch.tensor([-1, 1, 2, -1, 1, 5, -1, 1, 9, -1, -1], device=device)
+    logits = torch.zeros((target.numel(), 16), device=device)
+    logits.scatter_(1, target[:, None], 1)
+    offsets = torch.tensor([0, 3, 6, 9, 11], dtype=torch.int32, device=device)
+    reqs = torch.arange(4, dtype=torch.int32, device=device)
+    expected, expected_counts = rejection_sample(
+        target_logits=logits,
+        draft_logits_cache=None,
+        draft_sampled=draft,
+        cu_num_logits=offsets,
+        pos=torch.arange(target.numel(), device=device),
+        idx_mapping=reqs,
+        expanded_idx_mapping=torch.tensor(
+            [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3],
+            dtype=torch.int32,
+            device=device,
+        ),
+        expanded_local_pos=torch.tensor(
+            [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1],
+            dtype=torch.int32,
+            device=device,
+        ),
+        temperature=torch.zeros(4, device=device),
+        seed=torch.zeros(4, dtype=torch.int64, device=device),
+        num_speculative_steps=2,
+    )
+    sampled = torch.empty_like(expected)
+    counts = torch.empty_like(expected_counts)
+    _greedy_top_tokens_verify_kernel[(4,)](
+        sampled, sampled.stride(0), counts, target, draft, offsets, num_warps=1
+    )
+
+    assert expected_counts.tolist() == [3, 1, 2, 1]
+    assert torch.equal(counts, expected_counts)
+    for row, count in enumerate(expected_counts.tolist()):
+        assert torch.equal(sampled[row, :count], expected[row, :count])

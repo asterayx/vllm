@@ -6,6 +6,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -142,6 +143,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
             and not self.context_kv_only
         )
+        # Allow FULL_DECODE_ONLY draft graphs while the target stays PIECEWISE
+        # (the draft was launch-bound, about 193 eager kernels).
+        if envs.DPSK_DRAFT_FULL_CG and not self.context_kv_only:
+            logger.info("DPSK_DRAFT_FULL_CG=1: forcing FULL_DECODE_ONLY draft graphs")
+            wants_full = True
         supports_full = (
             self.attn_cg_support.min_cg_support.value
             >= AttentionCGSupport.UNIFORM_BATCH.value

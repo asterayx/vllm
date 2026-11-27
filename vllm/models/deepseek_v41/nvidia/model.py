@@ -67,6 +67,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    spec_decode_needs_target_embed,
 )
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -813,6 +814,9 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    # Relay DSpark aux hidden states across PP stages (EagleModelMixin).
+    supports_aux_hidden_states_over_pp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -958,7 +962,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.candidate_block_buffer = None
 
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
+            # The last PP rank also needs embed_tokens for the DSpark drafter.
             # On SM80 embed_input_ids sums the vocabulary shards with the
             # two-shot kernel too (and so does the DSpark draft model, which
             # shares this module).
@@ -1326,6 +1331,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             pre_mix = intermediate_tensors["pre_mix"]
             if self.use_sequence_parallel:
                 pre_mix = sp_shard(pre_mix)
+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
         hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
             range(self.start_layer, self.decoder_replay_start),
@@ -1378,6 +1384,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 {
                     "hidden_states": hidden_states,
                     "pre_mix": pre_mix,
+                    **self.pack_local_aux_hidden_states(aux_hidden_states),
                     **(
                         self.pipeline_relay.transfer(
                             positions,
@@ -1408,6 +1415,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        aux_hidden_states = remote_aux + aux_hidden_states
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -1458,7 +1466,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     residual,
                     engram_hashes,
                     engram_mask,
-                    capture_previous_aux=idx in self.aux_hidden_state_layers,
+                    capture_previous_aux=idx in self.aux_hidden_state_layers
+                    and (get_pp_group().is_first_rank or idx != self.start_layer),
                     mega_gate_metadata=mega_gate_metadata,
                 )
             )
@@ -1966,6 +1975,26 @@ class DeepseekV41LLMForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+
+    def apply_decode_kernel_overrides(self, draft_model: nn.Module | None) -> None:
+        """Swap in the opt-in small-batch decode kernels after weights load.
+
+        Called by the model runner once the target and draft models are
+        loaded, so each override can compile and check itself before CUDA
+        graph capture.
+        """
+        if envs.DPSK_LMHEAD_SKINNY:
+            from .lmhead_gemm import enable_dpsk_lmhead_skinny
+
+            enable_dpsk_lmhead_skinny(self, draft_model)
+        if envs.DPSK_WO_A_FP8_SKINNY:
+            from .ops.wo_a_fp8_skinny import enable_dpsk_wo_a_fp8
+
+            enable_dpsk_wo_a_fp8(self, draft_model)
+        if envs.DPSK_FP8_SKINNY_LINEAR:
+            from .ops.fp8_skinny_linear import enable_dpsk_fp8_skinny_linear
+
+            enable_dpsk_fp8_skinny_linear(self, draft_model)
 
     def build_specialized_decode(self) -> "SpecializedDecode":
         from .specialized_decode.logits.logits import SpecializedDecodeLogitsProcessor

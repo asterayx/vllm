@@ -167,6 +167,44 @@ def _warmup_ll_bf16_router_gemm(model: torch.nn.Module) -> None:
         shapes=shapes,
         m_values=_LL_BF16_WARMUP_M_RANGE,
     )
+    _warmup_ll_bf16_router_gemm_bf16_out(model)
+
+
+def _warmup_ll_bf16_router_gemm_bf16_out(model: torch.nn.Module) -> None:
+    """Compile the bf16-output variant for routers that dispatch to it."""
+    from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+        ll_bf16_gemm_c1_pdl_kernel,
+        ll_bf16_gemm_kernel,
+    )
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+
+    shapes: set[tuple[int, int]] = set()
+    max_tokens = 0
+    for module in model.modules():
+        if (
+            isinstance(module, GateLinear)
+            and module.allow_ll_bf16_gemm
+            and module._ll_bf16_out_dtype == torch.bfloat16
+        ):
+            n, k = module.weight.shape
+            shapes.add((int(k), int(n)))
+            max_tokens = max(max_tokens, module._ll_bf16_max_tokens)
+    if not shapes:
+        return
+
+    logger.info_once(
+        "Warming up bf16-output ll_bf16 router GEMM kernels for shapes: %s, M <= %d.",
+        tuple(sorted(shapes)),
+        max_tokens,
+    )
+    ll_bf16_gemm_c1_pdl_kernel.warmup(
+        shapes=shapes, m_values=(1,), output_dtype=torch.bfloat16
+    )
+    ll_bf16_gemm_kernel.warmup(
+        shapes=shapes,
+        m_values=range(2, max_tokens + 1),
+        output_dtype=torch.bfloat16,
+    )
 
 
 def _warmup_skinny_gemm(model: torch.nn.Module) -> None:

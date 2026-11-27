@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.b12x as b12x
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 import vllm.model_executor.layers.fused_moe.oracle.mxfp4 as mxfp4_oracle
@@ -180,6 +181,8 @@ def _make_b12x_moe_kernel(
     activation: MoEActivation,
     quant_config: FusedMoEQuantConfig,
     csf_scales: bool = False,
+    *,
+    warmup: bool = False,
 ) -> mk.FusedMoEKernel:
     num_experts = w1.shape[0]
     moe_config = make_dummy_moe_config(
@@ -198,14 +201,13 @@ def _make_b12x_moe_kernel(
         activation=activation,
     )
     experts = B12xExperts(moe_config, quant_config, csf_scales=csf_scales)
-    layer = SimpleNamespace(
-        activation=activation,
-        apply_router_weight_on_input=False,
-        w13_weight=w1,
-        w2_weight=w2,
-        w13_weight_scale=quant_config.w1_scale,
-        w2_weight_scale=quant_config.w2_scale,
-    )
+    layer = torch.nn.Module()
+    layer.activation = activation
+    layer.apply_router_weight_on_input = False
+    layer.w13_weight = w1
+    layer.w2_weight = w2
+    layer.w13_weight_scale = quant_config.w1_scale
+    layer.w2_weight_scale = quant_config.w2_scale
     if quant_config.weight_quant_dtype == "nvfp4":
         layer.w13_weight_scale_2 = quant_config.g1_alphas
         layer.w2_weight_scale_2 = quant_config.g2_alphas
@@ -215,6 +217,8 @@ def _make_b12x_moe_kernel(
             layer.w13_input_scale = 1.0 / quant_config.a1_gscale
             layer.w2_input_scale = 1.0 / quant_config.a2_gscale
     experts.process_weights_after_loading(layer)
+    if warmup:
+        experts.warmup_launches(layer, token_counts=[hidden_states.shape[0]])
     return mk.FusedMoEKernel(
         maybe_make_prepare_finalize(
             moe=moe_config,
@@ -234,6 +238,9 @@ def _run_b12x_moe(
     topk: int,
     activation: MoEActivation,
     quant_config: FusedMoEQuantConfig,
+    *,
+    warmup: bool = False,
+    out_of_range_ids: bool = False,
 ) -> torch.Tensor:
     num_experts = w1.shape[0]
     kernel = _make_b12x_moe_kernel(
@@ -243,10 +250,14 @@ def _run_b12x_moe(
         topk,
         activation,
         quant_config,
+        warmup=warmup,
     )
     topk_weights, topk_ids, _ = fused_topk(
         hidden_states, score, topk, renormalize=False
     )
+    if out_of_range_ids:
+        topk_ids[0, 0] = -1
+        topk_ids[-1, -1] = num_experts
     return kernel.apply(
         hidden_states=hidden_states,
         w1=w1,
@@ -1083,9 +1094,12 @@ def _make_b12x_moe_case(
     activation: MoEActivation = MoEActivation.SILU,
     tokens: int = 16,
     seed: int = 19,
+    num_experts: int = 4,
+    hidden_size: int = 512,
+    intermediate_size: int = 128,
+    topk: int = 2,
 ) -> _B12xMoeCase:
     set_random_seed(seed)
-    num_experts, hidden_size, intermediate_size = 4, 512, 128
     dtype = torch.bfloat16
     hidden_states = torch.randn((tokens, hidden_size), device="cuda", dtype=dtype) / 10
     w1_rows = 2 * intermediate_size if activation.is_gated else intermediate_size
@@ -1197,6 +1211,7 @@ def _make_b12x_moe_case(
         quant_config=quant_config,
         activation=activation,
         activation_dtype=activation_dtype,
+        topk=topk,
     )
 
 
@@ -1283,6 +1298,171 @@ def test_b12x_moe_matches_torch(
         dim=0,
     )
     assert cosine > 0.99
+
+
+@pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
+@pytest.mark.parametrize("intermediate_size", [128, 160, 192, 256, 320])
+@pytest.mark.parametrize("tokens", [1, 2, 3, 4, 8, 16, 24, 32, 48, 64, 96, 128])
+@torch.inference_mode()
+def test_b12x_nvfp4_moe_small_batch_unaligned_intermediate(
+    intermediate_size: int, tokens: int, workspace_init
+) -> None:
+    # Qwen3.8-Flash-Next at TP4: 640 / 4 = 160 per rank, padded to 192 for b12x.
+    # Small token counts take the micro-kernel path used by decode CUDA graphs.
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        case = _make_b12x_moe_case(
+            "nvfp4",
+            "nvfp4",
+            tokens=tokens,
+            num_experts=64,
+            hidden_size=2560,
+            intermediate_size=intermediate_size,
+            topk=10,
+        )
+        topk_weights, topk_ids, _ = fused_topk(
+            case.hidden_states, case.score, case.topk, renormalize=False
+        )
+        reference = _nvfp4_activation_reference(
+            case.hidden_states,
+            case.w1_ref,
+            case.w2_ref,
+            topk_weights,
+            topk_ids,
+            case.quant_config.a1_gscale,
+            case.quant_config.a2_gscale,
+        )
+        output = _run_b12x_moe(
+            case.hidden_states,
+            case.w1,
+            case.w2,
+            case.score,
+            case.topk,
+            case.activation,
+            case.quant_config,
+            warmup=envs.QWEN4_EXP_TRITON_MOE,
+        )
+        torch.accelerator.synchronize()
+
+    cosine = torch.nn.functional.cosine_similarity(
+        output.flatten().float(), reference.flatten().float(), dim=0
+    )
+    assert cosine > 0.99
+
+
+@pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
+@pytest.mark.parametrize("tokens", [3, 9, 16])
+@pytest.mark.parametrize("downbf16", [0, 1])
+@torch.inference_mode()
+def test_triton_nvfp4_moe_matches_b12x(
+    tokens: int, downbf16: int, workspace_init, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        outputs = []
+        for use_triton in (False, True):
+            monkeypatch.setenv("QWEN4_EXP_TRITON_MOE", str(int(use_triton)))
+            monkeypatch.setenv("QWEN4_EXP_TRITON_MOE_MAX_M", "96")
+            monkeypatch.setenv("QWEN4_EXP_TRITON_MOE_DOWNBF16", str(downbf16))
+            # Preparation can rewrite packed storage. Recreate the same seeded
+            # inputs and weights for each backend.
+            case = _make_b12x_moe_case(
+                "nvfp4",
+                "nvfp4",
+                tokens=tokens,
+                num_experts=64,
+                hidden_size=2560,
+                intermediate_size=160,
+                topk=10,
+            )
+            outputs.append(
+                _run_b12x_moe(
+                    case.hidden_states,
+                    case.w1,
+                    case.w2,
+                    case.score,
+                    case.topk,
+                    case.activation,
+                    case.quant_config,
+                    warmup=use_triton,
+                ).float()
+            )
+
+    reference, triton = outputs
+    rel_l2 = (triton - reference).norm(dim=1) / reference.norm(dim=1)
+    # On SM120 the six cases peaked at 0.00715 per token. Allow 0.008 for
+    # different FP4 quantization and FP32 accumulation/rounding in the two paths.
+    assert rel_l2.max().item() < 0.008
+
+
+@pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
+@pytest.mark.parametrize("tokens", [1, 3, 4])
+@pytest.mark.parametrize("out_of_range_ids", [False, True])
+@torch.inference_mode()
+def test_triton_nvfp4_moe_direct_layout_matches_grouped(
+    tokens: int,
+    out_of_range_ids: bool,
+    workspace_init,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # out_of_range_ids: the router can hand over ids outside [0, E), as it
+    # did while CUDA graphs were warmed up on dummy inputs. Grouping skips
+    # those pairs, so the direct layout must skip them too.
+    align_calls = 0
+    align = ops.moe_align_block_size
+
+    def counting_align(*args, **kwargs):
+        nonlocal align_calls
+        align_calls += 1
+        return align(*args, **kwargs)
+
+    monkeypatch.setattr(ops, "moe_align_block_size", counting_align)
+    monkeypatch.setenv("QWEN4_EXP_TRITON_MOE", "1")
+    monkeypatch.setenv("QWEN4_EXP_TRITON_MOE_MAX_M", "96")
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        outputs = []
+        calls = []
+        for direct_max_m in (0, tokens):
+            monkeypatch.setenv("QWEN4_EXP_TRITON_MOE_DIRECT_MAX_M", str(direct_max_m))
+            align_calls = 0
+            # 64 experts and top-10 make tokens share experts, the case where
+            # the two layouts put a pair in different blocks.
+            case = _make_b12x_moe_case(
+                "nvfp4",
+                "nvfp4",
+                tokens=tokens,
+                num_experts=64,
+                hidden_size=2560,
+                intermediate_size=160,
+                topk=10,
+            )
+            outputs.append(
+                _run_b12x_moe(
+                    case.hidden_states,
+                    case.w1,
+                    case.w2,
+                    case.score,
+                    case.topk,
+                    case.activation,
+                    case.quant_config,
+                    warmup=True,
+                    out_of_range_ids=out_of_range_ids,
+                ).float()
+            )
+            calls.append(align_calls)
+
+    grouped, direct = outputs
+    assert calls[0] > 0
+    assert calls[1] == 0
+    rel_l2 = (direct - grouped).norm(dim=1) / grouped.norm(dim=1)
+    # Each pair goes through the same arithmetic in both layouts. What can
+    # differ is the order of the FP32 atomic adds over a token's experts.
+    # On SM120 the three in-range cases measured 0, 1.1e-9 and 5.0e-8.
+    assert rel_l2.max().item() < 1e-6
 
 
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")

@@ -320,6 +320,13 @@ class Glm47MoeParser(ParserEngine):
             )
             thinking = None
             enable_thinking = None
+        # Honor only switches that the supplied template actually reads.
+        template = getattr(tokenizer, "chat_template", None)
+        if isinstance(template, str):
+            if not re.search(r"\bthinking\b", template):
+                thinking = None
+            if "enable_thinking" not in template:
+                enable_thinking = None
         self.thinking_enabled = (
             True
             if thinking is None and enable_thinking is None

@@ -100,6 +100,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
 from vllm.triton_utils import HAS_TRITON
+from vllm.utils.dpsk_nvtx import dpsk_nvtx_fn
 from vllm.utils.extensible_tensor import granule_size
 from vllm.utils.flashinfer import warn_if_flashinfer_kernels_missing
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
@@ -1506,6 +1507,7 @@ class Worker(WorkerBase):
     @torch.inference_mode()
     @with_gpu_sync_check
     @finish_iteration_timing
+    @dpsk_nvtx_fn("dpsk:worker_sample_tokens")
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -1514,6 +1516,7 @@ class Worker(WorkerBase):
     @torch.inference_mode()
     @with_gpu_sync_check
     @start_iteration_timing
+    @dpsk_nvtx_fn("dpsk:worker_execute_model")
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:

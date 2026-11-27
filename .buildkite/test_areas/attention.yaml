@@ -135,5 +135,11 @@ steps:
   source_file_dependencies:
   - vllm/v1/attention/backends/flashinfer.py
   - tests/v1/attention/test_attention_backends.py
+  - vllm/model_executor/layers/sm120_paged_mqa_logits.py
+  - vllm/model_executor/layers/sparse_attn_indexer.py
+  - tests/model_executor/layers/test_mla_short_prefill_indexer.py
   commands:
   - pytest -v -s v1/attention/test_attention_backends.py -k nvfp4_decode_correctness
+  - >-
+    pytest -v -s
+    model_executor/layers/test_mla_short_prefill_indexer.py::test_sm120_paged_sparse_mqa_logits_matches_reference

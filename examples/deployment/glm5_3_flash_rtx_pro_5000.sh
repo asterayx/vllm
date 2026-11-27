@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Serve GLM-5.3-Flash (Glm5Next: KDA linear attention + sparse MLA with a
+# Kpool indexer) on RTX PRO 5000 Blackwell (sm_120) GPUs.
+#
+# SM120 sparse MLA runs on FlashInfer (FLASHINFER_MLA_SPARSE_SM120); the
+# indexer needs DeepGEMM (vendored). FP8 KV cache halves MLA cache size.
+#
+# Usage:
+#   MODEL=~/models/zai-org/GLM-5.3-Flash TP=4 ./glm5_3_flash_rtx_pro_5000.sh
+#   NUMA=1        # bind each GPU worker to its NUMA node
+#   NCCL_LL=1     # P2P across sockets + LL for decode-sized TP all-reduce
+#   SPEC=N        # MTP speculative decoding with N draft tokens
+#   TOOLS=1       # enable tool calling (glm47 parser)
+#   STRICT_EFFORT=0  # accept any reasoning_effort (GLM maps all but
+#                    # low/high to max); default rejects them with HTTP 400
+#
+# Recommended on 4x RTX PRO 5000 72GB (NVFP4 checkpoint):
+#   NUMA=1 NCCL_LL=1 SPEC=3 ./glm5_3_flash_rtx_pro_5000.sh --moe-backend b12x
+# mt-bench output tok/s at concurrency 1/8/16 (default sampling):
+#   SPEC=2: 152/567/755 (acceptance length 2.41)
+#   SPEC=3: 165/562/808 (acceptance length 2.85)
+# The MTP layer is BF16 and costs ~3.7 GiB/GPU of KV cache.
+# Full runbook: glm5_3_flash_rtx_pro_5000.md
+set -euo pipefail
+
+MODEL=${MODEL:-zai-org/GLM-5.3-Flash}
+TP=${TP:-4}
+MAX_LEN=${MAX_LEN:-65536}
+MAX_SEQS=${MAX_SEQS:-16}
+GPU_UTIL=${GPU_UTIL:-0.93}
+PORT=${PORT:-8000}
+PYTHON=${PYTHON:-.venv/bin/python}
+# Keep colored logs when piped through tee; view saved logs with `less -R`.
+export VLLM_LOGGING_COLOR=${VLLM_LOGGING_COLOR:-1}
+# FlashInfer JIT needs ninja (installed into the venv) on PATH.
+PY_BIN_DIR=$(dirname "$PYTHON")
+if [[ -x "$PY_BIN_DIR/ninja" ]]; then
+    export PATH="$(cd "$PY_BIN_DIR" && pwd):$PATH"
+fi
+# vLLM treats FlashInfer as unavailable without flashinfer-cubin or nvcc on
+# PATH, silently dropping FlashInfer backends (e.g. SM120 sparse MLA).
+if ! command -v nvcc >/dev/null && [[ -x "${CUDA_HOME:-/usr/local/cuda}/bin/nvcc" ]]; then
+    export PATH="${CUDA_HOME:-/usr/local/cuda}/bin:$PATH"
+fi
+
+nvidia-smi --query-gpu=index,name,compute_cap,memory.total --format=csv
+
+extra=()
+if [[ "${NUMA:-0}" == "1" ]]; then
+    extra+=(--numa-bind)
+fi
+if [[ "${NCCL_LL:-0}" == "1" ]]; then
+    src="$(dirname "$0")/nccl_ll_tuner.c"
+    tuner="${XDG_CACHE_HOME:-$HOME/.cache}/vllm/libnccl_ll_tuner.so"
+    if [[ ! -f "$tuner" || "$src" -nt "$tuner" ]]; then
+        mkdir -p "$(dirname "$tuner")"
+        gcc -fPIC -shared -O2 -o "$tuner" "$src"
+    fi
+    export NCCL_P2P_LEVEL=${NCCL_P2P_LEVEL:-SYS}
+    export NCCL_TUNER_PLUGIN=$tuner
+fi
+if [[ "${SPEC:-0}" != "0" ]]; then
+    extra+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $SPEC, \"moe_backend\": \"${SPEC_MOE:-auto}\"}")
+fi
+if [[ "${TOOLS:-0}" == "1" ]]; then
+    extra+=(--enable-auto-tool-choice --tool-call-parser glm47)
+fi
+if [[ "${STRICT_EFFORT:-1}" == "1" ]]; then
+    template="${XDG_CACHE_HOME:-$HOME/.cache}/vllm/glm5_strict_effort.jinja"
+    mkdir -p "$(dirname "$template")"
+    "$PYTHON" "$(dirname "$0")/glm5_strict_effort_template.py" "$MODEL" "$template"
+    extra+=(--chat-template "$template")
+fi
+
+exec "$PYTHON" -m vllm.entrypoints.cli.main serve "$MODEL" \
+    --tensor-parallel-size "$TP" \
+    --max-model-len "$MAX_LEN" \
+    --max-num-seqs "$MAX_SEQS" \
+    --gpu-memory-utilization "$GPU_UTIL" \
+    --kv-cache-dtype fp8 \
+    --reasoning-parser glm47 \
+    --port "$PORT" \
+    "${extra[@]}" \
+    "$@"
