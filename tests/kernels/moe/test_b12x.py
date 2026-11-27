@@ -1458,11 +1458,15 @@ def test_triton_nvfp4_moe_direct_layout_matches_grouped(
     grouped, direct = outputs
     assert calls[0] > 0
     assert calls[1] == 0
-    rel_l2 = (direct - grouped).norm(dim=1) / grouped.norm(dim=1)
     # Each pair goes through the same arithmetic in both layouts. What can
-    # differ is the order of the FP32 atomic adds over a token's experts.
-    # On SM120 the three in-range cases measured 0, 1.1e-9 and 5.0e-8.
-    assert rel_l2.max().item() < 1e-6
+    # differ is the order of the FP32 atomic adds over a token's experts,
+    # which is not fixed between runs either, so a sum can land on the other
+    # side of a bf16 rounding boundary. On SM120 the runs that differed did
+    # so in single elements, by one bf16 step.
+    magnitude = torch.maximum(direct.abs(), grouped.abs())
+    tiny = torch.finfo(torch.float32).tiny
+    bf16_step = torch.exp2(torch.floor(torch.log2(magnitude.clamp_min(tiny))) - 7)
+    assert ((direct - grouped).abs() <= bf16_step).all()
 
 
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
