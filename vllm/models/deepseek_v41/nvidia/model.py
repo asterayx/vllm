@@ -1346,6 +1346,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 "the pipeline stage holding the last KV source layer must also "
                 "hold every layer after it"
             )
+        elif self.start_layer == cut:
+            # The replay layers take residual and mixes from the layer before
+            # the cut, which this stage does not hold.
+            reason = (
+                "the last KV source layer is the first layer of this pipeline stage"
+            )
         elif self.use_sequence_parallel or parallel_config.use_ubatching:
             reason = (
                 "the replay-layer batch shrinks per rank, which sequence and "
