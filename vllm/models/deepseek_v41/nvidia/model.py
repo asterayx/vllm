@@ -684,14 +684,35 @@ class DeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
         pre_mix: torch.Tensor,
-        post_mix: torch.Tensor,
-        res_mix: torch.Tensor,
-        residual: torch.Tensor,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
     ) -> None:
         """Write the KV ``forward`` would for the replay layers' inputs, skipping
         the rest of the layer; the replay batch then reruns its rows."""
         # The replay batch rules out Engram and sequence parallel here.
         assert self.engram is None and not self.use_sequence_parallel
+        if residual is None:
+            # First layer of a later pipeline stage: ``x`` is the hc stream the
+            # previous stage sent, as in ``forward``.
+            assert isinstance(x, torch.Tensor) and x.dim() == 3
+            _, _, x, _ = mhc_pre_delayed_tilelang(
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                pre_mix=pre_mix,
+                norm_weight=self.attn_norm.weight,
+                norm_eps=self.attn_norm.variance_epsilon,
+            )
+            self.attn.forward_kv(positions, x)
+            return
+        assert post_mix is not None and res_mix is not None
         *_, x, _, _ = mhc_shifted_post_pre(
             x,
             residual,
@@ -1122,19 +1143,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 pre_mix = sp_shard(pre_mix)
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
-        hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
-            range(self.start_layer, self.decoder_replay_start),
-            hidden_states,
-            positions,
-            input_ids,
-            pre_mix,
-            post_mix,
-            res_mix,
-            residual,
-            aux_hidden_by_layer,
-            engram_hashes,
-            engram_mask,
-        )
+        # A later pipeline stage that starts at the replay cut holds replay
+        # layers only; they start from the stream the previous stage sent.
+        if self.start_layer < self.decoder_replay_start:
+            hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
+                range(self.start_layer, self.decoder_replay_start),
+                hidden_states,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                aux_hidden_by_layer,
+                engram_hashes,
+                engram_mask,
+            )
         late_aux: list[torch.Tensor] = []
         if self.decoder_replay_layers is not None:
             hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
@@ -1149,6 +1173,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 residual,
             )
         else:
+            assert residual is not None and post_mix is not None
+            assert res_mix is not None
             hidden_states = self._collapse(
                 hidden_states,
                 residual,
@@ -1288,9 +1314,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
         pre_mix: torch.Tensor,
-        post_mix: torch.Tensor,
-        res_mix: torch.Tensor,
-        residual: torch.Tensor,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, ...]:
         """Layers ``decoder_replay_start``.. on the given rows; returns their output,
         the last FFN's pre-mix and the aux hidden states they capture."""
