@@ -276,6 +276,23 @@ def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn):
     ]
 
 
+def test_flashinfer_autotune_cache_saved_by_every_rank(tmp_path):
+    """Rank-keyed entries (e.g. CUTLASS fused MoE) must reach the shared
+    cache from every rank, or the next synchronized pass desyncs."""
+    from vllm.model_executor.warmup.flashinfer_autotune_cache import (
+        save_flashinfer_autotune_cache_all_ranks,
+    )
+
+    cache_path = tmp_path / "autotune_configs.json"
+    for rank in range(4):
+        tuner = Mock()
+        group = SimpleNamespace(rank_in_group=rank, world_size=4, barrier=Mock())
+        with patch("flashinfer.autotuner.AutoTuner.get", return_value=tuner):
+            save_flashinfer_autotune_cache_all_ranks(cache_path, group)
+        tuner.save_configs.assert_called_once_with(str(cache_path))
+        assert group.barrier.call_count == 4
+
+
 @pytest.mark.parametrize(
     "has_v2,elastic_ep,node_count",
     [(False, False, 1), (True, False, 1), (True, True, 1), (True, False, 2)],
@@ -459,6 +476,7 @@ def test_sparse_autotune_respects_cache_selection(
     world = SimpleNamespace(
         rank_in_group=rank,
         world_size=world_size,
+        cpu_group=object(),
         broadcast_object=Mock(return_value=b"cached"),
         barrier=Mock(),
     )
@@ -466,6 +484,7 @@ def test_sparse_autotune_respects_cache_selection(
     legacy = Mock(return_value=nullcontext())
     reload = Mock()
     tuner = Mock()
+    set_group = Mock()
     monkeypatch.setitem(
         sys.modules,
         "flashinfer",
@@ -474,7 +493,10 @@ def test_sparse_autotune_respects_cache_selection(
     monkeypatch.setitem(
         sys.modules,
         "flashinfer.autotuner",
-        SimpleNamespace(AutoTuner=SimpleNamespace(get=lambda: tuner)),
+        SimpleNamespace(
+            AutoTuner=SimpleNamespace(get=lambda: tuner),
+            set_autotune_process_group=set_group,
+        ),
     )
     monkeypatch.setattr(
         "vllm.distributed.parallel_state.get_world_group", lambda: world
@@ -482,6 +504,11 @@ def test_sparse_autotune_respects_cache_selection(
     monkeypatch.setattr(
         "vllm.distributed.parallel_state.get_node_count", lambda: node_count
     )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_pp_group",
+        lambda: SimpleNamespace(world_size=pp_size),
+    )
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_tp_group", lambda: world)
     monkeypatch.setattr(fi_utils, "has_flashinfer_autotune_v2", lambda: True)
     monkeypatch.setattr(sparse, "has_flashinfer", lambda: True)
     monkeypatch.setattr(
@@ -494,7 +521,7 @@ def test_sparse_autotune_respects_cache_selection(
     cache_path = tmp_path / "autotune.json"
     cache_path.write_bytes(b"cached")
     monkeypatch.setattr(
-        sparse, "resolve_flashinfer_autotune_file", lambda _: cache_path
+        sparse, "resolve_rank_flashinfer_autotune_file", lambda _: cache_path
     )
     monkeypatch.setattr(sparse, "flashinfer_autotune", legacy)
 
@@ -520,11 +547,14 @@ def test_sparse_autotune_respects_cache_selection(
     else:
         managed.assert_not_called()
         reload.assert_not_called()
-        assert legacy.call_count == (1 if rank == 0 else 0)
-        world.broadcast_object.assert_called_once_with(
-            b"cached" if rank == 0 else None, src=0
-        )
-        tuner.load_configs.assert_called_once_with(str(cache_path))
+        assert legacy.call_count == 1
+        world.broadcast_object.assert_not_called()
+        tuner.clear_cache.assert_called_once_with()
+        tuner.save_configs.assert_called_once_with(str(cache_path))
+        assert set_group.call_args_list == [
+            call(world.cpu_group if world_size > 1 else None),
+            call(None),
+        ]
     assert mixed.call_count == (1 if max_reqs >= 2 else 0)
     assert runner._dummy_run.call_count == (0 if mixed.called else 1)
 

@@ -8,10 +8,9 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
-    resolve_flashinfer_autotune_file,
     resolve_flashinfer_autotune_v2_root,
+    resolve_rank_flashinfer_autotune_file,
     use_flashinfer_autotune_v2,
-    write_flashinfer_autotune_cache,
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import autotune as flashinfer_autotune
@@ -134,7 +133,7 @@ def _run_flashinfer_sparse_mla_decode_autotune(
         return False
 
     try:
-        from flashinfer.autotuner import AutoTuner
+        from flashinfer.autotuner import AutoTuner, set_autotune_process_group
     except ImportError:
         logger.warning(
             "Skipping FlashInfer SM120 sparse MLA decode autotune because "
@@ -154,7 +153,7 @@ def _run_flashinfer_sparse_mla_decode_autotune(
             worker, num_tokens, log_label, dummy_run_kwargs
         )
 
-    cache_path = resolve_flashinfer_autotune_file(runner)
+    cache_path = resolve_rank_flashinfer_autotune_file(runner)
 
     if is_leader:
         logger.info(
@@ -163,62 +162,36 @@ def _run_flashinfer_sparse_mla_decode_autotune(
             cache_path,
         )
 
-    with torch.inference_mode():
-        warmup_executed = True
-        if is_leader:
-            if runner.max_num_reqs >= 2:
-                warmup_executed = run_mixed_prefill_decode_warmup(
-                    runner,
-                    worker.execute_model,
-                    worker.sample_tokens,
-                    num_tokens,
-                    mixed_step_context=flashinfer_autotune(True, cache=str(cache_path)),
-                    req_id_prefix="_sparse_mla_v2_warmup",
-                )
-            else:
-                with flashinfer_autotune(True, cache=str(cache_path)):
-                    runner._dummy_run(**dummy_run_kwargs)
-        else:
-            if runner.max_num_reqs >= 2:
-                warmup_executed = run_mixed_prefill_decode_warmup(
-                    runner,
-                    worker.execute_model,
-                    worker.sample_tokens,
-                    num_tokens,
-                    req_id_prefix="_sparse_mla_v2_warmup",
-                )
-            else:
-                runner._dummy_run(**dummy_run_kwargs)
+    from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 
+    # All TP peers execute the same tuning collectives; PP stages tune separately.
+    tune_group = get_tp_group() if get_pp_group().world_size > 1 else world
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    group = tune_group.cpu_group if tune_group.world_size > 1 else None
+    set_autotune_process_group(group)
+    try:
+        with torch.inference_mode():
+            if runner.max_num_reqs >= 2:
+                warmup_executed = run_mixed_prefill_decode_warmup(
+                    runner,
+                    worker.execute_model,
+                    worker.sample_tokens,
+                    num_tokens,
+                    mixed_step_context=flashinfer_autotune(True),
+                    req_id_prefix="_sparse_mla_v2_warmup",
+                )
+            else:
+                with flashinfer_autotune(True):
+                    runner._dummy_run(**dummy_run_kwargs)
+                warmup_executed = True
+    finally:
+        set_autotune_process_group(None)
     if not warmup_executed:
         return False
-
-    tune_results: bytes | None = None
-    if is_leader and cache_path.exists():
-        with open(cache_path, "rb") as f:
-            tune_results = f.read()
-
-    tune_results = world.broadcast_object(tune_results, src=0)
-    if tune_results is None:
-        logger.warning(
-            "No FlashInfer SM120 sparse MLA %s decode autotune cache entries found. "
-            "Falling back to FlashInfer's default tactic heuristic.",
-            log_label,
-        )
-        world.barrier()
-        return True
-
-    write_flashinfer_autotune_cache(cache_path, tune_results)
+    # Rank-keyed tactics must survive independently for the next synchronized pass.
+    tuner.save_configs(str(cache_path))
     world.barrier()
-
-    AutoTuner.get().load_configs(str(cache_path))
-    logger.info(
-        "FlashInfer SM120 sparse MLA %s decode autotune cache loaded on rank %d "
-        "from %s.",
-        log_label,
-        world.rank_in_group,
-        cache_path,
-    )
     return True
 
 

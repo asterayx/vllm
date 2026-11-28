@@ -67,6 +67,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    spec_decode_needs_target_embed,
 )
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -782,14 +783,35 @@ class DeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
         pre_mix: torch.Tensor,
-        post_mix: torch.Tensor,
-        res_mix: torch.Tensor,
-        residual: torch.Tensor,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
     ) -> None:
         """Write the KV `forward` would for the replay layers' inputs, skipping
         the rest of the layer; the replay batch then reruns its rows."""
         # The replay batch rules out Engram and sequence parallel here.
         assert self.engram is None and not self.use_sequence_parallel
+        if residual is None:
+            # First layer of a later pipeline stage: ``x`` is the hc stream the
+            # previous stage sent, as in ``forward``.
+            assert isinstance(x, torch.Tensor) and x.dim() == 3
+            _, _, x, _ = mhc_pre_delayed_tilelang(
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                pre_mix=pre_mix,
+                norm_weight=self.attn_norm.weight,
+                norm_eps=self.attn_norm.variance_epsilon,
+            )
+            self.attn.forward_kv(positions, x)
+            return
+        assert post_mix is not None and res_mix is not None
         *_, x, _, _ = mhc_shifted_post_pre(
             x,
             residual,
@@ -813,6 +835,9 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    # Relay DSpark aux hidden states across PP stages (EagleModelMixin).
+    supports_aux_hidden_states_over_pp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -958,7 +983,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.candidate_block_buffer = None
 
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
+            # The last PP rank also needs embed_tokens for the DSpark drafter.
             # On SM80 embed_input_ids sums the vocabulary shards with the
             # two-shot kernel too (and so does the DSpark draft model, which
             # shares this module).
@@ -1326,20 +1352,24 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             pre_mix = intermediate_tensors["pre_mix"]
             if self.use_sequence_parallel:
                 pre_mix = sp_shard(pre_mix)
+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
-        hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
-            range(self.start_layer, self.decoder_replay_start),
-            hidden_states,
-            positions,
-            input_ids,
-            pre_mix,
-            post_mix,
-            res_mix,
-            residual,
-            aux_hidden_by_layer,
-            engram_hashes,
-            engram_mask,
-        )
+        # A later pipeline stage that starts at the replay cut holds replay
+        # layers only; they start from the stream the previous stage sent.
+        if self.start_layer < self.decoder_replay_start:
+            hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
+                range(self.start_layer, self.decoder_replay_start),
+                hidden_states,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                aux_hidden_by_layer,
+                engram_hashes,
+                engram_mask,
+            )
         late_aux: list[torch.Tensor] = []
         if self.decoder_replay_layers is not None:
             hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
@@ -1354,6 +1384,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 residual,
             )
         else:
+            assert residual is not None and post_mix is not None
+            assert res_mix is not None
             hidden_states = self._collapse(
                 hidden_states,
                 residual,
@@ -1378,6 +1410,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 {
                     "hidden_states": hidden_states,
                     "pre_mix": pre_mix,
+                    **self.pack_local_aux_hidden_states(aux_hidden_states),
                     **(
                         self.pipeline_relay.transfer(
                             positions,
@@ -1408,6 +1441,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        aux_hidden_states = remote_aux + aux_hidden_states
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -1458,7 +1492,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     residual,
                     engram_hashes,
                     engram_mask,
-                    capture_previous_aux=idx in self.aux_hidden_state_layers,
+                    capture_previous_aux=idx in self.aux_hidden_state_layers
+                    and (get_pp_group().is_first_rank or idx != self.start_layer),
                     mega_gate_metadata=mega_gate_metadata,
                 )
             )
@@ -1499,9 +1534,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
         pre_mix: torch.Tensor,
-        post_mix: torch.Tensor,
-        res_mix: torch.Tensor,
-        residual: torch.Tensor,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, ...]:
         """Layers `decoder_replay_start`.. on the given rows; returns their output,
         the last FFN's pre-mix and the aux hidden states they capture."""
@@ -1966,6 +2001,26 @@ class DeepseekV41LLMForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+
+    def apply_decode_kernel_overrides(self, draft_model: nn.Module | None) -> None:
+        """Swap in the opt-in small-batch decode kernels after weights load.
+
+        Called by the model runner once the target and draft models are
+        loaded, so each override can compile and check itself before CUDA
+        graph capture.
+        """
+        if envs.DPSK_LMHEAD_SKINNY:
+            from .lmhead_gemm import enable_dpsk_lmhead_skinny
+
+            enable_dpsk_lmhead_skinny(self, draft_model)
+        if envs.DPSK_WO_A_FP8_SKINNY:
+            from .ops.wo_a_fp8_skinny import enable_dpsk_wo_a_fp8
+
+            enable_dpsk_wo_a_fp8(self, draft_model)
+        if envs.DPSK_FP8_SKINNY_LINEAR:
+            from .ops.fp8_skinny_linear import enable_dpsk_fp8_skinny_linear
+
+            enable_dpsk_fp8_skinny_linear(self, draft_model)
 
     def build_specialized_decode(self) -> "SpecializedDecode":
         from .specialized_decode.logits.logits import SpecializedDecodeLogitsProcessor

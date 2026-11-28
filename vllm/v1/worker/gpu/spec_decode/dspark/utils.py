@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any, cast
+
 import torch.nn as nn
 
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig, replace
@@ -75,6 +77,23 @@ def _get_dspark_parallel_config(
     )
 
 
+# DeepSeek-V4.x NVFP4 checkpoints keep the DSpark (mtp.*) routed experts in
+# native MXFP4. Other architectures keep whatever their quant config says.
+_NATIVE_MXFP4_DRAFT_MOE_MODEL_TYPES = frozenset({"deepseek_v4", "deepseek_v41"})
+_NATIVE_MXFP4_DRAFT_MOE_QUANT = frozenset({"modelopt_mixed", "deepseek_v4_fp8"})
+
+
+def _draft_moe_is_native_mxfp4(vllm_config: VllmConfig, quant_config) -> bool:
+    if quant_config is None:
+        return False
+    if quant_config.get_name() not in _NATIVE_MXFP4_DRAFT_MOE_QUANT:
+        return False
+    hf_config = vllm_config.model_config.hf_text_config
+    return getattr(hf_config, "model_type", None) in (
+        _NATIVE_MXFP4_DRAFT_MOE_MODEL_TYPES
+    )
+
+
 def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
@@ -124,6 +143,17 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     # VllmConfig post-init restores the target's quant config because the target
     # config is retained for DSpark's target-layer metadata, so we must override it.
     draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
+    draft_quant_config = draft_vllm_config.quant_config
+    if _draft_moe_is_native_mxfp4(vllm_config, draft_quant_config):
+        # get_draft_quant_config builds a fresh object, so this never reaches
+        # the target model's quant config.
+        cast(Any, draft_quant_config).dspark_draft_moe_mxfp4 = True
+    logger.info(
+        "DSpark drafter quant=%s model_type=%s moe_mxfp4=%s",
+        draft_quant_config.get_name() if draft_quant_config is not None else None,
+        getattr(draft_model_config.hf_config, "model_type", None),
+        getattr(draft_quant_config, "dspark_draft_moe_mxfp4", False),
+    )
 
     with set_model_tag("dspark_head"):
         draft_model = get_model(

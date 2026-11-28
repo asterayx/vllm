@@ -14,8 +14,12 @@ from vllm.config import CUDAGraphMode
 from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
 )
+from vllm.model_executor.layers.sm120_paged_mqa_logits import (
+    sm120_paged_mqa_logits_fp8,
+)
 from vllm.models.deepseek_v32 import attention as deepseek_v32_attention
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention
+from vllm.platforms import current_platform
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
     DeepseekV32IndexerPrefillChunkMetadata,
@@ -1365,7 +1369,11 @@ def test_candidate_indexer_matches_dense(
     )
 
     torch.manual_seed(43)
-    monkeypatch.setenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "1")
+    # Plan a large dense chunk, then exercise its budgeted fallback below.
+    monkeypatch.setenv(
+        "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB",
+        "16" if batch_kind == "full_prefill" else "1",
+    )
     LlamaConfig(
         architectures=["LlamaForCausalLM"],
         hidden_size=128,
@@ -1447,9 +1455,26 @@ def test_candidate_indexer_matches_dense(
             slot_mapping={},
         )
         with override_forward_context(context):
-            expected = sparse_indexer.SparseAttnIndexer.forward_cuda(
-                indexer, hidden, q, None, weights
-            ).clone()
+            live_before_window: list[int] = []
+            with monkeypatch.context() as memory_check:
+                if batch_kind == "full_prefill":
+                    memory_check.setenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "1")
+                    dense_logits = sparse_indexer.fp8_fp4_mqa_logits
+
+                    def record_live_memory(*args, **kwargs):
+                        live_before_window.append(torch.accelerator.memory_allocated())
+                        return dense_logits(*args, **kwargs)
+
+                    memory_check.setattr(
+                        sparse_indexer, "fp8_fp4_mqa_logits", record_live_memory
+                    )
+                expected = sparse_indexer.SparseAttnIndexer.forward_cuda(
+                    indexer, hidden, q, None, weights
+                ).clone()
+            if batch_kind == "full_prefill":
+                # The previous 1 MiB logits window must not survive into the next.
+                assert len(live_before_window) > 1
+                assert max(live_before_window) - live_before_window[0] < 512 * 1024
             actual = indexer(hidden, q, None, weights).clone()
             # A later consumer reuses the prepared pages but has different Q.
             actual_second = indexer(hidden, q.flip(0), None, weights).clone()
@@ -1712,3 +1737,40 @@ def test_sparse_mqa_logits_accuracy_vs_torch(kv_dtype: str):
     # bf16-level numerics: far below the value gaps that change top-k selection.
     assert norm_err.quantile(0.99).item() < 1e-2
     assert norm_err.max().item() < 2e-2
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or not current_platform.is_device_capability_family(120),
+    reason="Requires SM120 family CUDA GPU",
+)
+def test_sm120_paged_sparse_mqa_logits_matches_reference():
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(411)
+    q = torch.randint(-4, 5, (2, 2, 16, 128), device=device, generator=generator)
+    q = q.to(torch.float8_e4m3fn)
+    keys = torch.randint(-4, 5, (4, 128, 128), device=device, generator=generator).to(
+        torch.float8_e4m3fn
+    )
+    scales = (
+        torch.randint(1, 9, (4, 128), device=device, generator=generator).float() / 8
+    )
+    cache = torch.cat(
+        (keys.view(torch.uint8).flatten(1), scales.view(torch.uint8)), dim=1
+    ).view(4, 128, 132)
+    weights = (
+        torch.randint(1, 9, (4, 16), device=device, generator=generator).float() / 8
+    )
+    lengths = torch.tensor([[0, 200], [127, 131]], dtype=torch.int32, device=device)
+    pages = torch.tensor([[3, 0], [2, 1]], dtype=torch.int32, device=device)
+    out = torch.full((4, 290), torch.nan, device=device)[:, :273]
+
+    expected = sparse_indexer._paged_mqa_logits_ref_fp8(
+        q, cache, weights, lengths, pages, out.shape[1]
+    )
+    actual = sm120_paged_mqa_logits_fp8(
+        q, cache, weights, lengths, pages, out.shape[1], out=out
+    )
+    # Small integers and dyadic scales keep FP32 sums exact in either order.
+    assert actual is out
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

@@ -381,7 +381,14 @@ def test_cudagraph_input_update():
 # =================================================================
 
 
-def _make_gate_linear(monkeypatch, *, params_dtype, out_dtype=torch.float32):
+def _make_gate_linear(
+    monkeypatch,
+    *,
+    params_dtype,
+    out_dtype=torch.float32,
+    input_size=2048,
+    output_size=64,
+):
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.get_tensor_model_parallel_rank",
         lambda: 0,
@@ -406,8 +413,8 @@ def _make_gate_linear(monkeypatch, *, params_dtype, out_dtype=torch.float32):
         lambda: True,
     )
     return GateLinear(
-        input_size=2048,
-        output_size=64,
+        input_size=input_size,
+        output_size=output_size,
         bias=False,
         out_dtype=out_dtype,
         params_dtype=params_dtype,
@@ -439,6 +446,75 @@ def test_gate_linear_uses_ll_bf16_for_bf16_fast_path(monkeypatch):
     assert len(calls) == 1
     assert calls[0][0] is x
     assert calls[0][1] is gate.weight
+
+
+@pytest.mark.parametrize("M", [1, 3, 4])
+def test_gate_linear_ll_bf16_matches_reference_for_qwen_router(monkeypatch, M):
+    """The fast path is taken on every SM90+ family and computes the router."""
+    gate = _make_gate_linear(
+        monkeypatch, params_dtype=torch.bfloat16, input_size=2560, output_size=512
+    )
+    assert gate.allow_ll_bf16_gemm
+    torch.manual_seed(M)
+    with torch.no_grad():
+        gate.weight.copy_(torch.randn_like(gate.weight))
+    x = torch.randn(M, 2560, dtype=torch.bfloat16, device="cuda")
+    out, _ = gate(x)
+    assert out.dtype == torch.float32
+    _assert_close(out, _ref(x, gate.weight), context=f"qwen router M={M}")
+
+
+def _is_sm120() -> bool:
+    return torch.cuda.get_device_capability()[0] == 12
+
+
+@pytest.mark.parametrize("M", [1, 3, 4])
+def test_gate_linear_sm120_bf16_logits_use_ll_bf16(monkeypatch, M):
+    """Qwen builds its router without an out_dtype, so logits stay bf16."""
+    if not _is_sm120():
+        pytest.skip("bf16-output router tier is enabled on family 120 only")
+    gate = _make_gate_linear(
+        monkeypatch,
+        params_dtype=torch.bfloat16,
+        out_dtype=None,
+        input_size=2560,
+        output_size=512,
+    )
+    assert gate.allow_ll_bf16_gemm
+    torch.manual_seed(M)
+    with torch.no_grad():
+        gate.weight.copy_(torch.randn_like(gate.weight))
+    x = torch.randn(M, 2560, dtype=torch.bfloat16, device="cuda")
+    out, _ = gate(x)
+    assert out.dtype == torch.bfloat16
+    # bf16 logits of magnitude ~50 are spaced 0.25 apart: compare against the
+    # rounded reference, not the fp32 one.
+    ref = _ref(x, gate.weight)
+    assert (out.float() - ref).abs().max() <= ref.abs().max() * 2**-7
+
+
+def test_gate_linear_sm120_falls_back_above_four_tokens(monkeypatch):
+    if not _is_sm120():
+        pytest.skip("the four-token limit applies on family 120 only")
+    gate = _make_gate_linear(
+        monkeypatch,
+        params_dtype=torch.bfloat16,
+        out_dtype=None,
+        input_size=2560,
+        output_size=512,
+    )
+
+    def fail_ll_bf16_gemm(*args):
+        raise AssertionError("ll_bf16_gemm should not run above four tokens")
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.cute_dsl.ll_bf16.ll_bf16_gemm",
+        fail_ll_bf16_gemm,
+    )
+    x = torch.randn(5, 2560, dtype=torch.bfloat16, device="cuda")
+    out, _ = gate(x)
+    assert out.shape == (5, 512)
+    assert out.dtype == torch.bfloat16
 
 
 def test_gate_linear_fp32_weight_falls_back(monkeypatch):
@@ -476,9 +552,11 @@ def test_gate_linear_non_bf16_activation_falls_back(monkeypatch):
 
 def test_gate_linear_set_out_dtype_enables_ll_bf16(monkeypatch):
     gate = _make_gate_linear(monkeypatch, params_dtype=torch.bfloat16, out_dtype=None)
-    assert not gate.allow_ll_bf16_gemm
+    # Family 120 already serves bf16 logits through the kernel.
+    assert gate.allow_ll_bf16_gemm == _is_sm120()
     gate.set_out_dtype(torch.float32)
     assert gate.allow_ll_bf16_gemm
+    assert gate._ll_bf16_out_dtype == torch.float32
 
 
 def test_gate_linear_non_fp32_out_dtype_disables_ll_bf16(monkeypatch):

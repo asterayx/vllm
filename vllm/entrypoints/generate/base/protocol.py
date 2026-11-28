@@ -136,6 +136,7 @@ class SpeculativeDecodingMetrics(OpenAIBaseModel):
 
 class PerRequestMetrics(OpenAIBaseModel):
     time_to_first_token_ms: float | None = None
+    time_to_first_content_token_ms: float | None = None
     generation_time_ms: float | None = None
     queue_time_ms: float | None = None
     mean_itl_ms: float | None = None
@@ -379,4 +380,6 @@ class DeltaMessage(OpenAIBaseModel):
         data = handler(self)
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
+        if envs.VLLM_EMIT_REASONING_CONTENT and data.get("reasoning") is not None:
+            data["reasoning_content"] = data["reasoning"]
         return data

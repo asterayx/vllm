@@ -31,6 +31,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -49,23 +50,16 @@ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
 logger = init_logger(__name__)
 
+# try45: vocab-shard-local greedy drafting (no full-vocab all-gather of draft
+# logits, Markov bias computed only on this rank's vocab shard).
+_DPSK_VOCAB_LOCAL_ARGMAX = envs.DPSK_VOCAB_LOCAL_ARGMAX
+
 
 class DSparkSpeculator(DFlashSpeculator):
     _speculator_name = "DSpark"
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
-
-        # Whether to sample from the anchor position. When True, uses anchor-as-first
-        # (N slots, each position predicts the next token). When False, uses 1+N
-        # fill-in block (anchor is a bonus token).
-        self.sample_from_anchor = getattr(
-            self.draft_model_config.hf_config, "sample_from_anchor", True
-        )
-        if self.sample_from_anchor:
-            self.num_query_per_req = self.num_speculative_steps
-        else:
-            self.num_query_per_req = 1 + self.num_speculative_steps
 
         # DSpark consumes mean-pooled target aux hidden states at the target
         # layers, combined to hidden_size via main_proj. Store that combined
@@ -256,9 +250,66 @@ class DSparkSpeculator(DFlashSpeculator):
             return self.model.markov_step(prev, draft_hidden, state)
         return self.model.markov_embed(prev), None
 
+    def _use_vocab_local_argmax(self) -> bool:
+        cached = getattr(self, "_vocab_local_argmax_ok", None)
+        if cached is not None:
+            return cached
+        ok = (
+            _DPSK_VOCAB_LOCAL_ARGMAX
+            and self.draft_logits is None
+            and not self.use_confidence_head
+            and getattr(self, "acceptance_estimator", None) is None
+            and self.draft_watermarker is None
+            and hasattr(self.model, "vocab_local_argmax_supported")
+            and self.model.vocab_local_argmax_supported()
+        )
+        self._vocab_local_argmax_ok = bool(ok)
+        logger.info("DSpark vocab-local greedy argmax drafting: %s", ok)
+        return self._vocab_local_argmax_ok
+
+    def _sample_sequential_local_argmax(
+        self, num_reqs: int, head_hidden: torch.Tensor
+    ) -> None:
+        from vllm.distributed import tensor_model_parallel_all_gather
+
+        n_spec = self.num_speculative_steps
+        num_sample = num_reqs * n_spec
+        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        # [num_sample, shard] local logits; no all-gather.
+        base_local = self.model.compute_draft_logits_local(sample_hidden)
+        lm_head = self.model.lm_head
+        si = lm_head.shard_indices
+        n_org = si.org_vocab_end_index - si.org_vocab_start_index
+        vocab_start = si.org_vocab_start_index
+        base_local = base_local[:, :n_org].reshape(num_reqs, n_spec, n_org)
+        # vocab_local_argmax_supported() guarantees this equals the TP group
+        # that tensor_model_parallel_all_gather uses.
+        tp = lm_head.tp_size
+
+        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        for i in range(n_spec):
+            markov_embed = self.model.markov_embed(prev)
+            bias = self.model.markov_bias_local(markov_embed)
+            logits_i = base_local[:, i] + bias
+            vals, idx = logits_i.max(dim=-1)
+            gidx = idx + vocab_start
+            if tp > 1:
+                pair = torch.stack([vals.float(), gidx.float()], dim=-1)
+                gathered = tensor_model_parallel_all_gather(pair, dim=-1)
+                gathered = gathered.view(num_reqs, tp, 2)
+                best = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+                tok = gathered[:, :, 1].gather(-1, best).squeeze(-1).to(torch.int64)
+            else:
+                tok = gidx.to(torch.int64)
+            self.draft_tokens[:num_reqs, i] = tok
+            prev = tok
+
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)
+            return
+        if self._use_vocab_local_argmax():
+            self._sample_sequential_local_argmax(num_reqs, head_hidden)
             return
         # A draft model can run the Markov steps below with its own kernels.
         # It returns False, having done nothing, for a step that the loop

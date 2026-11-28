@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
@@ -105,12 +107,21 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
 
         scale_k = K // MXFP8_BLOCK_SIZE
         weight_scale_2d = layer.weight_scale.data[:N, :scale_k].contiguous()
+        unpadded_n = weight.shape[0]
         weight, weight_scale_2d = _pad_n(
             weight, weight_scale_2d, self._N_ALIGNMENT, "FlashInfer CUTLASS"
         )
         weight_scale_swizzled = swizzle_mxfp8_scale(
             weight_scale_2d, M=weight.shape[0], K=K
         )
+        # The FP8 skinny kernel returns every stored row, so it only takes
+        # layers whose N needed no padding.
+        if envs.DPSK_FP8_SKINNY_LINEAR and weight.shape[0] == unpadded_n:
+            layer._dpsk_scale_2d_u8 = (
+                weight_scale_2d.view(torch.uint8)
+                if weight_scale_2d.dtype != torch.uint8
+                else weight_scale_2d
+            )
 
         replace_parameter(layer, "weight", weight.contiguous())
         replace_parameter(layer, "weight_scale", weight_scale_swizzled.contiguous())
@@ -121,6 +132,14 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         x: torch.Tensor | QuantizedActivation,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if bias is None and getattr(layer, "_fp8_skinny", None) is not None:
+            from vllm.models.deepseek_v41.nvidia.ops.fp8_skinny_linear import (
+                fp8_skinny_apply,
+            )
+
+            y = fp8_skinny_apply(layer, x)
+            if y is not None:
+                return y
         weight = layer.weight  # [N padded to a multiple of 32, K]
         weight_scale = layer.weight_scale
         padded_n, K = weight.shape

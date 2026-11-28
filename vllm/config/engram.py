@@ -26,7 +26,7 @@ _NGRAM_LAYER_FIELDS = {
     "Qwen4ExpForConditionalGeneration": "ple_layer_ids",
 }
 # Fields of models whose tables an Engram pool can split (`peer_group_size`).
-_PEER_GROUP_FIELDS = {"engram_layer_ids"}
+_PEER_GROUP_FIELDS = {"engram_layer_ids", "ple_layer_ids"}
 
 
 def model_has_engram_layers(model_config: "ModelConfig | None") -> bool:
@@ -44,7 +44,8 @@ class EngramConfig:
     """Configuration for Engram embedding storage and sharding."""
 
     cpu_offload: bool = True
-    """Store embedding weights in pinned CPU memory for UVA lookup."""
+    """Store embedding weights in host memory. NVLink peer groups use local
+    Grace host memory when enabled and HBM when disabled."""
 
     disk_offload: bool = False
     """Keep Qwen4Exp PLE tables in the checkpoint files and read each step's
@@ -65,6 +66,18 @@ class EngramConfig:
     allow it; Flash uses private replicas. Falls back to per-replica tables when
     DP replicas are not co-located on one node or the host cannot hold them."""
 
+    storage_path: str | None = None
+    """Directory for file-backed (NVMe) CPU-offloaded tables. When set, tables
+    live in MAP_SHARED files under this path (reclaimable page cache, no
+    pinned host RAM) and lookups gather rows on the CPU before upload.
+    Requires cpu_offload=True, dp_shared_memory off and use_thp off. The
+    host gather syncs every Engram layer, so it needs breakable CUDA graphs
+    (the DeepSeek-V4.1 default) or --enforce-eager, and it is only fast while
+    the page cache still holds the tables: a cold miss faults a whole page per
+    264 B row.
+    Each process maps a private, already-unlinked file, so files never
+    collide across servers and are reclaimed on exit."""
+
     use_thp: bool = False
     """Back private CPU-offloaded tables with transparent huge pages (best
     effort, falls back to ordinary pinned pages). Prefaulting the tables at
@@ -75,14 +88,14 @@ class EngramConfig:
     """Split each table's rows over this many GPUs of several engines (the sum
     of their GPU counts); lookups read rows from the owning GPU. Every engine
     passes the same value, `peer_group_store` and `peer_group_transport`.
-    Requires a model with Engram pool support (DeepSeek V4.1), CUDA, TP=1 and
-    PP=1."""
+    Requires a model with Engram pool support (DeepSeek V4.1 or Qwen4Exp),
+    CUDA, TP=1 and PP=1."""
 
     peer_group_transport: Literal["nvlink", "rdma"] = "nvlink"
-    """How a peer group reads rows: `nvlink` loads them from peers' HBM (CUDA
-    FABRIC handles, an IMEX channel, cpu_offload=False); with `rdma`, the NICs
-    of the GPUs holding them gather them from HBM, or from host memory with
-    cpu_offload."""
+    """How a peer group reads rows: `nvlink` loads them from peer device or host memory
+    through CUDA FABRIC handles and an IMEX channel.
+    With `rdma`, the owners' NICs gather them from HBM, or from host memory
+    with `cpu_offload`."""
 
     peer_group_fetch: Literal["sync", "async"] = "sync"
     """Where a peer group's fetch kernels run. `sync`: on the compute stream,
@@ -114,6 +127,13 @@ class EngramConfig:
     def _validate_shared_memory(self) -> Self:
         if self.dp_shared_memory and not self.cpu_offload:
             raise ValueError("dp_shared_memory requires cpu_offload=True")
+        if self.storage_path and (
+            not self.cpu_offload or self.dp_shared_memory or self.use_thp
+        ):
+            raise ValueError(
+                "storage_path requires cpu_offload=True, dp_shared_memory off "
+                "and use_thp off"
+            )
         if self.use_thp and (not self.cpu_offload or self.dp_shared_memory):
             raise ValueError(
                 "use_thp requires cpu_offload=True and dp_shared_memory=False"
@@ -131,16 +151,14 @@ class EngramConfig:
             raise ValueError(
                 "peer_group_size and peer_group_store must be set together"
             )
-        if self.peer_group_size and self.cpu_offload:
-            if self.peer_group_transport != "rdma":
-                raise ValueError(
-                    "peer_group_size with cpu_offload requires "
-                    "peer_group_transport='rdma'"
-                )
-            if self.dp_shared_memory or self.use_thp:
-                raise ValueError(
-                    "peer_group_size does not support dp_shared_memory or use_thp"
-                )
+        if (
+            self.peer_group_size
+            and self.cpu_offload
+            and (self.dp_shared_memory or self.use_thp)
+        ):
+            raise ValueError(
+                "peer_group_size does not support dp_shared_memory or use_thp"
+            )
         return self
 
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
@@ -172,6 +190,16 @@ class EngramConfig:
             raise ValueError(
                 "peer_group_size requires a model with Engram pool support"
             )
+        if self.peer_group_size and field == "ple_layer_ids":
+            if self.peer_group_fetch != "sync":
+                raise ValueError(
+                    "Qwen4Exp Engram pool requires peer_group_fetch='sync'"
+                )
+            if self.disk_offload or self.embedding_across_dp:
+                raise ValueError(
+                    "Qwen4Exp Engram pool is incompatible with disk_offload "
+                    "and embedding_across_dp"
+                )
 
     def resolve_dp_shared_memory(
         self,
@@ -184,6 +212,7 @@ class EngramConfig:
                 self.cpu_offload
                 and not self.use_thp
                 and not self.peer_group_size
+                and not self.storage_path
                 and parallel_config.data_parallel_size > 1
                 and not parallel_config.enable_elastic_ep
                 and (

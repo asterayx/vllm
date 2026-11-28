@@ -40,6 +40,7 @@ from vllm.model_executor.kernels.attention.dsa.fused_mqa_topk import (
     get_fused_mqa_topk_workspaces,
     use_fused_mqa_topk,
 )
+from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 from vllm.model_executor.layers.indexer_topk import (
     RADIX_TOPK_WORKSPACE_SIZE,
     deep_select_topk,
@@ -56,6 +57,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_and_maybe_dequant_weights,
     get_fp8_min_max,
 )
+from vllm.model_executor.layers.sm120_paged_mqa_logits import (
+    sm120_deepgemm_supports_paged_logits,
+)
 from vllm.model_executor.utils import storage_view
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -67,8 +71,9 @@ from vllm.utils.deep_gemm import (
     mqa_logits_mx_inputs,
     mqa_logits_use_mx_scales,
 )
+from vllm.utils.dpsk_nvtx import dpsk_nvtx_fn
 from vllm.utils.import_utils import has_cutedsl
-from vllm.utils.math_utils import round_up
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import (
     STR_DTYPE_TO_TORCH_DTYPE,
@@ -91,6 +96,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.kernels.attention.dsa.dcp_topk_direct import (
         DirectDCPTopKWorkspace,
     )
+    from vllm.v1.attention.ops.dcp_shardq.context import DcpShardQContext
 
 logger = init_logger(__name__)
 
@@ -541,6 +547,21 @@ def _gather_workspace_shapes(
     )
 
 
+def dcp_decode_logits_width(
+    max_model_len: int, dcp_world_size: int, cp_kv_cache_interleave_size: int
+) -> int:
+    """Logits columns a decode row can use on one rank.
+
+    Under DCP each rank scores only the KV it holds, so its decode context
+    lengths are local (`get_dcp_local_seq_lens`): at most
+    `cdiv(max_model_len, dcp_world_size * interleave) * interleave` tokens.
+    """
+    if dcp_world_size <= 1:
+        return max_model_len
+    interleave = cp_kv_cache_interleave_size
+    return cdiv(max_model_len, dcp_world_size * interleave) * interleave
+
+
 def kv_cache_as_quant_view(
     kv_cache: torch.Tensor,
     head_dim: int,
@@ -559,6 +580,23 @@ def kv_cache_as_quant_view(
             stride=(page_bytes, fp4_bytes, fp4_bytes, 1),
         )
     return kv_cache.unsqueeze(-2)
+
+
+def dcp_shardq_context(
+    forward_context, k_cache_prefix: str
+) -> "tuple[str, DcpShardQContext] | None":
+    """The MLA layer and gathered context of a DCP ShardQ step whose MLA
+    layer this indexer cache follows (`shardq_layer_name`), or None."""
+    k_cache = forward_context.no_compile_layers.get(k_cache_prefix)
+    mla_layer_name = getattr(k_cache, "shardq_layer_name", "")
+    if not mla_layer_name:
+        return None
+    mla_metadata = forward_context.attn_metadata[mla_layer_name]
+    assert isinstance(mla_metadata, MLACommonMetadata)
+    gathered_context = mla_metadata.dcp_gathered_context
+    if gathered_context is None:
+        return None
+    return mla_layer_name, gathered_context
 
 
 def should_skip_indexer_scoring(
@@ -580,7 +618,87 @@ def should_skip_indexer_scoring(
     )
 
 
+# DPSK_INDEXER_SM120_FIX=1 uses the Triton kernel for SM120 pages DeepGEMM
+# cannot take. It stays opt-in until it has an on-box accuracy eval. The torch
+# reference used otherwise syncs the host and refuses CUDA graph capture.
+_DPSK_INDEXER_SM120_FIX = envs.DPSK_INDEXER_SM120_FIX
+
+
+def _sm120_needs_ref_paged_logits(kv_cache: torch.Tensor, use_fp4_cache: bool) -> bool:
+    """True when SM120 must bypass DeepGEMM (DSv4.1 ratio-1 uses 128-row pages)."""
+    return (
+        current_platform.is_cuda()
+        and not use_fp4_cache
+        and current_platform.is_device_capability_family(120)
+        and not sm120_deepgemm_supports_paged_logits(kv_cache.shape[1])
+    )
+
+
+def _paged_mqa_logits_ref_fp8(
+    q_fp8: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    """Torch fallback for fp8 paged MQA logits (segregated page layout:
+    [block_size * D fp8 values | block_size fp32 scales])."""
+    B, N, H, D = q_fp8.shape
+    bs = kv_cache.shape[1]
+    page = int(kv_cache.stride(0))
+    nb_total = kv_cache.shape[0]
+    out = torch.full(
+        (B * N, max_model_len),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q_fp8.device,
+    )
+    if B == 0:
+        return out
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "The SM120 torch reference paged MQA logits path syncs the host and "
+            "cannot be captured in a CUDA graph. Set DPSK_INDEXER_SM120_FIX=1 to "
+            "use the Triton kernel."
+        )
+    cl = context_lens.reshape(B, -1)
+    max_len = int(cl.max().item())
+    max_len = min(max_len, max_model_len)
+    if max_len <= 0:
+        return out
+    nblk = min((max_len + bs - 1) // bs, block_table.shape[1])
+    flat = torch.as_strided(kv_cache, (nb_total, bs * (D + 4)), (page, 1))
+    bt = block_table[:B, :nblk].long().clamp_(0, nb_total - 1)
+    T = nblk * bs
+    wq = weights.reshape(B, N, H).float()
+    qf = q_fp8.float()
+    chunk = 4
+    for b0 in range(0, B, chunk):
+        b1 = min(B, b0 + chunk)
+        pages = flat[bt[b0:b1]]  # [b, nblk, bs*(D+4)]
+        k = (
+            pages[..., : bs * D]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+            .view(b1 - b0, nblk, bs, D)
+            .float()
+        )
+        sc = pages[..., bs * D : bs * (D + 4)].contiguous().view(torch.float32)
+        sc = sc.view(b1 - b0, nblk, bs)
+        k = (k * sc.unsqueeze(-1)).view(b1 - b0, T, D)
+        score = torch.einsum("bnhd,btd->bnht", qf[b0:b1], k).relu_()
+        lg = (score * wq[b0:b1].unsqueeze(-1)).sum(2)  # [b, N, T]
+        Tc = min(T, max_model_len)
+        lg = lg[..., :Tc]
+        pos = torch.arange(Tc, device=lg.device).view(1, 1, Tc)
+        lg = lg.masked_fill(pos >= cl[b0:b1].unsqueeze(-1), float("-inf"))
+        out.view(B, N, max_model_len)[b0:b1, :, :Tc] = lg
+    return out
+
+
 @eager_break_during_capture
+@dpsk_nvtx_fn("dpsk:sparse_indexer")
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -700,13 +818,19 @@ def sparse_attn_indexer(
                 decode_budget // (logits_dtype.itemsize * max_model_len),
             )
             decode_copy_bytes = 0
+        decode_width = max_model_len
+        if not use_pcp:
+            # Decode rows score only this rank's KV shard, as below.
+            decode_width = dcp_decode_logits_width(
+                max_model_len, dcp_world_size, cp_kv_cache_interleave_size
+            )
         prefill_budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
         max_logits_bytes = max(
             prefill_budget
             // torch.float32.itemsize
             * (logits_dtype.itemsize + copy_bytes),
             max_decode_tokens
-            * round_up(max_model_len, row_align)
+            * round_up(decode_width, row_align)
             * (logits_dtype.itemsize + decode_copy_bytes),
         )
         _ = torch.empty(
@@ -804,6 +928,27 @@ def sparse_attn_indexer(
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
+        prefill_chunks = prefill_metadata.chunks
+        prefill_kv_cache = kv_cache
+        prefill_dcp_world_size = dcp_world_size
+        indices = prefill_metadata.shardq_gather_indices
+        if dcp_world_size > 1 and (
+            dcp_shardq := dcp_shardq_context(forward_context, k_cache_prefix)
+        ):
+            # A DCP ShardQ step scores its prefill tokens over a gathered copy
+            # of their keys, as a non-DCP ShardQ step does: no top-k merge
+            # across ranks. Its decode tokens keep the DCP decode path.
+            mla_layer_name, gathered_context = dcp_shardq
+            assert num_decode_tokens == gathered_context.num_decode_tokens
+            prefill_kv_cache = gathered_context.gather(
+                forward_context.no_compile_layers[mla_layer_name].kv_cache,
+                attn_metadata[mla_layer_name].block_table,  # type: ignore[attr-defined]
+                kv_cache,
+                attn_metadata_narrowed.block_table,
+            )
+            prefill_chunks = gathered_context.indexer_chunks
+            prefill_dcp_world_size = 1
+            indices = gathered_context.gather_indices
 
         # Get the shared workspace buffers once, sized for this batch's largest
         # chunk rather than the profiled bound (total_seq_lens), so the scratch
@@ -813,7 +958,7 @@ def sparse_attn_indexer(
         # scales) based on use_fp4_cache.
         workspace_manager = current_workspace_manager()
         values_spec, scales_spec = _gather_workspace_shapes(
-            max(c.max_local_total_seq_lens for c in prefill_metadata.chunks),
+            max(c.max_local_total_seq_lens for c in prefill_chunks),
             head_dim,
             fp8_dtype,
             use_fp4_cache,
@@ -822,7 +967,7 @@ def sparse_attn_indexer(
         # and the de-interleaved result.
         pcp_chunks = [
             (c, c.pcp_deinterleave_idx)
-            for c in prefill_metadata.chunks
+            for c in prefill_chunks
             if c.pcp_deinterleave_idx is not None
         ]
         gather_specs: list[tuple[tuple[int, int], torch.dtype]] = []
@@ -843,13 +988,12 @@ def sparse_attn_indexer(
         # Under ShardQ the chunks index the shardq_gather_indices tokens. The
         # caller may have computed the query and weights of just those.
         prefill_q, prefill_q_scale, prefill_weights = q_quant, q_scale, weights
-        indices = prefill_metadata.shardq_gather_indices
         assert indices is None or candidate_blocks is None
         if indices is not None and q_quant.shape[0] != indices.shape[0]:
             prefill_q, prefill_weights = q_quant[indices], weights[indices]
             if q_scale is not None:
                 prefill_q_scale = q_scale[indices]
-        for chunk in prefill_metadata.chunks:
+        for chunk in prefill_chunks:
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
             assert chunk.local_cu_seq_lens is not None
@@ -857,7 +1001,7 @@ def sparse_attn_indexer(
             k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
             if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:
                 ops.cp_gather_indexer_k_quant_cache(
-                    kv_cache,
+                    prefill_kv_cache,
                     k_quant,
                     k_scale,
                     chunk.block_table,
@@ -932,9 +1076,12 @@ def sparse_attn_indexer(
                     ).squeeze(-1)
                 # Chunks planned for fused_mqa_topk are not bounded by the logits
                 # budget: split their rows (budget-planned chunks, the only ones
-                # under DCP, are one window, so the merge below sees all the
-                # rows).
+                # under pure DCP, are one window, so the merge below sees all
+                # the rows).
                 for sub in range(0, q_slice.shape[0], dense_rows):
+                    if sub:
+                        # Startup reserves logits for one window at a time.
+                        del logits
                     rows = slice(sub, min(sub + dense_rows, q_slice.shape[0]))
                     tokens = slice(row_start + rows.start, row_start + rows.stop)
                     if current_platform.is_xpu():
@@ -974,7 +1121,7 @@ def sparse_attn_indexer(
                         use_deep_select = (
                             topk_backend == "deep_select"
                             and logits.dtype == torch.bfloat16
-                            and dcp_world_size == 1
+                            and prefill_dcp_world_size == 1
                             and is_deep_select_supported(logits, topk_tokens)
                         )
                         if not use_deep_select:
@@ -1026,7 +1173,7 @@ def sparse_attn_indexer(
                     topk_indices,
                     topk_tokens,
                     dcp_rank,
-                    dcp_world_size,
+                    prefill_dcp_world_size,
                     cp_kv_cache_interleave_size,
                     row_starts=row_starts,
                     logits_dtype=logits_dtype,
@@ -1143,6 +1290,13 @@ def sparse_attn_indexer(
                         end,
                     )
                 return topk_indices_buffer
+        # With localized (DCP) seq_lens a row scores only this rank's KV
+        # shard: size its logits by that, not by the whole model length.
+        decode_width = max_model_len
+        if decode_metadata.global_seq_lens is not None:
+            decode_width = dcp_decode_logits_width(
+                max_model_len, dcp_world_size, cp_kv_cache_interleave_size
+            )
         if current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
@@ -1156,6 +1310,32 @@ def sparse_attn_indexer(
                 seq_lens_xpu,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
+                decode_width,
+            )
+        elif _sm120_needs_ref_paged_logits(kv_cache, use_fp4_cache) and (
+            _DPSK_INDEXER_SM120_FIX
+        ):
+            # DPSK_INDEXER_SM120_FIX=1: fused Triton fp8 paged logits for
+            # 128-row pages (replaces fp32 dequant + einsum simt sgemm).
+            from vllm.model_executor.layers.sm120_paged_mqa_logits import (
+                sm120_paged_mqa_logits_fp8,
+            )
+
+            logits = sm120_paged_mqa_logits_fp8(
+                padded_q_quant_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len,
+            )
+        elif _sm120_needs_ref_paged_logits(kv_cache, use_fp4_cache):
+            logits = _paged_mqa_logits_ref_fp8(
+                padded_q_quant_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
                 max_model_len,
             )
         else:
@@ -1172,7 +1352,7 @@ def sparse_attn_indexer(
                 seq_lens,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
+                max_model_len=decode_width,
                 logits_dtype=logits_dtype,
                 indices=decode_metadata.indices,
             )

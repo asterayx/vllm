@@ -1442,3 +1442,41 @@ def test_engram_head_collectives_survive_graph_breaks():
     if torch.accelerator.device_count() < 2:
         pytest.skip("Requires two GPUs")
     torch.multiprocessing.spawn(_engram_tp_worker, args=(2, get_open_port()), nprocs=2)
+
+
+@pytest.mark.parametrize("packed_fp4", [False, True])
+@pytest.mark.parametrize("storage", ["gpu", "pinned", "file"])
+def test_engram_storage_formats_preserve_lookup_values(
+    dist_init, tmp_path, packed_fp4, storage
+):
+    """Exercise real allocation, host staging and packed dequantization together."""
+    with torch.device("cuda"):
+        layer = ParallelEngramEmbedding(
+            36,
+            64,
+            (17, 19),
+            cpu_offload=storage != "gpu",
+            storage_path=str(tmp_path) if storage == "file" else None,
+            packed_fp4=packed_fp4,
+        )
+    if packed_fp4:
+        packed = torch.arange(36 * 32, dtype=torch.int64).remainder(256)
+        packed = packed.to(torch.uint8).view(36, 32)
+        layer.weight.data.copy_(packed)
+        levels = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6]
+        )
+        nibbles = torch.stack((packed & 15, packed >> 4), dim=-1).long()
+        reference = levels[nibbles].reshape(36, 64)
+    else:
+        reference = torch.arange(36 * 64).remainder(8).float().view(36, 64)
+        layer.weight.data.copy_(reference.to(torch.float8_e4m3fn))
+    layer.weight_scale_inv.data.fill_(128)
+    reference *= 2
+    indices = torch.tensor([[0, 17], [16, 35], [-1, 36]], device="cuda")
+    expected = torch.stack(
+        (reference[[0, 17]], reference[[16, 35]], torch.zeros(2, 64))
+    ).to("cuda", torch.bfloat16)
+    torch.testing.assert_close(layer(indices), expected, rtol=0, atol=0)
+    if storage == "file":
+        assert list(tmp_path.iterdir()) == []
